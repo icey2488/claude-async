@@ -34,10 +34,10 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
 - `claude_start` accepts an `effort` param: `low | medium | high | xhigh | max | ultracode`.
   The default is `xhigh` (override the default via the `CLAUDE_ASYNC_DEFAULT_EFFORT` env var).
 - `max` = highest reasoning effort.
-- `ultracode` adds standing dynamic-workflow orchestration (parallel subagents), wired via
-  `--settings '{"ultracode":true}'`. Note: unlike the flag-mapped levels above, the bridge
-  enables `ultracode` through this settings flag **alone** — it does **not** also pass
-  `--effort`, so the reasoning-effort level under `ultracode` is governed by that setting /
-  `settings.json` rather than by an explicit `--effort` value. (See the effort routing in
+- `ultracode` = xhigh effort **plus** standing dynamic-workflow orchestration (parallel
+  subagents). The bridge wires it via both `--effort xhigh` **and**
+  `--settings '{"ultracode":true}'`: the `--effort xhigh` is now passed explicitly, so
+  `ultracode`'s xhigh reasoning is guaranteed regardless of the ambient `effortLevel`
+  (it previously relied on `settings.json` to govern effort). (See the effort routing in
   `job-core.mjs`.)
 - The resolved effort level is recorded in each job's `meta.json` and shown by `claude_check`.

@@ -68,6 +68,10 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
   if (eff === "ultracode") {
+    // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
+    // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the
+    // ambient effortLevel, rather than inheriting it from settings.json.
+    argv.push("--effort", "xhigh");
     // STEP 1 confirmed `--settings '{"ultracode":true}'` surfaces the Workflow tool headlessly,
     // so use the settings mechanism (not the prompt-keyword fallback) to enable the composite.
     argv.push("--settings", JSON.stringify({ ultracode: true }));
