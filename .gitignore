@@ -1,0 +1,27 @@
+# --- Dependencies (reproducible from package-lock.json) ---
+node_modules/
+
+# --- Secrets: TLS certs & private keys (local mkcert), env/credentials ---
+# certs/ holds 127.0.0.1+1-key.pem (a private key) — never commit.
+certs/
+*.pem
+*.key
+.env
+.env.*
+
+# --- Daemon (PM2) runtime logs written beside the source ---
+daemon.out.log
+daemon.err.log
+*.log
+
+# --- Per-job runtime artifacts ---
+# JOB_ROOT defaults to ~/.claude-async-jobs (outside this repo) and is set to
+# C:\Users\Raide\.claude-async-jobs by ecosystem.config.cjs — so job files normally
+# never land here. Ignored defensively in case CLAUDE_ASYNC_JOB_DIR ever points inside
+# the tree. Each job dir holds: spec.json, meta.json, exit_code, out.log, err.log.
+.claude-async-jobs/
+
+# --- Editor / manual backups (not clean source) ---
+# e.g. claude-async-server.mjs.bak-preB
+*.bak
+*.bak-*
