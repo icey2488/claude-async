@@ -1,0 +1,35 @@
+{
+  "name": "claude-async",
+  "version": "1.0.0",
+  "description": "Fire-and-poll MCP server for running long Claude Code jobs past the Claude app's tool-call timeout.",
+  "type": "module",
+  "bin": {
+    "claude-async": "claude-async-server.mjs"
+  },
+  "scripts": {
+    "start": "node claude-async-server.mjs",
+    "selftest": "node claude-async-server.mjs --selftest"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "claude-code",
+    "async",
+    "background-jobs"
+  ],
+  "author": "icey2488",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/icey2488/claude-async.git"
+  },
+  "homepage": "https://github.com/icey2488/claude-async#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  }
+}

@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Job state (runtime logs + exit codes)
+.claude-async-jobs/
+
+# TLS / cert material — never commit private keys
+certs/
+*.pem
+*.key
+*.crt
+*.cer
+*.pfx
+
+# Local env / secrets
+.env
+.env.*
+
+# Logs and backups
+*.log
+*.bak
+*.bak-*
+
+# OS cruft
+.DS_Store
+Thumbs.db
