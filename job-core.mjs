@@ -16,6 +16,9 @@ export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
 const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runner.mjs");
+// Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
+// preventing a project .mcp.json from recursively respawning claude-async.
+const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
 // Reasoning effort: default xhigh, overridable per-process. FLAG_EFFORT are the levels that
 // map straight to `--effort`; "ultracode" is a composite handled separately (see startJob).
 const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "xhigh";
@@ -63,7 +66,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   fs.mkdirSync(p.d, { recursive: true });
 
   const cwd = workFolder || DEFAULT_CWD;
-  const argv = ["-p", prompt, "--dangerously-skip-permissions"];
+  const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   if (model) argv.push("--model", model);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
