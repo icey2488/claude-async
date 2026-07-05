@@ -11,11 +11,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { mintCard } from "./card-hook.mjs";
 
 export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
 const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runner.mjs");
+// Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
+// preventing a project .mcp.json from recursively respawning claude-async.
+const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
 // Reasoning effort: default xhigh, overridable per-process. FLAG_EFFORT are the levels that
 // map straight to `--effort`; "ultracode" is a composite handled separately (see startJob).
 const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "xhigh";
@@ -63,7 +67,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   fs.mkdirSync(p.d, { recursive: true });
 
   const cwd = workFolder || DEFAULT_CWD;
-  const argv = ["-p", prompt, "--dangerously-skip-permissions"];
+  const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   if (model) argv.push("--model", model);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
@@ -80,12 +84,16 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   const pid = launch(p, CLAUDE_BIN, argv, cwd);
 
+  const { cardId, startHead, error: cardError } = mintCard(id, cwd);
   const meta = { jobId: id, pid, workFolder: cwd, model: model || null, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
-                 startedAt: new Date().toISOString() };
+                 startedAt: new Date().toISOString(),
+                 cardId: cardId || null, startHead: startHead || null };
   fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2));
-  return { ...meta, status: "running",
-           note: "Job detached. Poll with claude_check(jobId). Safe across bridge restarts." };
+  const note = cardError
+    ? `UNCARDED: ${cardError} — Job detached. Poll with claude_check(jobId). Safe across bridge restarts.`
+    : "Job detached. Poll with claude_check(jobId). Safe across bridge restarts.";
+  return { ...meta, status: "running", note };
 }
 
 export function checkJob(id, tailBytes = 8000) {

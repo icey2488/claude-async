@@ -11,6 +11,8 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
+import { closeCard } from "./card-hook.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -31,6 +33,15 @@ function finish(code) {
   if (done) return;
   done = true;
   try { fs.writeFileSync(exit, String(code)); } catch {}
+  // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
+  // Reading here (after child exits) avoids any startup race with job-core's meta write.
+  let cardId = null, startHead = null;
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(path.dirname(specPath), "meta.json"), "utf8"));
+    cardId = m.cardId || null;
+    startHead = m.startHead || null;
+  } catch {}
+  try { closeCard(cardId, code, cwd, startHead); } catch {}
   try { fs.closeSync(outFd); } catch {}
   try { fs.closeSync(errFd); } catch {}
   process.exit(0);
