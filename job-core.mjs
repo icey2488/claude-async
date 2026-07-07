@@ -5,7 +5,7 @@
  * stateless. job-runner.mjs (the detached worker) must sit beside this file.
  */
 import { z } from "zod";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
@@ -16,6 +16,10 @@ import { mintCard } from "./card-hook.mjs";
 export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
 const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
+// Heartbeat classification thresholds. HEARTBEAT_FRESH_MS: a lastAlive within this window
+// is definitely running. JOB_TIMEOUT_MS: beyond this, the job is timed_out regardless of pid.
+const HEARTBEAT_FRESH_MS = 3 * 60 * 1000; // 3 minutes
+export const JOB_TIMEOUT_MS = Number(process.env.CLAUDE_ASYNC_JOB_TIMEOUT_MS) || 4 * 60 * 60 * 1000; // 4h
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runner.mjs");
 // Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
 // preventing a project .mcp.json from recursively respawning claude-async.
@@ -31,12 +35,54 @@ const jobPaths = (id) => {
   const d = jobDir(id);
   return { d, out: path.join(d, "out.log"), err: path.join(d, "err.log"),
            exit: path.join(d, "exit_code"), meta: path.join(d, "meta.json"),
-           spec: path.join(d, "spec.json") };
+           spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat") };
 };
 
 function pidAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (e) { return e.code === "EPERM"; }
+}
+
+// Returns the lowercased executable/image name for a running pid, or null if unknown/gone.
+function getProcessImageName(pid) {
+  try {
+    if (process.platform === "win32") {
+      const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"],
+                          { encoding: "utf8", timeout: 5000 });
+      if (r.error || r.status !== 0) return null;
+      const line = (r.stdout || "").trim().split(/\r?\n/)[0];
+      // "INFO: No tasks are running which match..." means the PID is gone
+      if (!line || line.startsWith("INFO:")) return null;
+      const first = line.split(",")[0];
+      return first ? first.replace(/"/g, "").toLowerCase() : null;
+    } else {
+      return fs.readFileSync(`/proc/${pid}/comm`, "utf8").trim().toLowerCase();
+    }
+  } catch { return null; }
+}
+
+// True when the process is ours (node runner or claude CLI). If the image name can't be
+// determined (permissions, OS quirk) we give benefit of the doubt — conservative/safe.
+function isOurProcess(pid) {
+  const name = getProcessImageName(pid);
+  if (!name) return true;
+  return name.includes("node") || name.includes("claude");
+}
+
+// Reads the runner_heartbeat file; returns a Date or null on any failure.
+function readLastAlive(hbPath) {
+  try {
+    const raw = fs.readFileSync(hbPath, "utf8").trim();
+    if (!raw) return null;
+    const d = new Date(raw);
+    return isNaN(d.getTime()) ? null : d;
+  } catch { return null; }
+}
+
+function formatElapsed(ms) {
+  const s = Math.round(ms / 1000);
+  const m = Math.floor(s / 60);
+  return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
 }
 
 function readTail(file, maxBytes) {
@@ -101,16 +147,51 @@ export function checkJob(id, tailBytes = 8000) {
   if (!fs.existsSync(p.meta)) return { jobId: id, status: "unknown", error: "no such job" };
   const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
   let state, exitCode = null, finishedAt = null;
+  const extra = {};
+
   if (fs.existsSync(p.exit)) {
     exitCode = parseInt(fs.readFileSync(p.exit, "utf8").trim(), 10);
     state = exitCode === 0 ? "completed" : "failed";
     finishedAt = fs.statSync(p.exit).mtime.toISOString();
-  } else if (pidAlive(meta.pid)) {
-    state = "running";
   } else {
-    state = "orphaned";
+    const lastAlive = readLastAlive(p.heartbeat);
+    if (lastAlive === null) {
+      // Legacy record: no runner_heartbeat file — classify by pid re-stat alone.
+      // (Jobs started before heartbeat was added; never leaves them "running" forever.)
+      state = pidAlive(meta.pid) ? "running" : "died";
+    } else {
+      const ageMs = Date.now() - lastAlive.getTime();
+      extra.lastAlive = lastAlive.toISOString();
+
+      if (ageMs < HEARTBEAT_FRESH_MS) {
+        // Heartbeat is recent — definitely running.
+        state = "running";
+        if (meta.startedAt) extra.elapsed = formatElapsed(Date.now() - new Date(meta.startedAt).getTime());
+      } else if (ageMs >= JOB_TIMEOUT_MS) {
+        // Heartbeat is older than the global ceiling — timed_out regardless of pid.
+        state = "timed_out";
+      } else {
+        // Stale window (3 min – timeout): re-stat the pid for additional signal.
+        if (pidAlive(meta.pid)) {
+          if (isOurProcess(meta.pid)) {
+            // Pid alive and looks like node/claude — heartbeat may have lagged.
+            state = "running";
+            extra.stalled = true;
+            if (meta.startedAt) extra.elapsed = formatElapsed(Date.now() - new Date(meta.startedAt).getTime());
+          } else {
+            // Pid reused by a foreign process (recycling observed in the field: e.g. Code.exe).
+            state = "died";
+            extra.pidNote = "pid recycled to foreign process";
+          }
+        } else {
+          // Process gone without writing exit_code — crashed or SIGKILL'd.
+          state = "died";
+        }
+      }
+    }
   }
-  return { ...meta, status: state, exitCode, finishedAt,
+
+  return { ...meta, status: state, exitCode, finishedAt, ...extra,
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
@@ -120,7 +201,12 @@ export function listJobs() {
     : [];
   return ids.map((id) => {
     const s = checkJob(id, 0);
-    return { jobId: id, status: s.status, exitCode: s.exitCode ?? null, startedAt: s.startedAt ?? null };
+    const row = { jobId: id, status: s.status, exitCode: s.exitCode ?? null, startedAt: s.startedAt ?? null };
+    if (s.lastAlive) row.lastAlive = s.lastAlive;
+    if (s.elapsed) row.elapsed = s.elapsed;
+    if (s.stalled) row.stalled = true;
+    if (s.pidNote) row.pidNote = s.pidNote;
+    return row;
   }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
 }
 
@@ -143,7 +229,10 @@ export function registerTools(server) {
 
   server.registerTool("claude_check", {
     description: "Check a background job's status and recent output. Returns status " +
-                 "(running | completed | failed | orphaned), exit code, and a tail of stdout/stderr.",
+                 "(running | completed | failed | died | timed_out), exit code, and a tail of stdout/stderr. " +
+                 "running may include elapsed and lastAlive fields; stalled:true means heartbeat is stale " +
+                 "but pid is still alive. died means the process exited without recording a result. " +
+                 "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h).",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
