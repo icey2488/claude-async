@@ -11,7 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { mintCard } from "./card-hook.mjs";
+import { mintCard, failCard } from "./card-hook.mjs";
 
 export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
@@ -188,6 +188,16 @@ export function checkJob(id, tailBytes = 8000) {
           state = "died";
         }
       }
+    }
+  }
+
+  if ((state === "died" || state === "timed_out") && meta.cardId && !meta.cardReaped) {
+    const reap = failCard(meta.cardId);
+    if (reap.ok) {
+      meta.cardReaped = true;
+      try { fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); } catch {}
+    } else {
+      extra.reapError = reap.error || "reap failed";
     }
   }
 

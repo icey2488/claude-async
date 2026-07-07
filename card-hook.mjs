@@ -77,6 +77,15 @@ export function mintCard(jobId, workFolder) {
 }
 
 /**
+ * Fail a card by id. Returns { ok, error } so callers can decide whether the reap
+ * succeeded — unlike closeCard, which is fire-and-forget (fail-open, void).
+ */
+export function failCard(cardId) {
+  if (!cardId) return { ok: false, error: "no cardId" };
+  return runJobcard(["fail", cardId]);
+}
+
+/**
  * Close the card on job finish. Fail-open: all errors are swallowed.
  * On exit 0 with HEAD moved from startHead, attaches a delivery artifact.
  */

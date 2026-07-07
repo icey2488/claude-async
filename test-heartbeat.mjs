@@ -20,7 +20,7 @@ import crypto from "node:crypto";
 
 // ---- helpers ---------------------------------------------------------------
 
-function makeJob({ pid, heartbeatAgeMs, exitCode, noHeartbeat = false } = {}) {
+function makeJob({ pid, heartbeatAgeMs, exitCode, noHeartbeat = false, cardId } = {}) {
   const id = `test-hb-${Date.now()}-${crypto.randomBytes(2).toString("hex")}`;
   const dir = path.join(JOB_ROOT, id);
   fs.mkdirSync(dir, { recursive: true });
@@ -35,6 +35,7 @@ function makeJob({ pid, heartbeatAgeMs, exitCode, noHeartbeat = false } = {}) {
     startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), // 10 min ago
     workFolder: JOB_ROOT,
   };
+  if (cardId !== undefined) meta.cardId = cardId;
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify(meta, null, 2));
 
   if (!noHeartbeat && heartbeatAgeMs !== undefined) {
@@ -163,6 +164,135 @@ function assert(cond, msg) {
   assert(s.stalled === true,       `stalled=true`);
   assert(!!s.lastAlive,            `lastAlive present`);
   assert(!!s.elapsed,              `elapsed present`);
+  cleanup(dir);
+}
+
+// ---- card-reap tests -------------------------------------------------------
+// Mock jobcard: logs invocation args to MOCK_CALLS_FILE; exits MOCK_FAIL (0|1).
+const MOCK_SCRIPT = path.join(JOB_ROOT, "_mock_jobcard.mjs");
+const MOCK_CALLS_FILE = path.join(JOB_ROOT, "_mock_calls.json");
+
+fs.writeFileSync(MOCK_SCRIPT, [
+  "import fs from 'node:fs';",
+  "const cf = process.env.MOCK_CALLS_FILE;",
+  "const calls = fs.existsSync(cf) ? JSON.parse(fs.readFileSync(cf,'utf8')) : [];",
+  "calls.push(process.argv.slice(2).join(' '));",
+  "fs.writeFileSync(cf, JSON.stringify(calls));",
+  "process.exit(Number(process.env.MOCK_FAIL || '0'));",
+].join("\n"));
+
+function resetMockCalls() { fs.writeFileSync(MOCK_CALLS_FILE, "[]"); }
+function getMockCallCount() {
+  try { return JSON.parse(fs.readFileSync(MOCK_CALLS_FILE, "utf8")).length; } catch { return 0; }
+}
+
+function withMock(fail, fn) {
+  const save = { cmd: process.env.CLAUNKER_JOBCARD_CMD, fail: process.env.MOCK_FAIL, cf: process.env.MOCK_CALLS_FILE };
+  process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify([process.execPath, MOCK_SCRIPT]);
+  process.env.MOCK_CALLS_FILE = MOCK_CALLS_FILE;
+  process.env.MOCK_FAIL = fail ? "1" : "0";
+  try { return fn(); }
+  finally {
+    if (save.cmd === undefined) delete process.env.CLAUNKER_JOBCARD_CMD;
+    else process.env.CLAUNKER_JOBCARD_CMD = save.cmd;
+    if (save.fail === undefined) delete process.env.MOCK_FAIL;
+    else process.env.MOCK_FAIL = save.fail;
+    if (save.cf === undefined) delete process.env.MOCK_CALLS_FILE;
+    else process.env.MOCK_CALLS_FILE = save.cf;
+  }
+}
+
+// Test 8+9: died + cardId + no flag -> reap once; idempotent on second check
+{
+  console.log("\nTest 8: died + cardId -> reap invoked once, cardReaped set");
+  const { id, dir } = makeJob({ heartbeatAgeMs: 10 * 60 * 1000, pid: 99999999, cardId: "card-reap-test-1" });
+  resetMockCalls();
+
+  withMock(false, () => {
+    const s = checkJob(id);
+    assert(s.status === "died",   `status=died, got "${s.status}"`);
+    assert(!s.reapError,          `no reapError on success`);
+  });
+  assert(getMockCallCount() === 1, `mock called exactly once`);
+  const meta1 = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+  assert(meta1.cardReaped === true, `cardReaped=true in meta after reap`);
+
+  console.log("\nTest 9: second check -> no second invocation (idempotent)");
+  withMock(false, () => {
+    const s2 = checkJob(id);
+    assert(s2.status === "died", `status=died on re-check`);
+    assert(!s2.reapError,        `no reapError on re-check`);
+  });
+  assert(getMockCallCount() === 1, `mock still invoked exactly once after second check`);
+
+  cleanup(dir);
+}
+
+// Test 10: timed_out + cardId -> reap invoked
+{
+  console.log("\nTest 10: timed_out + cardId -> reap invoked");
+  const overAge = JOB_TIMEOUT_MS + 60 * 60 * 1000;
+  const { id, dir } = makeJob({ heartbeatAgeMs: overAge, cardId: "card-reap-test-2" });
+  resetMockCalls();
+
+  withMock(false, () => {
+    const s = checkJob(id);
+    assert(s.status === "timed_out", `status=timed_out, got "${s.status}"`);
+    assert(!s.reapError,             `no reapError`);
+  });
+  assert(getMockCallCount() === 1, `mock called once for timed_out`);
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+  assert(meta.cardReaped === true, `cardReaped=true after timed_out reap`);
+
+  cleanup(dir);
+}
+
+// Test 11: reap-failure -> flag unset, reapError surfaced, classification still returned
+{
+  console.log("\nTest 11: reap failure -> flag unset, reapError surfaced, status still returned");
+  const { id, dir } = makeJob({ heartbeatAgeMs: 10 * 60 * 1000, pid: 99999999, cardId: "card-reap-test-3" });
+  resetMockCalls();
+
+  withMock(true, () => {
+    const s = checkJob(id);
+    assert(s.status === "died",  `status=died even on reap failure`);
+    assert(!!s.reapError,        `reapError set on failure`);
+  });
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+  assert(!meta.cardReaped,       `cardReaped NOT set when reap failed`);
+
+  cleanup(dir);
+}
+
+// Test 12: completed job with cardId -> never reaped
+{
+  console.log("\nTest 12: completed job with cardId -> never reaped");
+  const { id, dir } = makeJob({ exitCode: 0, cardId: "card-reap-test-4" });
+  resetMockCalls();
+
+  withMock(false, () => {
+    const s = checkJob(id);
+    assert(s.status === "completed", `status=completed, got "${s.status}"`);
+    assert(!s.reapError,             `no reapError`);
+  });
+  assert(getMockCallCount() === 0, `mock never called for completed job`);
+
+  cleanup(dir);
+}
+
+// Test 13: legacy record without cardId -> classification only, no error
+{
+  console.log("\nTest 13: legacy record without cardId -> classification only, no reapError");
+  const { id, dir } = makeJob({ noHeartbeat: true, pid: 99999999 });
+  resetMockCalls();
+
+  withMock(false, () => {
+    const s = checkJob(id);
+    assert(s.status === "died", `status=died, got "${s.status}"`);
+    assert(!s.reapError,        `no reapError when cardId absent`);
+  });
+  assert(getMockCallCount() === 0, `mock never called without cardId`);
+
   cleanup(dir);
 }
 
