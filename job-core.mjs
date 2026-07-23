@@ -28,7 +28,7 @@ const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty
 // `claude` CLI's own default model (Fable) at xhigh effort — the priciest configuration
 // available — and that combination absorbed 99.6% of dispatch spend on 2026-07-23. Both
 // defaults below are overridable per-process; explicit caller-supplied model/effort always win.
-const DEFAULT_MODEL = process.env.CLAUDE_ASYNC_DEFAULT_MODEL || "claude-sonnet-4-6";
+const DEFAULT_MODEL = process.env.CLAUDE_ASYNC_DEFAULT_MODEL || "claude-sonnet-5";
 const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "medium";
 const FLAG_EFFORT = new Set(["low", "medium", "high", "xhigh", "max"]);
 fs.mkdirSync(JOB_ROOT, { recursive: true });
@@ -233,8 +233,8 @@ export function registerTools(server) {
       prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
       workFolder: z.string().optional().describe("Directory to run in (default: $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
       jobId: z.string().optional().describe("Custom job id; otherwise one is generated."),
-      model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-4-6. " +
-                  "Default claude-sonnet-4-6 (fail-safe; override via CLAUDE_ASYNC_DEFAULT_MODEL)."),
+      model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-5. " +
+                  "Default claude-sonnet-5 (fail-safe; override via CLAUDE_ASYNC_DEFAULT_MODEL)."),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultracode"]).optional()
         .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
                   "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),

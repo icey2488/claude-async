@@ -32,7 +32,7 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /
-  `claude-sonnet-4-6`). The default is `claude-sonnet-4-6` (override via the
+  `claude-sonnet-5`). The default is `claude-sonnet-5` (override via the
   `CLAUDE_ASYNC_DEFAULT_MODEL` env var). This is deliberately the cheapest/fastest broadly-capable
   tier — an unspecified `model` used to inherit the `claude` CLI's own default (Fable), which
   combined with the old xhigh effort default absorbed 99.6% of dispatch spend on 2026-07-23.
