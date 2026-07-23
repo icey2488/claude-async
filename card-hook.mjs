@@ -50,6 +50,37 @@ function runJobcard(args) {
   return { ok: true, stdout: (result.stdout || "").trim() };
 }
 
+// Upper bound on the extracted card body. A dispatch card wants a GLANCEABLE intent
+// snippet, not the whole (often multi-page) prompt — 200 chars is ~2-3 lines on the card
+// face, room for a full intent sentence, and far below the spine's 16 KiB description cap.
+export const INTENT_SUMMARY_MAX = 200;
+
+/**
+ * Extract a bounded, readable INTENT SUMMARY from a dispatch prompt for the card body.
+ * Dispatch prompts conventionally OPEN with a one-line statement of intent, so the rule is:
+ *   1. take the FIRST non-empty line (the conventional opener);
+ *   2. if it fits in INTENT_SUMMARY_MAX chars, use it whole (the common case — a short
+ *      imperative opener — is preserved verbatim, no risk of a false-positive cut);
+ *   3. otherwise prefer the FIRST sentence boundary (. ? !) within the cap;
+ *   4. failing that, cut at the last word boundary and ellipsize.
+ * Never dumps the whole prompt onto the card. Returns null for an empty/blank/non-string
+ * prompt, so the caller simply omits --description (absent body, never an empty string).
+ */
+export function intentSummary(prompt) {
+  if (typeof prompt !== "string") return null;
+  const line = prompt.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
+  if (!line) return null;
+  if (line.length <= INTENT_SUMMARY_MAX) return line;
+  // Long opener: first sentence ending in . ? ! (≥20 chars in, to skip early abbreviations
+  // like "e.g.") within the cap window; the boundary punctuation is kept.
+  const sentence = line.slice(0, INTENT_SUMMARY_MAX + 1).match(/^(.{20,}?[.?!])\s/);
+  if (sentence) return sentence[1];
+  // No sentence boundary in range → last word boundary, ellipsized.
+  const clipped = line.slice(0, INTENT_SUMMARY_MAX);
+  const lastSpace = clipped.lastIndexOf(" ");
+  return (lastSpace > 40 ? clipped.slice(0, lastSpace) : clipped).trimEnd() + "…";
+}
+
 /** Return the current git HEAD sha for dir, or null if not a repo / git unavailable. */
 export function getGitHead(dir) {
   try {
@@ -70,8 +101,12 @@ export function getGitHead(dir) {
  * job-core's own default — never raw/possibly-absent), recorded inside created_by
  * (spec v0.7.0). Both optional: omitted means the corresponding key is absent, never
  * an empty string. jobId doubles as --job-id since it's already on hand.
+ *
+ * prompt is the dispatch prompt; a bounded INTENT SUMMARY of it (intentSummary) becomes
+ * the card's narrative body (--description, spec v0.8.0) so dispatch cards stop being
+ * title-only. Omitted/blank prompt → no --description (absent body, never "").
  */
-export function mintCard(jobId, workFolder, model, effort) {
+export function mintCard(jobId, workFolder, model, effort, prompt) {
   const startHead = getGitHead(workFolder);
   const args = [
     "create", "--state", "dispatched", "--actor", "claude-code",
@@ -79,6 +114,8 @@ export function mintCard(jobId, workFolder, model, effort) {
   ];
   if (model) args.push("--model", model);
   if (effort) args.push("--effort", effort);
+  const body = intentSummary(prompt);
+  if (body) args.push("--description", body);
   args.push("--job-id", jobId, jobId);
   const r = runJobcard(args);
   if (!r.ok) return { cardId: null, startHead, error: r.error };

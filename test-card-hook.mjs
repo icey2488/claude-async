@@ -64,7 +64,7 @@ process.env.CLAUDE_CLI_PATH = process.execPath; // node as "claude" — exits fa
 
 // ─── Imports (dynamic so env vars are set first) ──────────────────────────────
 
-const { mintCard, closeCard, getGitHead } = await import("./card-hook.mjs");
+const { mintCard, closeCard, getGitHead, intentSummary, INTENT_SUMMARY_MAX } = await import("./card-hook.mjs");
 const { startJob } = await import("./job-core.mjs");
 
 // ─── Git test repo ────────────────────────────────────────────────────────────
@@ -130,6 +130,35 @@ test("mintCard omits --model/--effort when not provided (absent means absent)", 
   assert(!log.includes("--model"), `expected no --model flag, got: ${log}`);
   assert(!log.includes("--effort"), `expected no --effort flag, got: ${log}`);
   assert(log.includes("--job-id\tjob-prov2"), `expected --job-id still present, got: ${log}`);
+});
+
+// ─── Test 1c: mintCard emits a bounded intent summary as --description ─────────
+
+test("mintCard passes the prompt's intent summary as --description (first sentence)", () => {
+  // A realistic dispatch prompt: a >200-char first line (intent sentence + boilerplate),
+  // so the rule extracts just the opening sentence rather than keeping the whole line.
+  const prompt = "Give the chip a vendor-keyed color. You are on native Windows as Raide. Repo lives on main which auto-deploys, gh.exe authed as icey2488, one-shot git-credential, never store creds, secret-scan every staged diff before committing.";
+  mintCard("job-desc1", REPO, null, null, prompt);
+  const fields = readLog().trim().split("\t");
+  const body = fields[fields.indexOf("--description") + 1];
+  assert(body === "Give the chip a vendor-keyed color.", `expected first sentence, got: ${JSON.stringify(body)}`);
+});
+
+test("mintCard omits --description when no prompt (absent body, never empty string)", () => {
+  mintCard("job-desc2", REPO, null, null);
+  const log = readLog();
+  assert(!log.includes("--description"), `expected no --description flag, got: ${log}`);
+});
+
+// ─── Test 1d: intentSummary extraction rule (unit) ────────────────────────────
+
+test("intentSummary: short first line used whole; long line → first sentence; else ellipsized", () => {
+  assert(intentSummary("Do the thing.") === "Do the thing.", "short whole line");
+  assert(intentSummary("") === null, "empty → null");
+  assert(intentSummary("\n\n  Fix it.  \nmore") === "Fix it.", "first non-empty line, trimmed");
+  const longNoSentence = "word ".repeat(60).trim(); // 300 chars, no . ? !
+  const s = intentSummary(longNoSentence);
+  assert(s.length <= INTENT_SUMMARY_MAX + 1 && s.endsWith("…"), `expected ellipsized ≤cap, got len ${s.length}`);
 });
 
 test("startJob threads its resolved model/effort into mintCard's flags", () => {

@@ -134,7 +134,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   const pid = launch(p, CLAUDE_BIN, argv, cwd);
 
-  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff);
+  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt);
   const meta = { jobId: id, pid, workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
