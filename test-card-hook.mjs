@@ -33,7 +33,7 @@ import fs from "node:fs";
 const [cmd, ...rest] = process.argv.slice(2);
 const LOG = ${JSON.stringify(LOG)};
 if (cmd === "create") {
-  fs.appendFileSync(LOG, "create\\t" + rest[rest.length - 1] + "\\n");
+  fs.appendFileSync(LOG, "create\\t" + rest.join("\\t") + "\\n");
   process.stdout.write(${JSON.stringify(MOCK_ID)} + "\\n");
 } else if (cmd === "done") {
   fs.appendFileSync(LOG, "done\\t" + rest[0] + "\\n");
@@ -108,7 +108,48 @@ test("card-id recorded on start (mintCard returns cardId)", () => {
   assert(error === null, `expected no error, got ${JSON.stringify(error)}`);
   assert(startHead === HEAD1, `expected HEAD1 ${HEAD1}, got ${startHead}`);
   const log = readLog();
-  assert(log.includes("create\tjob-t1"), `log should contain create entry, got: ${log}`);
+  assert(log.trim().endsWith("job-t1"), `log should end with title job-t1, got: ${log}`);
+});
+
+// ─── Test 1b: mintCard emits resolved model/effort/job-id as provenance flags ─
+
+test("mintCard passes resolved model/effort as --model/--effort, jobId as --job-id", () => {
+  mintCard("job-prov1", REPO, "claude-opus-4-8", "high");
+  const fields = readLog().trim().split("\t");
+  assert(fields[fields.indexOf("--model") + 1] === "claude-opus-4-8",
+    `expected --model claude-opus-4-8, got: ${fields.join(" ")}`);
+  assert(fields[fields.indexOf("--effort") + 1] === "high",
+    `expected --effort high, got: ${fields.join(" ")}`);
+  assert(fields[fields.indexOf("--job-id") + 1] === "job-prov1",
+    `expected --job-id job-prov1, got: ${fields.join(" ")}`);
+});
+
+test("mintCard omits --model/--effort when not provided (absent means absent)", () => {
+  mintCard("job-prov2", REPO);
+  const log = readLog();
+  assert(!log.includes("--model"), `expected no --model flag, got: ${log}`);
+  assert(!log.includes("--effort"), `expected no --effort flag, got: ${log}`);
+  assert(log.includes("--job-id\tjob-prov2"), `expected --job-id still present, got: ${log}`);
+});
+
+test("startJob threads its resolved model/effort into mintCard's flags", () => {
+  startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov3", model: "claude-opus-4-8", effort: "xhigh" });
+  const fields = readLog().trim().split("\t");
+  assert(fields[fields.indexOf("--model") + 1] === "claude-opus-4-8",
+    `expected resolved caller model in flags, got: ${fields.join(" ")}`);
+  assert(fields[fields.indexOf("--effort") + 1] === "xhigh",
+    `expected resolved caller effort in flags, got: ${fields.join(" ")}`);
+  try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-prov3"), { recursive: true, force: true }); } catch {}
+});
+
+test("startJob falls back to job-core's own model/effort defaults in mintCard's flags", () => {
+  startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov4" });
+  const fields = readLog().trim().split("\t");
+  assert(fields[fields.indexOf("--model") + 1] === "claude-sonnet-5",
+    `expected default model in flags, got: ${fields.join(" ")}`);
+  assert(fields[fields.indexOf("--effort") + 1] === "medium",
+    `expected default effort in flags, got: ${fields.join(" ")}`);
+  try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-prov4"), { recursive: true, force: true }); } catch {}
 });
 
 // Also verify startJob stores cardId in meta.json

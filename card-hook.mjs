@@ -65,13 +65,22 @@ export function getGitHead(dir) {
  * Mint a dispatch card for jobId. Returns { cardId, startHead, error }.
  * cardId is null and error is set when the jobcard command fails (fail-open).
  * startHead is the git HEAD sha at dispatch time (null for non-repos).
+ *
+ * model/effort are the job's RESOLVED dispatch provenance (caller-supplied value or
+ * job-core's own default — never raw/possibly-absent), recorded inside created_by
+ * (spec v0.7.0). Both optional: omitted means the corresponding key is absent, never
+ * an empty string. jobId doubles as --job-id since it's already on hand.
  */
-export function mintCard(jobId, workFolder) {
+export function mintCard(jobId, workFolder, model, effort) {
   const startHead = getGitHead(workFolder);
-  const r = runJobcard([
+  const args = [
     "create", "--state", "dispatched", "--actor", "claude-code",
-    "--project", "Dispatch Log", jobId,
-  ]);
+    "--project", "Dispatch Log",
+  ];
+  if (model) args.push("--model", model);
+  if (effort) args.push("--effort", effort);
+  args.push("--job-id", jobId, jobId);
+  const r = runJobcard(args);
   if (!r.ok) return { cardId: null, startHead, error: r.error };
   return { cardId: r.stdout || null, startHead, error: null };
 }

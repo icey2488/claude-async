@@ -117,7 +117,8 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
 
   const cwd = workFolder || DEFAULT_CWD;
   const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
-  argv.push("--model", model || DEFAULT_MODEL);
+  const resolvedModel = model || DEFAULT_MODEL;
+  argv.push("--model", resolvedModel);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
   if (eff === "ultracode") {
@@ -133,8 +134,8 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   const pid = launch(p, CLAUDE_BIN, argv, cwd);
 
-  const { cardId, startHead, error: cardError } = mintCard(id, cwd);
-  const meta = { jobId: id, pid, workFolder: cwd, model: model || DEFAULT_MODEL, effort: eff,
+  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff);
+  const meta = { jobId: id, pid, workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
