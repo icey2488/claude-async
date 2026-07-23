@@ -100,6 +100,8 @@ Optional environment variables:
 | `CLAUDE_CLI_PATH` | `claude` (on PATH) | Path to the `claude` binary |
 | `CLAUDE_ASYNC_JOB_DIR` | `~/.claude-async-jobs` | Where per-job logs and exit codes are stored |
 | `CLAUDE_ASYNC_DEFAULT_CWD` | `$HOME` | Default working directory for jobs |
+| `CLAUDE_ASYNC_DEFAULT_MODEL` | `claude-sonnet-4-6` | Model used when `claude_start`'s `model` param is omitted |
+| `CLAUDE_ASYNC_DEFAULT_EFFORT` | `medium` | Reasoning effort used when `claude_start`'s `effort` param is omitted |
 
 ## How it works
 

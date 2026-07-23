@@ -29,10 +29,19 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   cause `spawn ENAMETOOLONG` (exit 127). Pass large content via files instead of inline in
   the prompt.
 
+## Dispatch defaults (model + effort)
+
+- `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /
+  `claude-sonnet-4-6`). The default is `claude-sonnet-4-6` (override via the
+  `CLAUDE_ASYNC_DEFAULT_MODEL` env var). This is deliberately the cheapest/fastest broadly-capable
+  tier — an unspecified `model` used to inherit the `claude` CLI's own default (Fable), which
+  combined with the old xhigh effort default absorbed 99.6% of dispatch spend on 2026-07-23.
+  Explicit `model` always overrides the default.
+
 ## Effort levels
 
 - `claude_start` accepts an `effort` param: `low | medium | high | xhigh | max | ultracode`.
-  The default is `xhigh` (override the default via the `CLAUDE_ASYNC_DEFAULT_EFFORT` env var).
+  The default is `medium` (override the default via the `CLAUDE_ASYNC_DEFAULT_EFFORT` env var).
 - `max` = highest reasoning effort.
 - `ultracode` = xhigh effort **plus** standing dynamic-workflow orchestration (parallel
   subagents). The bridge wires it via both `--effort xhigh` **and**

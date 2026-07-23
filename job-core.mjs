@@ -24,9 +24,12 @@ const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runn
 // Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
 // preventing a project .mcp.json from recursively respawning claude-async.
 const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
-// Reasoning effort: default xhigh, overridable per-process. FLAG_EFFORT are the levels that
-// map straight to `--effort`; "ultracode" is a composite handled separately (see startJob).
-const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "xhigh";
+// Dispatch defaults: fail-SAFE, not fail-EXPENSIVE. An unspecified job used to inherit the
+// `claude` CLI's own default model (Fable) at xhigh effort — the priciest configuration
+// available — and that combination absorbed 99.6% of dispatch spend on 2026-07-23. Both
+// defaults below are overridable per-process; explicit caller-supplied model/effort always win.
+const DEFAULT_MODEL = process.env.CLAUDE_ASYNC_DEFAULT_MODEL || "claude-sonnet-4-6";
+const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "medium";
 const FLAG_EFFORT = new Set(["low", "medium", "high", "xhigh", "max"]);
 fs.mkdirSync(JOB_ROOT, { recursive: true });
 
@@ -114,7 +117,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
 
   const cwd = workFolder || DEFAULT_CWD;
   const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
-  if (model) argv.push("--model", model);
+  argv.push("--model", model || DEFAULT_MODEL);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
   if (eff === "ultracode") {
@@ -131,7 +134,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   const pid = launch(p, CLAUDE_BIN, argv, cwd);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd);
-  const meta = { jobId: id, pid, workFolder: cwd, model: model || null, effort: eff,
+  const meta = { jobId: id, pid, workFolder: cwd, model: model || DEFAULT_MODEL, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
@@ -230,9 +233,10 @@ export function registerTools(server) {
       prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
       workFolder: z.string().optional().describe("Directory to run in (default: $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
       jobId: z.string().optional().describe("Custom job id; otherwise one is generated."),
-      model: z.string().optional().describe("Optional --model override, e.g. claude-opus-4-8 / claude-sonnet-4-6."),
+      model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-4-6. " +
+                  "Default claude-sonnet-4-6 (fail-safe; override via CLAUDE_ASYNC_DEFAULT_MODEL)."),
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultracode"]).optional()
-        .describe("Reasoning effort; default xhigh. \"max\" = highest reasoning; " +
+        .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
                   "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),
     },
   }, async (args) => ok(startJob(args)));
