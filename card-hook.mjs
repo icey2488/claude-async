@@ -65,6 +65,13 @@ export const INTENT_SUMMARY_MAX = 200;
  *   4. failing that, cut at the last word boundary and ellipsize.
  * Never dumps the whole prompt onto the card. Returns null for an empty/blank/non-string
  * prompt, so the caller simply omits --description (absent body, never an empty string).
+ *
+ * This HEURISTIC is a FALLBACK: it is brittle (a prompt that does not open with its intent
+ * gets a poor body). The robust path is an EXPLICIT intent supplied by the dispatcher
+ * (mintCard's `intent` arg / claude_start's `intent` input) — see `boundIntent`. We do NOT
+ * put a model call on the mint path: that would trade a mild failure (a truncated line) for
+ * a worse one (mint blocks or fails when the model is unavailable) on a path that today
+ * cannot fail. Explicit-when-known, heuristic-when-not.
  */
 export function intentSummary(prompt) {
   if (typeof prompt !== "string") return null;
@@ -77,6 +84,23 @@ export function intentSummary(prompt) {
   if (sentence) return sentence[1];
   // No sentence boundary in range → last word boundary, ellipsized.
   const clipped = line.slice(0, INTENT_SUMMARY_MAX);
+  const lastSpace = clipped.lastIndexOf(" ");
+  return (lastSpace > 40 ? clipped.slice(0, lastSpace) : clipped).trimEnd() + "…";
+}
+
+/**
+ * Bound an EXPLICIT dispatcher-supplied intent for the card body. Unlike `intentSummary`,
+ * this does NOT re-extract a first line/sentence — an explicit intent IS already the summary,
+ * so mangling it would defeat the point. It only trims and applies the same hard length cap
+ * (word-boundary ellipsis) as a storage-abuse safety bound. Returns null for an empty/blank/
+ * non-string value, so the caller falls back to the heuristic.
+ */
+export function boundIntent(intent) {
+  if (typeof intent !== "string") return null;
+  const s = intent.trim();
+  if (!s) return null;
+  if (s.length <= INTENT_SUMMARY_MAX) return s;
+  const clipped = s.slice(0, INTENT_SUMMARY_MAX);
   const lastSpace = clipped.lastIndexOf(" ");
   return (lastSpace > 40 ? clipped.slice(0, lastSpace) : clipped).trimEnd() + "…";
 }
@@ -102,11 +126,15 @@ export function getGitHead(dir) {
  * (spec v0.7.0). Both optional: omitted means the corresponding key is absent, never
  * an empty string. jobId doubles as --job-id since it's already on hand.
  *
- * prompt is the dispatch prompt; a bounded INTENT SUMMARY of it (intentSummary) becomes
- * the card's narrative body (--description, spec v0.8.0) so dispatch cards stop being
- * title-only. Omitted/blank prompt → no --description (absent body, never "").
+ * The card's narrative body (--description, spec v0.8.0) so dispatch cards stop being
+ * title-only. TWO SOURCES, explicit-first (the middle path — no model call on the mint path):
+ *   1. `intent` — an EXPLICIT intent string supplied by the dispatcher (claude_start's
+ *      `intent` input). When present/non-blank it WINS, bounded verbatim by `boundIntent`.
+ *   2. else the `prompt`'s bounded first-line/first-sentence heuristic (`intentSummary`) —
+ *      unchanged fallback.
+ * Both omitted/blank → no --description (absent body, never "").
  */
-export function mintCard(jobId, workFolder, model, effort, prompt) {
+export function mintCard(jobId, workFolder, model, effort, prompt, intent) {
   const startHead = getGitHead(workFolder);
   const args = [
     "create", "--state", "dispatched", "--actor", "claude-code",
@@ -114,7 +142,7 @@ export function mintCard(jobId, workFolder, model, effort, prompt) {
   ];
   if (model) args.push("--model", model);
   if (effort) args.push("--effort", effort);
-  const body = intentSummary(prompt);
+  const body = boundIntent(intent) || intentSummary(prompt);  // explicit wins; heuristic fallback
   if (body) args.push("--description", body);
   args.push("--job-id", jobId, jobId);
   const r = runJobcard(args);

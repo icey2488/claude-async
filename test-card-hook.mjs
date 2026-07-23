@@ -64,7 +64,7 @@ process.env.CLAUDE_CLI_PATH = process.execPath; // node as "claude" — exits fa
 
 // ─── Imports (dynamic so env vars are set first) ──────────────────────────────
 
-const { mintCard, closeCard, getGitHead, intentSummary, INTENT_SUMMARY_MAX } = await import("./card-hook.mjs");
+const { mintCard, closeCard, getGitHead, intentSummary, boundIntent, INTENT_SUMMARY_MAX } = await import("./card-hook.mjs");
 const { startJob } = await import("./job-core.mjs");
 
 // ─── Git test repo ────────────────────────────────────────────────────────────
@@ -159,6 +159,57 @@ test("intentSummary: short first line used whole; long line → first sentence; 
   const longNoSentence = "word ".repeat(60).trim(); // 300 chars, no . ? !
   const s = intentSummary(longNoSentence);
   assert(s.length <= INTENT_SUMMARY_MAX + 1 && s.endsWith("…"), `expected ellipsized ≤cap, got len ${s.length}`);
+});
+
+// ─── Test 1e: explicit intent (the middle path) takes precedence over the heuristic ───
+
+test("mintCard prefers an EXPLICIT intent over the prompt heuristic", () => {
+  // Prompt's heuristic would yield "First line opener." — the explicit intent must win.
+  const prompt = "First line opener.\nmore body text that the heuristic would never reach";
+  mintCard("job-desc3", REPO, null, null, prompt, "Ship the vendor-color chip fix");
+  const fields = readLog().trim().split("\t");
+  const body = fields[fields.indexOf("--description") + 1];
+  assert(body === "Ship the vendor-color chip fix",
+    `expected explicit intent as body, got: ${JSON.stringify(body)}`);
+});
+
+test("mintCard falls back to the heuristic when no explicit intent is supplied (unchanged)", () => {
+  // Blank/absent explicit intent → the existing intentSummary heuristic, untouched (first
+  // non-empty LINE used whole when it fits the cap).
+  const prompt = "Give the chip a vendor-keyed color.\nThen wire it up.";
+  mintCard("job-desc4", REPO, null, null, prompt, "   ");   // blank explicit → fall back
+  const fields = readLog().trim().split("\t");
+  const body = fields[fields.indexOf("--description") + 1];
+  assert(body === "Give the chip a vendor-keyed color.",
+    `expected heuristic first-line fallback, got: ${JSON.stringify(body)}`);
+});
+
+test("mintCard omits --description when neither explicit intent nor prompt is usable", () => {
+  mintCard("job-desc5", REPO, null, null, "", "");
+  const log = readLog();
+  assert(!log.includes("--description"), `expected no --description, got: ${log}`);
+});
+
+test("boundIntent: verbatim when short, ellipsized when long, null when blank/non-string", () => {
+  assert(boundIntent("Ship it.") === "Ship it.", "short verbatim (no first-line/sentence mangling)");
+  assert(boundIntent("  trimmed  ") === "trimmed", "trimmed");
+  assert(boundIntent("") === null && boundIntent("   ") === null, "blank → null");
+  assert(boundIntent(undefined) === null && boundIntent(42) === null, "non-string → null");
+  // A multi-sentence explicit intent is kept whole (unlike intentSummary, which cuts to one).
+  assert(boundIntent("Do A. Then B. Then C.") === "Do A. Then B. Then C.", "explicit multi-sentence kept whole");
+  const long = "z".repeat(INTENT_SUMMARY_MAX + 50);
+  const b = boundIntent(long);
+  assert(b.length <= INTENT_SUMMARY_MAX + 1 && b.endsWith("…"), `expected ellipsized ≤cap, got len ${b.length}`);
+});
+
+test("startJob threads an explicit intent into mintCard's --description", () => {
+  startJob({ prompt: "some prompt opener.", workFolder: REPO, jobId: "job-intent1",
+             intent: "Explicit dispatcher intent" });
+  const fields = readLog().trim().split("\t");
+  const body = fields[fields.indexOf("--description") + 1];
+  assert(body === "Explicit dispatcher intent",
+    `expected explicit intent threaded through startJob, got: ${JSON.stringify(body)}`);
+  try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-intent1"), { recursive: true, force: true }); } catch {}
 });
 
 test("startJob threads its resolved model/effort into mintCard's flags", () => {

@@ -109,7 +109,7 @@ function launch(p, command, argv, cwd) {
   return child.pid;
 }
 
-export function startJob({ prompt, workFolder, jobId, model, effort }) {
+export function startJob({ prompt, workFolder, jobId, model, effort, intent }) {
   const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
   const p = jobPaths(id);
   if (fs.existsSync(p.d)) return { error: `jobId ${id} already exists` };
@@ -134,7 +134,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort }) {
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   const pid = launch(p, CLAUDE_BIN, argv, cwd);
 
-  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt);
+  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
   const meta = { jobId: id, pid, workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
@@ -232,6 +232,9 @@ export function registerTools(server) {
                  "Use for any work that might run longer than ~30s. Poll with claude_check.",
     inputSchema: {
       prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
+      intent: z.string().optional().describe("Optional one-line intent for the dispatch card body. " +
+                  "When supplied it is used verbatim (bounded); otherwise a heuristic summary of the " +
+                  "prompt's opener is used. Prefer supplying this for a clean card face."),
       workFolder: z.string().optional().describe("Directory to run in (default: $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
       jobId: z.string().optional().describe("Custom job id; otherwise one is generated."),
       model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-5. " +
