@@ -121,10 +121,9 @@ export function getGitHead(dir) {
  * cardId is null and error is set when the jobcard command fails (fail-open).
  * startHead is the git HEAD sha at dispatch time (null for non-repos).
  *
- * model/effort are the job's RESOLVED dispatch provenance (caller-supplied value or
+ * model/effort/jobId are the job's dispatch provenance (caller-supplied value or
  * job-core's own default — never raw/possibly-absent), recorded inside created_by
- * (spec v0.7.0). Both optional: omitted means the corresponding key is absent, never
- * an empty string. jobId doubles as --job-id since it's already on hand.
+ * (spec v0.7.0) via --job-id. Provenance only — jobId never appears on the card face.
  *
  * The card's narrative body (--description, spec v0.8.0) so dispatch cards stop being
  * title-only. TWO SOURCES, explicit-first (the middle path — no model call on the mint path):
@@ -133,6 +132,11 @@ export function getGitHead(dir) {
  *   2. else the `prompt`'s bounded first-line/first-sentence heuristic (`intentSummary`) —
  *      unchanged fallback.
  * Both omitted/blank → no --description (absent body, never "").
+ *
+ * The TITLE (the board face most users actually see) is that same summary — the
+ * one-line intent, not the jobId, which stays confined to provenance. If neither
+ * source yields a body (no intent, no prompt), jobId is the last-resort title so the
+ * positional arg is never sent blank.
  */
 export function mintCard(jobId, workFolder, model, effort, prompt, intent) {
   const startHead = getGitHead(workFolder);
@@ -144,7 +148,7 @@ export function mintCard(jobId, workFolder, model, effort, prompt, intent) {
   if (effort) args.push("--effort", effort);
   const body = boundIntent(intent) || intentSummary(prompt);  // explicit wins; heuristic fallback
   if (body) args.push("--description", body);
-  args.push("--job-id", jobId, jobId);
+  args.push("--job-id", jobId, body || jobId);
   const r = runJobcard(args);
   if (!r.ok) return { cardId: null, startHead, error: r.error };
   return { cardId: r.stdout || null, startHead, error: null };

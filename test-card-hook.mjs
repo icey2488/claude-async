@@ -190,6 +190,22 @@ test("mintCard omits --description when neither explicit intent nor prompt is us
   assert(!log.includes("--description"), `expected no --description, got: ${log}`);
 });
 
+// ─── Test 1f: card TITLE carries the intent summary, not the jobId ────────────
+
+test("mintCard uses the intent summary as the card TITLE, not the jobId", () => {
+  mintCard("job-title1", REPO, null, null, null, "Ship the vendor-color chip fix");
+  const log = readLog();
+  assert(log.trim().endsWith("Ship the vendor-color chip fix"),
+    `expected title to be the intent summary, got: ${log}`);
+  assert(log.includes("--job-id\tjob-title1"), `expected jobId only in provenance, got: ${log}`);
+});
+
+test("mintCard falls back to jobId as TITLE when neither intent nor prompt is usable", () => {
+  mintCard("job-title2", REPO);
+  const log = readLog();
+  assert(log.trim().endsWith("job-title2"), `expected jobId fallback title, got: ${log}`);
+});
+
 test("boundIntent: verbatim when short, ellipsized when long, null when blank/non-string", () => {
   assert(boundIntent("Ship it.") === "Ship it.", "short verbatim (no first-line/sentence mangling)");
   assert(boundIntent("  trimmed  ") === "trimmed", "trimmed");

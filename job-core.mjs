@@ -232,7 +232,8 @@ export function registerTools(server) {
                  "Use for any work that might run longer than ~30s. Poll with claude_check.",
     inputSchema: {
       prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
-      intent: z.string().optional().describe("Optional one-line intent for the dispatch card body. " +
+      intent: z.string().optional().describe("Optional one-line intent that becomes the dispatch card's " +
+                  "TITLE (the board face most users actually see — the jobId never appears there). " +
                   "When supplied it is used verbatim (bounded); otherwise a heuristic summary of the " +
                   "prompt's opener is used. Prefer supplying this for a clean card face."),
       workFolder: z.string().optional().describe("Directory to run in (default: $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
