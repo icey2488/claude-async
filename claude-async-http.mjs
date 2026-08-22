@@ -3,7 +3,8 @@
  * claude-async-http.mjs — HTTP/HTTPS entrypoint (Architecture B).
  * Stateless, loopback-only Streamable HTTP MCP server. Serves TLS when CLAUDE_ASYNC_TLS_CERT +
  * CLAUDE_ASYNC_TLS_KEY are set (else plain HTTP for local checks). Same tools/logic as the stdio
- * server. Register in the app's Connectors UI as: https://127.0.0.1:<port>/mcp
+ * server. Register in the app's Connectors UI as: http://127.0.0.1:<port>/mcp
+ * (this deployment runs plain HTTP — no TLS cert/key are set; see ecosystem.config.cjs)
  * Security: binds to 127.0.0.1 ONLY + DNS-rebinding protection scoped to loopback.
  * Env: CLAUDE_ASYNC_HTTP_PORT (default 7842), CLAUDE_ASYNC_TLS_CERT, CLAUDE_ASYNC_TLS_KEY.
  * Self-test: node claude-async-http.mjs --selftest

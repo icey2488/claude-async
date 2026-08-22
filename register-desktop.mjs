@@ -33,9 +33,16 @@ const candidates = [...msixCandidates(), path.join(APPDATA, "Claude", "claude_de
 const configPath = candidates.find((c) => fs.existsSync(c)) || candidates[candidates.length - 1];
 
 // Resolve binaries (absolute, so the app's minimal PATH can't matter).
+// Known install layouts, most-current first: the native installer drops claude.exe in
+// ~/.local/bin; the legacy npm global put it under %APPDATA%\npm. Pick whichever exists
+// so a stale layout can't silently register a path that spawns ENOENT.
+const CLI_FALLBACKS = [
+  path.join(HOME, ".local", "bin", "claude.exe"),
+  path.join(APPDATA, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+];
 const NODE = process.execPath;
 const CLAUDE_EXE = process.env.CLAUDE_CLI_PATH ||
-  path.join(APPDATA, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe");
+  CLI_FALLBACKS.find((p) => fs.existsSync(p)) || CLI_FALLBACKS[0];
 const SERVER = path.join(PROJECT_DIR, "claude-async-server.mjs");
 const JOB_DIR = path.join(HOME, ".claude-async-jobs");
 
@@ -45,9 +52,20 @@ const entry = {
   env: { CLAUDE_CLI_PATH: CLAUDE_EXE, CLAUDE_ASYNC_JOB_DIR: JOB_DIR },
 };
 
-const warnings = [];
-if (!fs.existsSync(CLAUDE_EXE)) warnings.push(`claude.exe not found at ${CLAUDE_EXE}`);
-if (!fs.existsSync(SERVER)) warnings.push(`server not found at ${SERVER}`);
+// Registering a path that does not exist yields a config the app accepts but cannot spawn
+// (exit 127 / ENOENT at dispatch time), so these are aborts, not warnings. --force keeps the
+// old behaviour for bootstrapping a machine where the binaries land after registration.
+const FORCE = process.argv.includes("--force");
+const problems = [];
+if (!fs.existsSync(CLAUDE_EXE)) problems.push(`claude.exe not found at ${CLAUDE_EXE}`);
+if (!fs.existsSync(SERVER)) problems.push(`server not found at ${SERVER}`);
+
+if (problems.length && !FORCE) {
+  console.error("ABORT:\n - " + problems.join("\n - "));
+  console.error("Nothing changed. Set CLAUDE_CLI_PATH, or re-run with --force to register anyway.");
+  process.exit(1);
+}
+const warnings = problems;
 
 fs.mkdirSync(path.dirname(configPath), { recursive: true });
 
@@ -64,8 +82,12 @@ if (existedBefore) {
 }
 if (!cfg.mcpServers || typeof cfg.mcpServers !== "object") cfg.mcpServers = {};
 
-const before = cfg.mcpServers["claude-async"] ? JSON.stringify(cfg.mcpServers["claude-async"]) : "(absent)";
-cfg.mcpServers["claude-async"] = entry;
+const existing = cfg.mcpServers["claude-async"];
+const before = existing ? JSON.stringify(existing) : "(absent)";
+// Keep operator-set env keys this script does not manage (e.g. CLAUDE_ASYNC_DEFAULT_CWD);
+// the keys it does manage still win. Without this, re-registration silently reverts them.
+const merged = { ...entry, env: { ...existing?.env, ...entry.env } };
+cfg.mcpServers["claude-async"] = merged;
 
 fs.writeFileSync(configPath, JSON.stringify(cfg, null, 2) + "\n");
 JSON.parse(fs.readFileSync(configPath, "utf8")); // confirm still valid JSON
@@ -74,6 +96,6 @@ console.log(`Config file        : ${configPath}`);
 console.log(`Existed before     : ${existedBefore}`);
 console.log(`Servers now present: ${Object.keys(cfg.mcpServers).join(", ")}`);
 console.log(`claude-async before: ${before}`);
-console.log(`claude-async after : ${JSON.stringify(entry)}`);
+console.log(`claude-async after : ${JSON.stringify(merged)}`);
 if (warnings.length) console.log("WARNINGS:\n - " + warnings.join("\n - "));
 console.log("DONE");

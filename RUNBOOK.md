@@ -50,3 +50,20 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   (it previously relied on `settings.json` to govern effort). (See the effort routing in
   `job-core.mjs`.)
 - The resolved effort level is recorded in each job's `meta.json` and shown by `claude_check`.
+
+## Field notes — 2026-08 migration
+
+- **Ollama restarts must kill `llama-server.exe` by name.** Killing the parent `ollama.exe`
+  process leaves orphaned `llama-server.exe` children running — they survive the parent kill
+  and continue holding VRAM, so a "restart" that only stops the parent doesn't free GPU memory.
+- **Dispatched jobs may spawn without the user's PATH.** A detached job's environment isn't
+  guaranteed to include the interactive shell PATH, so invoke `ollama.exe`, `nvidia-smi`, and
+  `setx` by absolute path rather than relying on PATH resolution.
+- **The Desktop install on this machine is Squirrel (`%APPDATA%\Claude`), not MSIX.** Prior
+  docs assumed MSIX packaging; that assumption is stale for this machine and any install-path
+  or update-mechanism logic should check for the Squirrel layout first.
+- **Detached jobs cannot answer questions.** A background job has no one to prompt mid-run, so
+  every stop-condition needs a pre-decided answer or a hard abort baked in up front — decisions
+  can only come back in the *next* dispatch, not mid-job.
+- **Models larger than 14B at Q4 CPU-split on the 8GB 4060 Ti.** Anything above that size
+  exceeds available VRAM and falls back to partial CPU offload, with the expected throughput hit.
