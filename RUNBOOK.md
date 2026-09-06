@@ -67,3 +67,11 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   can only come back in the *next* dispatch, not mid-job.
 - **Models larger than 14B at Q4 CPU-split on the 8GB 4060 Ti.** Anything above that size
   exceeds available VRAM and falls back to partial CPU offload, with the expected throughput hit.
+- **An external exe invoked bare in a job shell can fail silently: empty stdout AND an empty
+  exit code**, distinct from a normal PATH-less-spawn error. Observed with `python.exe` invoked
+  via `&` — both stdout and `$LASTEXITCODE` came back empty, giving no signal that anything went
+  wrong. `Start-Process` with `-RedirectStandardOutput`/`-RedirectStandardError` and `-PassThru`
+  revealed the real exit code and output. Mitigation: prefer PowerShell cmdlets over external
+  exes in dispatched jobs; when an exe must be called, capture via `Start-Process` redirection
+  rather than `&`/pipeline capture, and treat empty-output-empty-exit-code as an anomaly to
+  retry, never as evidence the call did nothing (card d03c097d).
