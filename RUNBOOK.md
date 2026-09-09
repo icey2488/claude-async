@@ -122,3 +122,16 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   the assumption. Fixed by `sanitizeEnvForWin32()` in `job-core.mjs`, which repairs `PATHEXT`
   (missing, empty, or lacking `.EXE`) before both spawns that matter: the `launchWin32()` wrapper
   spawn and `job-runner.mjs`'s spawn of the `claude` CLI. See `test/pathext-integrity.mjs`.
+- **The `powershell.exe` hop is not a byte-identical pass-through of the environment it inherits,
+  even before `CreateProcessW`/`lpEnvironment=NULL` come into play.** Confirmed empirically
+  (`powershell.exe -NoProfile -NonInteractive`, variables stripped from the parent first):
+  PowerShell's own startup sets `PSModulePath` if it was absent, and defaults `TEMP` (not `TMP`)
+  if absent. `test/env-integrity.mjs` only asserts `PATH`/`PATHEXT`/a sentinel survive intact — it
+  does not (and given the above, cannot) claim the full environment block is byte-for-byte
+  identical across the win32-breakaway path. See `win32-breakaway.ps1`'s header for detail.
+- **A wrapper-fallback `meta.pid` can heal wrong if the poll window races a job dir reused across
+  restarts.** `launchWin32()`'s `readRunnerPid()` polls `runner.pid` for 2s before falling back to
+  the PowerShell wrapper's own (short-lived) pid; `checkJob()`'s `healMetaPid()` re-reads
+  `runner.pid` later and adopts it if that pid is alive and looks like ours. `launchWin32()` now
+  deletes any stray `runner.pid` before spawning to keep this from ever reading a stale file. See
+  `test/pid-heal.mjs`.

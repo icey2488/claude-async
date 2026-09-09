@@ -22,6 +22,13 @@
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
  * on the same volume. This prevents checkJob from reading a truncated file between the
  * open-for-write and the data flush of a direct overwrite.
+ *
+ * CLAUDE_ASYNC_TEST_DELAY_PIDFILE_MS: test-only knob (see test/pid-heal.mjs) that delays the
+ * runner.pid write below by the given number of milliseconds, letting a test force job-core.mjs's
+ * launchWin32()/readRunnerPid() poll window to expire so it falls back to the wrapper's pid --
+ * exercising checkJob's healMetaPid() path deterministically instead of racing a real timing
+ * window. Uses Atomics.wait for a synchronous block since the pid write happens before any async
+ * machinery (heartbeat, child spawn) is set up. Production never sets this env var.
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -31,6 +38,11 @@ import { sanitizeEnvForWin32, logIfPathextSanitized } from "./job-core.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
+
+const pidWriteDelayMs = Number(process.env.CLAUDE_ASYNC_TEST_DELAY_PIDFILE_MS) || 0;
+if (pidWriteDelayMs > 0) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pidWriteDelayMs);
+}
 
 // Written before anything else that could fail. On win32 the runner may be launched via the
 // CREATE_BREAKAWAY_FROM_JOB shell-out (see job-core.mjs launch()), so the pid job-core gets

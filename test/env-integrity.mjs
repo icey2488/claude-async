@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 /**
  * test/env-integrity.mjs — proves a job launched through job-core.mjs's real startJob()/launch()
- * inherits its environment byte-for-byte from the process that called startJob(), on both the
- * pre-5a09feb direct-spawn path and the current win32-breakaway.ps1 path.
+ * carries PATH, PATHEXT, and a sentinel variable through identically from the process that called
+ * startJob(), on both the pre-5a09feb direct-spawn path and the current win32-breakaway.ps1 path.
+ * This is NOT a full-environment-block comparison (the win32 path hops through powershell.exe,
+ * which can inject/alter a few variables of its own before CreateProcessW ever runs -- e.g.
+ * PSModulePath, TEMP -- see win32-breakaway.ps1's header); it only asserts the three variables
+ * this bridge actually depends on downstream survive intact.
  *
  * Mechanism: CLAUDE_CLI_PATH is pointed at test/dummy-env-dumper.exe (a real .exe is required --
  * see test/build-dummy-claude.ps1's identical note about job-runner.mjs's shell-less spawn), which
@@ -106,9 +110,16 @@ const REAL_CORE = path.join(REPO, "job-core.mjs");
 const OLD_CORE_SNAPSHOT = path.join(REPO, ".job-core-before-env-test.mjs");
 const DUMPER_EXE = path.join(REPO, "test", "dummy-env-dumper.exe");
 
-const gitShow = spawnSync("git", ["show", "HEAD~1:job-core.mjs"], { cwd: REPO, encoding: "utf8" });
+// Pinned to 7effb28762c58a43e260aad7e655802a9579b68f (5a09feb^), the last commit before the
+// win32 breakaway fix -- same rationale and same commit as test/detach-survival.mjs's
+// PRE_FIX_COMMIT. HEAD~1 is NOT safe here: as more commits land on top of the fix, HEAD~1 drifts
+// forward and stops pointing at a pre-breakaway job-core.mjs, silently turning this into a
+// before-vs-after comparison of two copies of the SAME (post-fix) code -- which is exactly what
+// happened once 9c06ff3 and 4b74d0c landed on top of this test's original HEAD~1 reference.
+const PRE_FIX_COMMIT = "7effb28762c58a43e260aad7e655802a9579b68f";
+const gitShow = spawnSync("git", ["show", `${PRE_FIX_COMMIT}:job-core.mjs`], { cwd: REPO, encoding: "utf8" });
 if (gitShow.status !== 0) {
-  console.error("Could not obtain pre-5a09feb job-core.mjs via `git show HEAD~1:job-core.mjs`:", gitShow.stderr);
+  console.error(`Could not obtain pre-5a09feb job-core.mjs via \`git show ${PRE_FIX_COMMIT}:job-core.mjs\`:`, gitShow.stderr);
   process.exit(1);
 }
 fs.writeFileSync(OLD_CORE_SNAPSHOT, gitShow.stdout);

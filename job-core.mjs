@@ -134,6 +134,28 @@ function isOurProcess(pid) {
   return name.includes("node") || name.includes("claude");
 }
 
+// launchWin32's pid-poll window (RUNNER_PID_POLL_MS) can expire before job-runner.mjs writes
+// runner.pid, in which case meta.pid is the PowerShell wrapper's pid (pidSource:
+// "wrapper-fallback") -- and the wrapper exits within milliseconds of spawning the real runner,
+// so pidAlive(meta.pid) goes false almost immediately even though the runner itself is healthy.
+// Before checkJob trusts a pidAlive()===false result enough to declare a job died, it calls this
+// to see whether runner.pid has since appeared (job-runner.mjs writes it as its first action) and
+// points to a live, ours-looking process; if so it heals meta.json in place and the caller treats
+// the job as running. Returns true iff healed.
+function healMetaPid(p, meta) {
+  try {
+    const raw = fs.readFileSync(path.join(p.d, "runner.pid"), "utf8").trim();
+    if (!raw) return false;
+    const runnerPid = Number(raw);
+    if (!runnerPid || runnerPid === meta.pid) return false;
+    if (!pidAlive(runnerPid) || !isOurProcess(runnerPid)) return false;
+    meta.pid = runnerPid;
+    meta.pidSource = "runner-healed";
+    try { fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); } catch {}
+    return true;
+  } catch { return false; }
+}
+
 // Reads the runner_heartbeat file; returns a Date or null on any failure.
 function readLastAlive(hbPath) {
   try {
@@ -182,15 +204,18 @@ async function readRunnerPid(p, fallbackPid) {
   while (Date.now() < deadline) {
     try {
       const raw = fs.readFileSync(pidPath, "utf8").trim();
-      if (raw) return Number(raw);
+      if (raw) return { pid: Number(raw), pidSource: "runner" };
     } catch { /* not written yet */ }
     await sleep(RUNNER_PID_POLL_INTERVAL_MS);
   }
   // Timed out -- fall back to the pid we were handed (the wrapper's, on win32), noting the
   // uncertainty so a future reader of meta.json/err.log understands why pid tracking may be off.
+  // pidSource: "wrapper-fallback" flags this in meta.json so checkJob knows this pid may belong
+  // to a process (the PowerShell wrapper) that exits within milliseconds of spawning the real
+  // runner -- see checkJob's healMetaPid() for how a stale wrapper pid gets healed later.
   try { fs.appendFileSync(p.err, `\n[job-core] runner.pid did not appear within ${RUNNER_PID_POLL_MS}ms; ` +
     `falling back to launcher pid ${fallbackPid} (may be a shell wrapper, not the runner itself)\n`); } catch {}
-  return fallbackPid;
+  return { pid: fallbackPid, pidSource: "wrapper-fallback" };
 }
 
 // win32: node's child_process has no option to request CREATE_BREAKAWAY_FROM_JOB, and a plain
@@ -222,6 +247,12 @@ async function readRunnerPid(p, fallbackPid) {
 // this is the first of the two hops it patches; job-runner.mjs's own spawn of the CLI is the
 // second, belt-and-suspenders in case a future launch path bypasses this one).
 async function launchWin32(p) {
+  // A stray runner.pid can only exist here if a prior job dir at this same path was left behind
+  // without a clean startJob() (startJob() itself refuses to reuse an existing job dir -- see
+  // its fs.existsSync(p.d) guard -- so this is defense in depth, not a path this code expects to
+  // hit in practice). Removing it up front guarantees readRunnerPid() below can only observe a
+  // runner.pid written by the runner.mjs we are about to spawn, never a leftover from one we didn't.
+  try { fs.unlinkSync(path.join(p.d, "runner.pid")); } catch {}
   const env = sanitizeEnvForWin32(process.env);
   logIfPathextSanitized(p.err, process.env, env, "spawning the win32 breakaway wrapper");
   const child = spawn("powershell.exe",
@@ -237,7 +268,7 @@ function launchPosix(p) {
   const child = spawn(process.execPath, [RUNNER, p.spec], { detached: true, stdio: "ignore" });
   child.on("error", (e) => recordLaunchFailure(p, `failed to spawn job-runner: ${e.message}`));
   child.unref();
-  return child.pid;
+  return { pid: child.pid, pidSource: "runner" };
 }
 
 async function launch(p, command, argv, cwd) {
@@ -268,10 +299,10 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
-  const pid = await launch(p, CLAUDE_BIN, argv, cwd);
+  const { pid, pidSource } = await launch(p, CLAUDE_BIN, argv, cwd);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
-  const meta = { jobId: id, pid, workFolder: cwd, model: resolvedModel, effort: eff,
+  const meta = { jobId: id, pid, pidSource, workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
@@ -298,7 +329,7 @@ export function checkJob(id, tailBytes = 8000) {
     if (lastAlive === null) {
       // Legacy record: no runner_heartbeat file — classify by pid re-stat alone.
       // (Jobs started before heartbeat was added; never leaves them "running" forever.)
-      state = pidAlive(meta.pid) ? "running" : "died";
+      state = (pidAlive(meta.pid) || healMetaPid(p, meta)) ? "running" : "died";
     } else {
       const ageMs = Date.now() - lastAlive.getTime();
       extra.lastAlive = lastAlive.toISOString();
@@ -323,6 +354,14 @@ export function checkJob(id, tailBytes = 8000) {
             state = "died";
             extra.pidNote = "pid recycled to foreign process";
           }
+        } else if (healMetaPid(p, meta)) {
+          // meta.pid was a wrapper-fallback pid that has since exited; runner.pid now points to
+          // the real (still alive) runner. Heal and treat as running, same as the lagging-heartbeat
+          // case above.
+          state = "running";
+          extra.stalled = true;
+          extra.pidHealed = true;
+          if (meta.startedAt) extra.elapsed = formatElapsed(Date.now() - new Date(meta.startedAt).getTime());
         } else {
           // Process gone without writing exit_code — crashed or SIGKILL'd.
           state = "died";
@@ -406,9 +445,9 @@ export async function runSelfTest() {
   const id = `selftest-${Date.now()}`;
   const p = jobPaths(id);
   fs.mkdirSync(p.d, { recursive: true });
-  const pid = await launch(p, process.execPath,
+  const { pid, pidSource } = await launch(p, process.execPath,
     ["-e", "setTimeout(() => console.log('SELFTEST_OK'), 300)"], JOB_ROOT);
-  fs.writeFileSync(p.meta, JSON.stringify({ jobId: id, pid, startedAt: new Date().toISOString() }));
+  fs.writeFileSync(p.meta, JSON.stringify({ jobId: id, pid, pidSource, startedAt: new Date().toISOString() }));
 
   const deadline = Date.now() + 5000;
   let s;

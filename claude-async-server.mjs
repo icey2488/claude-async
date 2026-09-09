@@ -34,13 +34,27 @@ function logTrace(kind, detail) {
   try { fs.appendFileSync(CRASH_LOG, line); } catch {}
 }
 
+// On Windows, a piped process.stderr (Desktop captures ours into mcp-server-claude-async.log
+// this way) is non-blocking: write() queues the data and returns before the OS has flushed it,
+// so a process.exit() issued right after can truncate or drop the write entirely. These two
+// handlers are the last-resort crash trace, so they wait for stderr's callback (falling back to
+// exiting anyway if the stream errors) before exiting -- fs.appendFileSync above already landed
+// synchronously regardless of platform, so CRASH_LOG never depends on this.
+function logTraceThenExit(kind, detail, code) {
+  const line = `[${new Date().toISOString()}] ${kind}: ${detail}\n`;
+  try { fs.appendFileSync(CRASH_LOG, line); } catch {}
+  try {
+    process.stderr.write(line, () => process.exit(code));
+  } catch {
+    process.exit(code);
+  }
+}
+
 process.on("uncaughtException", (err) => {
-  logTrace("uncaughtException", (err && err.stack) || String(err));
-  process.exit(1);
+  logTraceThenExit("uncaughtException", (err && err.stack) || String(err), 1);
 });
 process.on("unhandledRejection", (reason) => {
-  logTrace("unhandledRejection", (reason && reason.stack) || String(reason));
-  process.exit(1);
+  logTraceThenExit("unhandledRejection", (reason && reason.stack) || String(reason), 1);
 });
 process.on("SIGTERM", () => { logTrace("SIGTERM", "received, exiting"); process.exit(0); });
 process.on("SIGINT", () => { logTrace("SIGINT", "received, exiting"); process.exit(0); });

@@ -22,10 +22,21 @@
   as-is when lpEnvironment is NULL, no re-encoding or registry merge involved. This wrapper is
   itself spawned by job-core.mjs's launchWin32() with no `env` override (inherits process.env),
   so the whole chain from the bridge process down to job-runner.mjs is pure inheritance with zero
-  transformation at any hop. Do NOT build a custom lpEnvironment block here -- test/env-integrity.mjs
-  proves this path and the pre-5a09feb direct-spawn path produce byte-identical child environments
-  (PATHEXT/PATH/a random sentinel all verified intact) given the same starting environment; a
-  custom block would be new, unverified surface area solving a problem this code doesn't have.
+  transformation at any hop *by this script*. Do NOT build a custom lpEnvironment block here --
+  test/env-integrity.mjs proves this path and the pre-5a09feb direct-spawn path produce identical
+  child environments for PATH, PATHEXT, and a random sentinel (not the full environment block --
+  see that test's own header) given the same starting environment; a custom block would be new,
+  unverified surface area solving a problem this code doesn't have.
+
+  Caveat: this hop is not literally a no-op on the *hosting* powershell.exe process itself before
+  CreateProcessW ever runs -- PowerShell's own startup can inject/alter a couple of variables in
+  its process environment block ahead of whatever it inherited (confirmed empirically on this
+  machine, powershell.exe -NoProfile -NonInteractive): it sets PSModulePath if the variable was
+  absent, and defaults TEMP (observed; TMP was not defaulted in the same test) if absent. Since
+  lpEnvironment=NULL means whatever is in *this* process's block at CreateProcessW time flows
+  down verbatim, a caller missing PSModulePath/TEMP would see them appear from this hop, not from
+  job-runner.mjs or the CLI. PATHEXT is the one variable this code deliberately overrides itself
+  (sanitizeEnvForWin32, job-core.mjs) rather than leaving to chance.
 
 .PARAMETER ExePath
   Full path to the executable to launch (node.exe).
