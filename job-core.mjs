@@ -155,6 +155,14 @@ async function readRunnerPid(p, fallbackPid) {
 // wrapper's own job/console membership doesn't matter since it just calls CreateProcessW and
 // exits within milliseconds, and job-runner.mjs (the actual long-lived target) gets its own
 // CREATE_NEW_PROCESS_GROUP + CREATE_NO_WINDOW from win32-breakaway.ps1 regardless.
+//
+// Environment: no `env` option is passed here, so the wrapper inherits this process's
+// environment unchanged, and win32-breakaway.ps1's Launch() passes lpEnvironment=IntPtr.Zero so
+// job-runner.mjs inherits the wrapper's unchanged too -- see win32-breakaway.ps1's header for why
+// that's deliberate and test/env-integrity.mjs for the proof (this path and the pre-5a09feb
+// direct-spawn path are environment-identical). A corrupted PATHEXT reaching a job here means the
+// corruption was already present in this bridge process's own environment before it ever called
+// launch() -- check the bridge process's own env, not this function.
 async function launchWin32(p) {
   const child = spawn("powershell.exe",
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",

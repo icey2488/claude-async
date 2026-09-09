@@ -113,9 +113,12 @@ const REAL_CORE = path.join(REPO, "job-core.mjs");
 const OLD_CORE_SNAPSHOT = path.join(REPO, ".job-core-before.mjs");
 const DUMMY_CLI = path.join(REPO, "test", "dummy-claude.exe");
 
-const gitShow = spawnSync("git", ["show", "HEAD:job-core.mjs"], { cwd: REPO, encoding: "utf8" });
+// HEAD~1, not HEAD: HEAD is the fix commit itself (5a09feb) once it's landed, so pinning to HEAD
+// would diff the fix against itself the moment it's committed -- true pre-fix baseline is its
+// parent, regardless of how many commits land on top afterward.
+const gitShow = spawnSync("git", ["show", "HEAD~1:job-core.mjs"], { cwd: REPO, encoding: "utf8" });
 if (gitShow.status !== 0) {
-  console.error("Could not obtain pre-fix job-core.mjs via `git show HEAD:job-core.mjs`:", gitShow.stderr);
+  console.error("Could not obtain pre-fix job-core.mjs via `git show HEAD~1:job-core.mjs`:", gitShow.stderr);
   process.exit(1);
 }
 fs.writeFileSync(OLD_CORE_SNAPSHOT, gitShow.stdout);

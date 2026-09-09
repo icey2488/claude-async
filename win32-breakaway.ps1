@@ -17,6 +17,16 @@
   Exit code 0 = target process created (with or without breakaway). Non-zero = CreateProcessW
   failed outright; the 4th argument (a log file path) gets a diagnostic line appended.
 
+  Environment: lpEnvironment is deliberately IntPtr.Zero (see Launch() below), meaning the target
+  process inherits this wrapper's own environment block verbatim -- CreateProcessW copies it
+  as-is when lpEnvironment is NULL, no re-encoding or registry merge involved. This wrapper is
+  itself spawned by job-core.mjs's launchWin32() with no `env` override (inherits process.env),
+  so the whole chain from the bridge process down to job-runner.mjs is pure inheritance with zero
+  transformation at any hop. Do NOT build a custom lpEnvironment block here -- test/env-integrity.mjs
+  proves this path and the pre-5a09feb direct-spawn path produce byte-identical child environments
+  (PATHEXT/PATH/a random sentinel all verified intact) given the same starting environment; a
+  custom block would be new, unverified surface area solving a problem this code doesn't have.
+
 .PARAMETER ExePath
   Full path to the executable to launch (node.exe).
 .PARAMETER RunnerScript

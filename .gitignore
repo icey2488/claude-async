@@ -29,6 +29,9 @@ daemon.err.log
 # --- Test build artifacts ---
 # test/build-dummy-claude.ps1 compiles this on demand for test/detach-survival.mjs.
 test/dummy-claude.exe
+# test/build-dummy-env-dumper.ps1 compiles this on demand for test/env-integrity.mjs.
+test/dummy-env-dumper.exe
 
-# --- Scratch snapshot test/detach-survival.mjs writes/removes at run time ---
+# --- Scratch snapshot test/detach-survival.mjs / test/env-integrity.mjs write/remove at run time ---
 .job-core-before.mjs
+.job-core-before-env-test.mjs
