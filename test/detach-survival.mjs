@@ -75,6 +75,12 @@ async function runScenario(label, coreModulePath, dummyCli) {
   const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
   const runnerPid = marker.result && marker.result.pid;
 
+  // win32-breakaway.ps1 logs every outcome unconditionally to <jobdir>/launch.log (2026-09-09
+  // runner-termination investigation) -- captured here, before jobDir gets cleaned up below, so
+  // the caller can assert on it independent of pid/heartbeat survival.
+  const launchLogPath = path.join(jobDir, "survival-job", "launch.log");
+  const launchLog = fs.existsSync(launchLogPath) ? fs.readFileSync(launchLogPath, "utf8") : null;
+
   const hbPath = path.join(jobDir, "survival-job", "runner_heartbeat");
   const hbDeadline = Date.now() + 10000;
   while (!fs.existsSync(hbPath) && Date.now() < hbDeadline) await sleep(100);
@@ -104,7 +110,7 @@ async function runScenario(label, coreModulePath, dummyCli) {
   const killFired = !pStillAlive;
   const ok = killFired && runnerAliveAfter && hbAdvanced;
   return {
-    label, ok,
+    label, ok, launchLog,
     detail: { pPid, runnerPid, killFired, runnerAliveAfter, hbBefore, hbAfter, hbAdvanced },
   };
 }
@@ -142,16 +148,23 @@ try {
   const after = await runScenario("after", REAL_CORE, DUMMY_CLI);
   console.log(JSON.stringify(after, null, 2));
 
+  // The "after" scenario's ambient job (JOB_OBJECT_LIMIT_BREAKAWAY_OK, no SILENT) permits explicit
+  // breakaway, so on this machine win32-breakaway.ps1 should always log the plain "ok" outcome,
+  // not a fallback -- confirming the wrapper itself is doing the escape, not silently no-op'ing.
+  const afterBreakawayOk = !!(after.launchLog && /breakaway=ok\b/.test(after.launchLog));
+
   console.log("\n=== SUMMARY ===");
   console.log(`before: ${before.ok ? "SURVIVED (unexpected -- pre-fix code shouldn't escape)" : "DIED (bug reproduced)"}`
     + (before.reason ? ` -- ${before.reason}` : ""));
   console.log(`after:  ${after.ok ? "SURVIVED (fix confirmed)" : "DIED (fix NOT working)"}`
     + (after.reason ? ` -- ${after.reason}` : ""));
+  console.log(`after launch.log: ${afterBreakawayOk ? "breakaway=ok confirmed" : "MISSING/unexpected"}`
+    + (after.launchLog ? ` -- ${after.launchLog.trim()}` : " -- file absent"));
 
-  const expected = !before.ok && after.ok;
+  const expected = !before.ok && after.ok && afterBreakawayOk;
   console.log(expected
-    ? "\nPASS — before dies, after survives: fix demonstrated"
-    : "\nFAIL — did not see the expected before/after contrast");
+    ? "\nPASS — before dies, after survives, launch.log confirms breakaway=ok"
+    : "\nFAIL — did not see the expected before/after contrast and/or launch.log evidence");
   process.exit(expected ? 0 : 1);
 } finally {
   try { fs.rmSync(OLD_CORE_SNAPSHOT, { force: true }); } catch {}

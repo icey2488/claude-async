@@ -46,6 +46,17 @@
   Full path to the job's spec.json.
 .PARAMETER ErrLogPath
   Full path to the job's err.log, for best-effort diagnostics if CreateProcessW fails entirely.
+
+.NOTES
+  2026-09-09 runner-termination investigation: every outcome (not just total failure) is now
+  logged UNCONDITIONALLY to <jobdir>/launch.log -- one line of "breakaway=ok",
+  "breakaway=fallback(ERROR_ACCESS_DENIED)", or "breakaway=failed(<code>)", plus the created pid,
+  the dwCreationFlags actually used, and whether this wrapper process itself was already in a Job
+  Object at launch (IsProcessInJob on $PID) -- so a later reader can tell, from disk, whether a
+  given job's runner ever actually escaped, without relying on err.log only getting a line on
+  total failure. <jobdir> is derived from -SpecPath's directory (spec.json always lives in the job
+  dir, same as launch.log). This never introduces a new exit-0-on-failure path: CreateProcessW
+  failing outright still exits 1, same as before this instrumentation was added.
 #>
 param(
   [Parameter(Mandatory=$true)][string]$ExePath,
@@ -98,6 +109,13 @@ public static class Breakaway {
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsProcessInJob(IntPtr ProcessHandle, IntPtr JobHandle, out bool Result);
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
     // Returns dwProcessId on success, or -(Win32 error code) on total failure.
     //
     // lpCurrentDirectory is deliberately never null: passing null (inherit the caller's native
@@ -124,20 +142,41 @@ public static class Breakaway {
 }
 '@
 
+$jobDir = Split-Path -Parent $SpecPath
+$launchLog = Join-Path $jobDir "launch.log"
+
+function Write-LaunchLog([string]$line) {
+    $ts = (Get-Date).ToUniversalTime().ToString("o")
+    try { Add-Content -Path $launchLog -Value "$ts $line" -Encoding utf8 } catch {}
+}
+
 try {
     Add-Type -TypeDefinition $code -ErrorAction Stop
+
+    $wrapperInJobResult = $false
+    $wrapperInJobOk = [Breakaway]::IsProcessInJob([Breakaway]::GetCurrentProcess(), [IntPtr]::Zero, [ref]$wrapperInJobResult)
+    $wrapperInJob = if ($wrapperInJobOk) { $wrapperInJobResult } else { "unknown" }
 
     function Quote($s) { '"' + $s + '"' }
     $cmdLine = (Quote $ExePath) + " " + (Quote $RunnerScript) + " " + (Quote $SpecPath)
 
+    $flagsUsed = [Breakaway]::CREATE_NO_WINDOW -bor [Breakaway]::CREATE_NEW_PROCESS_GROUP -bor [Breakaway]::CREATE_BREAKAWAY_FROM_JOB
     $result = [Breakaway]::Launch($ExePath, $cmdLine, $PSScriptRoot, $true)
+    $outcome = "ok"
     if ($result -lt 0) {
         $err = -$result
         if ($err -eq [Breakaway]::ERROR_ACCESS_DENIED) {
             # Ambient job forbids breakaway -- fall back to a plain launch (no worse than pre-fix).
+            $flagsUsed = [Breakaway]::CREATE_NO_WINDOW -bor [Breakaway]::CREATE_NEW_PROCESS_GROUP
             $result = [Breakaway]::Launch($ExePath, $cmdLine, $PSScriptRoot, $false)
+            $outcome = if ($result -lt 0) { "failed($(-$result))" } else { "fallback(ERROR_ACCESS_DENIED)" }
+        } else {
+            $outcome = "failed($err)"
         }
     }
+
+    $pidStr = if ($result -ge 0) { $result } else { "n/a" }
+    Write-LaunchLog "breakaway=$outcome pid=$pidStr flags=0x$($flagsUsed.ToString('X')) wrapperInJob=$wrapperInJob wrapperPid=$PID"
 
     if ($result -lt 0) {
         $msg = "[win32-breakaway] CreateProcessW failed err=$(-$result) exe=$ExePath cmdline=$cmdLine`n"
@@ -147,6 +186,7 @@ try {
 
     exit 0
 } catch {
+    Write-LaunchLog "breakaway=failed(exception) wrapperPid=$PID error=$($_.Exception.Message)"
     $msg = "[win32-breakaway] script threw: $($_.Exception.Message)`n$($_.ScriptStackTrace)`n"
     try { Add-Content -Path $ErrLogPath -Value $msg -Encoding utf8 } catch {}
     exit 1

@@ -20,6 +20,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { mintCard, failCard } from "./card-hook.mjs";
+import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -103,7 +104,7 @@ const jobPaths = (id) => {
            spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat") };
 };
 
-function pidAlive(pid) {
+export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (e) { return e.code === "EPERM"; }
 }
@@ -154,6 +155,14 @@ function healMetaPid(p, meta) {
     try { fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); } catch {}
     return true;
   } catch { return false; }
+}
+
+// Reads the runner-side job-membership record job-runner.mjs refreshes on every heartbeat
+// (2026-09-09 runner-termination investigation). Returns null if absent/unparseable — legacy
+// jobs and non-win32 jobs never have this file.
+function readRunnerJobMembership(p) {
+  try { return JSON.parse(fs.readFileSync(path.join(p.d, "runner_job.json"), "utf8")); }
+  catch { return null; }
 }
 
 // Reads the runner_heartbeat file; returns a Date or null on any failure.
@@ -261,7 +270,20 @@ async function launchWin32(p) {
     { detached: false, stdio: "ignore", windowsHide: true, env });
   child.on("error", (e) => recordLaunchFailure(p, `failed to spawn win32 breakaway wrapper: ${e.message}`));
   child.unref();
-  return readRunnerPid(p, child.pid);
+  const { pid, pidSource } = await readRunnerPid(p, child.pid);
+
+  // 2026-09-09 runner-termination investigation: hard evidence of job membership, not just an
+  // inference from the breakaway exit path. Foreign-pid query (this bridge process, not the
+  // runner, is asking) -- see tools/query-job-membership.ps1's header for why only `inJob` is
+  // populated here (limitFlags etc. require a self-query, which job-runner.mjs does on its own
+  // behalf via runner_job.json).
+  const jobMembership = queryJobMembershipOnce(pid);
+  if (jobMembership.inJob) {
+    try { fs.appendFileSync(p.err, `\n[job-core] WARN: runner pid=${pid} is still a member of a ` +
+      `Job Object at launch time -- breakaway may not have taken effect (jobMembership=` +
+      `${JSON.stringify(jobMembership)})\n`); } catch {}
+  }
+  return { pid, pidSource, jobMembership };
 }
 
 function launchPosix(p) {
@@ -299,10 +321,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
-  const { pid, pidSource } = await launch(p, CLAUDE_BIN, argv, cwd);
+  const { pid, pidSource, jobMembership } = await launch(p, CLAUDE_BIN, argv, cwd);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
-  const meta = { jobId: id, pid, pidSource, workFolder: cwd, model: resolvedModel, effort: eff,
+  const meta = { jobId: id, pid, pidSource, ...(jobMembership ? { jobMembership } : {}),
+                 workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
@@ -380,7 +403,10 @@ export function checkJob(id, tailBytes = 8000) {
     }
   }
 
+  const runnerJobMembership = readRunnerJobMembership(p);
+
   return { ...meta, status: state, exitCode, finishedAt, ...extra,
+           ...(runnerJobMembership ? { runnerJobMembership } : {}),
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
@@ -426,7 +452,10 @@ export function registerTools(server) {
                  "(running | completed | failed | died | timed_out), exit code, and a tail of stdout/stderr. " +
                  "running may include elapsed and lastAlive fields; stalled:true means heartbeat is stale " +
                  "but pid is still alive. died means the process exited without recording a result. " +
-                 "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h).",
+                 "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h). " +
+                 "On win32, jobMembership (recorded at launch) and runnerJobMembership (refreshed every " +
+                 "heartbeat by the runner itself) report Windows Job Object membership -- inJob:true on " +
+                 "either means the breakaway did not fully take effect.",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),

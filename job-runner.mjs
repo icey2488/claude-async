@@ -13,6 +13,11 @@
  * 60s while the child runs, and once in finish(). checkJob reads this to classify
  * running vs timed_out vs died without relying solely on pid re-stat.
  *
+ * runner_job.json: alongside every heartbeat (win32 only), writes this runner's own Job Object
+ * membership (queried via tools/jobMembership.mjs), plus its parent pid and whether the parent is
+ * still alive. Lets job-core.mjs's checkJob() (and a human reading the job dir after the fact)
+ * see whether a runner was ever re-absorbed into a job mid-flight, not just at launch.
+ *
  * runner.pid: writes its own process.pid to the job dir before doing anything else. On win32,
  * job-core.mjs's launch() may spawn us indirectly through a PowerShell/CreateProcessW shell-out
  * (to escape the caller's Job Object -- see the win32 note in job-core.mjs), in which case the
@@ -34,7 +39,8 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
-import { sanitizeEnvForWin32, logIfPathextSanitized } from "./job-core.mjs";
+import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core.mjs";
+import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -62,6 +68,36 @@ const { command, argv, cwd, out, err, exit } = spec;
 
 const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
 
+// 2026-09-09 runner-termination investigation: self-reported Job Object membership, refreshed on
+// every heartbeat, so a job's death can be correlated against "was this runner actually free of
+// its ambient job the whole time" instead of trusting the launch-time breakaway result alone. The
+// helper process is spawned once (Add-Type JIT cost paid once) and polled cheaply thereafter --
+// see tools/jobMembership.mjs and tools/query-job-membership.ps1 for why this only ever reports
+// on the runner's OWN job (via Windows' automatic job-nesting of a plain, non-breakaway child).
+const jobMembershipPath = path.join(path.dirname(specPath), "runner_job.json");
+const membershipQuerier = createSelfMembershipQuerier();
+// null = "no prior check yet" -- distinct from false, so the very first check never logs a
+// spurious "became a member" transition for a runner that was already in a job from the start.
+let lastMembershipInJob = null;
+
+async function writeJobMembership() {
+  const membership = await membershipQuerier.query(process.pid);
+  const parentAlive = pidAlive(process.ppid);
+  const record = { ts: new Date().toISOString(), pid: process.pid,
+                    parentPid: process.ppid, parentAlive, ...membership };
+  const tmp = jobMembershipPath + ".tmp";
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(record, null, 2), "utf8");
+    fs.renameSync(tmp, jobMembershipPath);
+  } catch { /* best-effort, same as writeHeartbeat */ }
+
+  if (membership.inJob && lastMembershipInJob === false) {
+    try { fs.writeSync(errFd, `\n[job-runner] WARN: ${record.ts} pid=${process.pid} became a member of a ` +
+      `Job Object (was not at the previous check) -- membership=${JSON.stringify(membership)}\n`); } catch {}
+  }
+  lastMembershipInJob = !!membership.inJob;
+}
+
 function writeHeartbeat() {
   const ts = new Date().toISOString();
   const tmp = heartbeatPath + ".tmp";
@@ -88,6 +124,7 @@ function finish(code) {
   done = true;
   if (hbInterval) clearInterval(hbInterval);
   writeHeartbeat(); // final heartbeat immediately before recording exit code
+  membershipQuerier.close();
   try { fs.writeFileSync(exit, String(code)); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
@@ -105,13 +142,17 @@ function finish(code) {
 
 // Initial heartbeat at spawn so checkJob sees "alive" even before the first 60s tick.
 writeHeartbeat();
+writeJobMembership().catch(() => {});
 
 // Periodic heartbeat while the child runs. unref() so the interval doesn't prevent exit if
 // the child is already gone (child.on("exit") listener is what keeps the loop alive).
 // Override for tests (e.g. test/detach-survival.mjs) that need to observe progression in
 // seconds rather than minutes; production always uses the 60s default.
 const HEARTBEAT_MS = Number(process.env.CLAUDE_ASYNC_HEARTBEAT_MS) || 60_000;
-hbInterval = setInterval(writeHeartbeat, HEARTBEAT_MS);
+hbInterval = setInterval(() => {
+  writeHeartbeat();
+  writeJobMembership().catch(() => {});
+}, HEARTBEAT_MS);
 hbInterval.unref();
 
 // Belt-and-suspenders: job-core.mjs's launchWin32() already sanitizes PATHEXT before spawning the
