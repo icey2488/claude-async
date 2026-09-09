@@ -27,6 +27,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
+import { sanitizeEnvForWin32, logIfPathextSanitized } from "./job-core.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -101,9 +102,15 @@ const HEARTBEAT_MS = Number(process.env.CLAUDE_ASYNC_HEARTBEAT_MS) || 60_000;
 hbInterval = setInterval(writeHeartbeat, HEARTBEAT_MS);
 hbInterval.unref();
 
+// Belt-and-suspenders: job-core.mjs's launchWin32() already sanitizes PATHEXT before spawning the
+// wrapper that eventually leads here, but this repairs it again in case a future launch path ever
+// gets us started some other way -- see sanitizeEnvForWin32()'s header comment in job-core.mjs.
+const spawnEnv = sanitizeEnvForWin32(process.env);
+logIfPathextSanitized(err, process.env, spawnEnv, `spawning ${command}`);
+
 let child;
 try {
-  child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true });
+  child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true, env: spawnEnv });
 } catch (e) {
   try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
   finish(127);

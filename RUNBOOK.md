@@ -110,3 +110,15 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   `windowsHide: true` (`STARTF_USESHOWWINDOW`/`SW_HIDE`) does not have this problem, since the
   process still gets a (hidden) console. `job-core.mjs`'s `launchWin32()` spawns the
   `win32-breakaway.ps1` wrapper with `detached: false` for this reason.
+- **The breakaway fix above introduced a second bug: Claude Desktop omits `PATHEXT` from this
+  bridge's environment entirely, and the new `powershell.exe` hop turns that into a corrupted
+  `PATHEXT` for every downstream process.** PowerShell's startup appends `.CPL` to whatever
+  `PATHEXT` it inherits; appended to an absent value that's a `PATHEXT` of exactly `.CPL`, which
+  then flows unchanged (by design — see `win32-breakaway.ps1`'s `lpEnvironment=NULL` comment)
+  through `job-runner.mjs` into the `claude` CLI and any shell its tools invoke, breaking bare
+  resolution of `node`/`npm`/`npx`/`cmd`/`tsc` (`'tsc' is not recognized as an internal or
+  external command`). The pre-breakaway direct spawn path tolerated the same absent `PATHEXT`
+  because `cmd.exe` fills in a sane default when it's missing — the powershell hop is what broke
+  the assumption. Fixed by `sanitizeEnvForWin32()` in `job-core.mjs`, which repairs `PATHEXT`
+  (missing, empty, or lacking `.EXE`) before both spawns that matter: the `launchWin32()` wrapper
+  spawn and `job-runner.mjs`'s spawn of the `claude` CLI. See `test/pathext-integrity.mjs`.

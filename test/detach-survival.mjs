@@ -113,12 +113,13 @@ const REAL_CORE = path.join(REPO, "job-core.mjs");
 const OLD_CORE_SNAPSHOT = path.join(REPO, ".job-core-before.mjs");
 const DUMMY_CLI = path.join(REPO, "test", "dummy-claude.exe");
 
-// HEAD~1, not HEAD: HEAD is the fix commit itself (5a09feb) once it's landed, so pinning to HEAD
-// would diff the fix against itself the moment it's committed -- true pre-fix baseline is its
-// parent, regardless of how many commits land on top afterward.
-const gitShow = spawnSync("git", ["show", "HEAD~1:job-core.mjs"], { cwd: REPO, encoding: "utf8" });
+// Pinned to 7effb28762c58a43e260aad7e655802a9579b68f (5a09feb^), the last commit before the
+// win32 breakaway fix. HEAD~1 is not safe here: as more commits land on top of the fix, HEAD~1
+// drifts forward and stops pointing at the true pre-fix baseline.
+const PRE_FIX_COMMIT = "7effb28762c58a43e260aad7e655802a9579b68f";
+const gitShow = spawnSync("git", ["show", `${PRE_FIX_COMMIT}:job-core.mjs`], { cwd: REPO, encoding: "utf8" });
 if (gitShow.status !== 0) {
-  console.error("Could not obtain pre-fix job-core.mjs via `git show HEAD~1:job-core.mjs`:", gitShow.stderr);
+  console.error(`Could not obtain pre-fix job-core.mjs via \`git show ${PRE_FIX_COMMIT}:job-core.mjs\`:`, gitShow.stderr);
   process.exit(1);
 }
 fs.writeFileSync(OLD_CORE_SNAPSHOT, gitShow.stdout);

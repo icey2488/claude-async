@@ -3,6 +3,14 @@
  * job-core.mjs — shared logic for claude-async (stdio + http entrypoints).
  * Job state lives entirely on disk under JOB_ROOT, which is why the HTTP server can be
  * stateless. job-runner.mjs (the detached worker) must sit beside this file.
+ *
+ * PATHEXT: Claude Desktop spawns this bridge with PATHEXT absent from its environment
+ * entirely, which only became a problem once the win32 breakaway path (launchWin32) added a
+ * powershell.exe hop -- PowerShell appends ".CPL" to whatever PATHEXT it inherits, and appended
+ * to nothing that's a PATHEXT of exactly ".CPL", breaking bare resolution of node/npm/npx/cmd/tsc
+ * for every process downstream. sanitizeEnvForWin32() (below) guarantees PATHEXT always contains
+ * a usable value before both spawns that matter; see its own header comment for the full story
+ * and test/pathext-integrity.mjs for the regression test.
  */
 import { z } from "zod";
 import { spawn, spawnSync } from "node:child_process";
@@ -12,6 +20,55 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { mintCard, failCard } from "./card-hook.mjs";
+
+// Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
+// at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
+// "claude"/"npm"/"tsc" resolve through cmd.exe, which fills in its own sane PATHEXT default when
+// the variable is absent. The win32 breakaway path (launchWin32 below) added a powershell.exe hop,
+// and PowerShell's own startup APPENDS ".CPL" to whatever PATHEXT it inherited -- appended to an
+// absent value that produces a PATHEXT of exactly ".CPL", which then flows down through
+// win32-breakaway.ps1 (lpEnvironment=NULL, i.e. verbatim inheritance -- see that script's header)
+// into job-runner.mjs and whatever it spawns (the claude CLI, and any shell that CLI's own tools
+// invoke), silently breaking bare resolution of node/npm/npx/cmd/tsc ("'tsc' is not recognized").
+// sanitizeEnvForWin32() below repairs PATHEXT before both hops that matter (the wrapper spawn here
+// and job-runner.mjs's spawn of the CLI); PowerShell still appends ".CPL" after the repair, but
+// ".COM;.EXE;...;.MSC;.CPL" resolves everything the original list did, so that's harmless.
+// Delegated to qwen2.5-coder:7b (local ollama) per the exact spec above; accepted with only a
+// STANDARD-constant hoist for reuse by logIfPathextSanitized() below — logic unchanged.
+const STANDARD_PATHEXT = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC";
+export function sanitizeEnvForWin32(env) {
+  if (process.platform !== "win32") return { ...env };
+
+  const caseInsensitiveKeys = Object.keys(env).filter((key) => key.toLowerCase() === "pathext");
+  const effectiveValue = caseInsensitiveKeys.includes("PATHEXT")
+    ? env.PATHEXT
+    : env[caseInsensitiveKeys[0]];
+
+  const standardizedValue = effectiveValue
+    ? (effectiveValue.trim().toLowerCase().includes(".exe") ? effectiveValue : STANDARD_PATHEXT)
+    : STANDARD_PATHEXT;
+
+  const result = { ...env };
+  caseInsensitiveKeys.forEach((key) => delete result[key]);
+  result.PATHEXT = standardizedValue;
+
+  return result;
+}
+
+// Appends a diagnostic line to `logPath` iff sanitizeEnvForWin32() had to intervene (i.e. the
+// sanitized PATHEXT differs from what was actually present in `originalEnv`), naming the original
+// value so a future reader can tell whether it was absent, empty, or corrupted.
+export function logIfPathextSanitized(logPath, originalEnv, sanitizedEnv, context) {
+  const matches = Object.keys(originalEnv).filter((k) => k.toLowerCase() === "pathext");
+  const hadCanonicalOnly = matches.length === 1 && matches[0] === "PATHEXT";
+  const originalValue = matches.length ? originalEnv[matches[0]] : undefined;
+  if (hadCanonicalOnly && originalValue === sanitizedEnv.PATHEXT) return; // nothing to repair
+  const originalDesc = matches.length === 0 ? "(absent)"
+    : matches.map((k) => `${k}=${JSON.stringify(originalEnv[k])}`).join(", ");
+  try { fs.appendFileSync(logPath,
+    `\n[job-core] sanitizeEnvForWin32: repaired PATHEXT before ${context} ` +
+    `(was ${originalDesc}) -> ${sanitizedEnv.PATHEXT}\n`); } catch {}
+}
 
 export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
@@ -156,18 +213,21 @@ async function readRunnerPid(p, fallbackPid) {
 // exits within milliseconds, and job-runner.mjs (the actual long-lived target) gets its own
 // CREATE_NEW_PROCESS_GROUP + CREATE_NO_WINDOW from win32-breakaway.ps1 regardless.
 //
-// Environment: no `env` option is passed here, so the wrapper inherits this process's
-// environment unchanged, and win32-breakaway.ps1's Launch() passes lpEnvironment=IntPtr.Zero so
-// job-runner.mjs inherits the wrapper's unchanged too -- see win32-breakaway.ps1's header for why
-// that's deliberate and test/env-integrity.mjs for the proof (this path and the pre-5a09feb
-// direct-spawn path are environment-identical). A corrupted PATHEXT reaching a job here means the
-// corruption was already present in this bridge process's own environment before it ever called
-// launch() -- check the bridge process's own env, not this function.
+// Environment: the wrapper otherwise inherits this process's environment unchanged, and
+// win32-breakaway.ps1's Launch() passes lpEnvironment=IntPtr.Zero so job-runner.mjs inherits the
+// wrapper's unchanged too -- see win32-breakaway.ps1's header for why that's deliberate and
+// test/env-integrity.mjs for the proof (this path and the pre-5a09feb direct-spawn path are
+// environment-identical otherwise). The one deliberate exception is PATHEXT: sanitizeEnvForWin32()
+// repairs it before this spawn (see that function's header comment above for why it's needed --
+// this is the first of the two hops it patches; job-runner.mjs's own spawn of the CLI is the
+// second, belt-and-suspenders in case a future launch path bypasses this one).
 async function launchWin32(p) {
+  const env = sanitizeEnvForWin32(process.env);
+  logIfPathextSanitized(p.err, process.env, env, "spawning the win32 breakaway wrapper");
   const child = spawn("powershell.exe",
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
      "-File", WIN32_BREAKAWAY_SCRIPT, process.execPath, RUNNER, p.spec, p.err],
-    { detached: false, stdio: "ignore", windowsHide: true });
+    { detached: false, stdio: "ignore", windowsHide: true, env });
   child.on("error", (e) => recordLaunchFailure(p, `failed to spawn win32 breakaway wrapper: ${e.message}`));
   child.unref();
   return readRunnerPid(p, child.pid);
