@@ -12,8 +12,12 @@
  * see test/build-dummy-claude.ps1's identical note about job-runner.mjs's shell-less spawn), which
  * writes its own environment to ENV_DUMP_OUTPUT_PATH instead of running claude. The test sets
  * CLAUDE_ASYNC_ENV_SENTINEL to a random value in ITS OWN process before calling startJob(), then
- * asserts the dumped child environment has: the same PATHEXT as the parent, the same PATH as the
- * parent, and the sentinel intact.
+ * asserts the dumped child environment has: the same PATH as the parent and the sentinel intact,
+ * plus a PATHEXT check that differs by scenario -- the "before" (direct-spawn) path must match
+ * PATHEXT exactly, but the "after" (win32-breakaway.ps1) path hops through a real powershell.exe,
+ * which by design appends ".CPL" to PATHEXT on that breakaway hop; that scenario instead asserts
+ * the parent's PATHEXT is a case-insensitive prefix of the runner's PATHEXT and that the runner's
+ * PATHEXT still contains ".EXE" and ".CMD".
  *
  * Run: node test/env-integrity.mjs   (exit 0 = both old and new paths preserve env correctly)
  */
@@ -91,8 +95,15 @@ async function runScenario(label, coreModulePath, dumperExe, sentinel) {
   const childPath = lookupCI(childEnv, "PATH");
   const childSentinel = lookupCI(childEnv, "CLAUDE_ASYNC_ENV_SENTINEL");
 
+  const pathextMatches = label === "after"
+    ? typeof childPathext.value === "string"
+      && childPathext.value.toLowerCase().startsWith(parentPathext.toLowerCase())
+      && childPathext.value.toUpperCase().includes(".EXE")
+      && childPathext.value.toUpperCase().includes(".CMD")
+    : childPathext.value === parentPathext;
+
   const checks = {
-    pathextMatches: childPathext.value === parentPathext,
+    pathextMatches,
     pathMatches: childPath.value === parentPath,
     sentinelMatches: childSentinel.value === sentinel,
   };
