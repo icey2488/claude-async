@@ -88,10 +88,10 @@ function readLog()  { try { return fs.readFileSync(LOG, "utf8"); } catch { retur
 
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
-function test(name, fn) {
+async function test(name, fn) {
   clearLog();
   try {
-    fn();
+    await fn();
     console.log(`PASS — ${name}`);
     passed++;
   } catch (e) {
@@ -102,7 +102,7 @@ function test(name, fn) {
 
 // ─── Test 1: card-id recorded on start ───────────────────────────────────────
 
-test("card-id recorded on start (mintCard returns cardId)", () => {
+await test("card-id recorded on start (mintCard returns cardId)", () => {
   const { cardId, startHead, error } = mintCard("job-t1", REPO);
   assert(cardId === MOCK_ID, `expected ${MOCK_ID}, got ${JSON.stringify(cardId)}`);
   assert(error === null, `expected no error, got ${JSON.stringify(error)}`);
@@ -113,7 +113,7 @@ test("card-id recorded on start (mintCard returns cardId)", () => {
 
 // ─── Test 1b: mintCard emits resolved model/effort/job-id as provenance flags ─
 
-test("mintCard passes resolved model/effort as --model/--effort, jobId as --job-id", () => {
+await test("mintCard passes resolved model/effort as --model/--effort, jobId as --job-id", () => {
   mintCard("job-prov1", REPO, "claude-opus-4-8", "high");
   const fields = readLog().trim().split("\t");
   assert(fields[fields.indexOf("--model") + 1] === "claude-opus-4-8",
@@ -124,7 +124,7 @@ test("mintCard passes resolved model/effort as --model/--effort, jobId as --job-
     `expected --job-id job-prov1, got: ${fields.join(" ")}`);
 });
 
-test("mintCard omits --model/--effort when not provided (absent means absent)", () => {
+await test("mintCard omits --model/--effort when not provided (absent means absent)", () => {
   mintCard("job-prov2", REPO);
   const log = readLog();
   assert(!log.includes("--model"), `expected no --model flag, got: ${log}`);
@@ -134,7 +134,7 @@ test("mintCard omits --model/--effort when not provided (absent means absent)", 
 
 // ─── Test 1c: mintCard emits a bounded intent summary as --description ─────────
 
-test("mintCard passes the prompt's intent summary as --description (first sentence)", () => {
+await test("mintCard passes the prompt's intent summary as --description (first sentence)", () => {
   // A realistic dispatch prompt: a >200-char first line (intent sentence + boilerplate),
   // so the rule extracts just the opening sentence rather than keeping the whole line.
   const prompt = "Give the chip a vendor-keyed color. You are on native Windows as Raide. Repo lives on main which auto-deploys, gh.exe authed as icey2488, one-shot git-credential, never store creds, secret-scan every staged diff before committing.";
@@ -144,7 +144,7 @@ test("mintCard passes the prompt's intent summary as --description (first senten
   assert(body === "Give the chip a vendor-keyed color.", `expected first sentence, got: ${JSON.stringify(body)}`);
 });
 
-test("mintCard omits --description when no prompt (absent body, never empty string)", () => {
+await test("mintCard omits --description when no prompt (absent body, never empty string)", () => {
   mintCard("job-desc2", REPO, null, null);
   const log = readLog();
   assert(!log.includes("--description"), `expected no --description flag, got: ${log}`);
@@ -152,7 +152,7 @@ test("mintCard omits --description when no prompt (absent body, never empty stri
 
 // ─── Test 1d: intentSummary extraction rule (unit) ────────────────────────────
 
-test("intentSummary: short first line used whole; long line → first sentence; else ellipsized", () => {
+await test("intentSummary: short first line used whole; long line → first sentence; else ellipsized", () => {
   assert(intentSummary("Do the thing.") === "Do the thing.", "short whole line");
   assert(intentSummary("") === null, "empty → null");
   assert(intentSummary("\n\n  Fix it.  \nmore") === "Fix it.", "first non-empty line, trimmed");
@@ -163,7 +163,7 @@ test("intentSummary: short first line used whole; long line → first sentence; 
 
 // ─── Test 1e: explicit intent (the middle path) takes precedence over the heuristic ───
 
-test("mintCard prefers an EXPLICIT intent over the prompt heuristic", () => {
+await test("mintCard prefers an EXPLICIT intent over the prompt heuristic", () => {
   // Prompt's heuristic would yield "First line opener." — the explicit intent must win.
   const prompt = "First line opener.\nmore body text that the heuristic would never reach";
   mintCard("job-desc3", REPO, null, null, prompt, "Ship the vendor-color chip fix");
@@ -173,7 +173,7 @@ test("mintCard prefers an EXPLICIT intent over the prompt heuristic", () => {
     `expected explicit intent as body, got: ${JSON.stringify(body)}`);
 });
 
-test("mintCard falls back to the heuristic when no explicit intent is supplied (unchanged)", () => {
+await test("mintCard falls back to the heuristic when no explicit intent is supplied (unchanged)", () => {
   // Blank/absent explicit intent → the existing intentSummary heuristic, untouched (first
   // non-empty LINE used whole when it fits the cap).
   const prompt = "Give the chip a vendor-keyed color.\nThen wire it up.";
@@ -184,7 +184,7 @@ test("mintCard falls back to the heuristic when no explicit intent is supplied (
     `expected heuristic first-line fallback, got: ${JSON.stringify(body)}`);
 });
 
-test("mintCard omits --description when neither explicit intent nor prompt is usable", () => {
+await test("mintCard omits --description when neither explicit intent nor prompt is usable", () => {
   mintCard("job-desc5", REPO, null, null, "", "");
   const log = readLog();
   assert(!log.includes("--description"), `expected no --description, got: ${log}`);
@@ -192,7 +192,7 @@ test("mintCard omits --description when neither explicit intent nor prompt is us
 
 // ─── Test 1f: card TITLE carries the intent summary, not the jobId ────────────
 
-test("mintCard uses the intent summary as the card TITLE, not the jobId", () => {
+await test("mintCard uses the intent summary as the card TITLE, not the jobId", () => {
   mintCard("job-title1", REPO, null, null, null, "Ship the vendor-color chip fix");
   const log = readLog();
   assert(log.trim().endsWith("Ship the vendor-color chip fix"),
@@ -200,13 +200,13 @@ test("mintCard uses the intent summary as the card TITLE, not the jobId", () => 
   assert(log.includes("--job-id\tjob-title1"), `expected jobId only in provenance, got: ${log}`);
 });
 
-test("mintCard falls back to jobId as TITLE when neither intent nor prompt is usable", () => {
+await test("mintCard falls back to jobId as TITLE when neither intent nor prompt is usable", () => {
   mintCard("job-title2", REPO);
   const log = readLog();
   assert(log.trim().endsWith("job-title2"), `expected jobId fallback title, got: ${log}`);
 });
 
-test("boundIntent: verbatim when short, ellipsized when long, null when blank/non-string", () => {
+await test("boundIntent: verbatim when short, ellipsized when long, null when blank/non-string", () => {
   assert(boundIntent("Ship it.") === "Ship it.", "short verbatim (no first-line/sentence mangling)");
   assert(boundIntent("  trimmed  ") === "trimmed", "trimmed");
   assert(boundIntent("") === null && boundIntent("   ") === null, "blank → null");
@@ -218,8 +218,8 @@ test("boundIntent: verbatim when short, ellipsized when long, null when blank/no
   assert(b.length <= INTENT_SUMMARY_MAX + 1 && b.endsWith("…"), `expected ellipsized ≤cap, got len ${b.length}`);
 });
 
-test("startJob threads an explicit intent into mintCard's --description", () => {
-  startJob({ prompt: "some prompt opener.", workFolder: REPO, jobId: "job-intent1",
+await test("startJob threads an explicit intent into mintCard's --description", async () => {
+  await startJob({ prompt: "some prompt opener.", workFolder: REPO, jobId: "job-intent1",
              intent: "Explicit dispatcher intent" });
   const fields = readLog().trim().split("\t");
   const body = fields[fields.indexOf("--description") + 1];
@@ -228,8 +228,8 @@ test("startJob threads an explicit intent into mintCard's --description", () => 
   try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-intent1"), { recursive: true, force: true }); } catch {}
 });
 
-test("startJob threads its resolved model/effort into mintCard's flags", () => {
-  startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov3", model: "claude-opus-4-8", effort: "xhigh" });
+await test("startJob threads its resolved model/effort into mintCard's flags", async () => {
+  await startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov3", model: "claude-opus-4-8", effort: "xhigh" });
   const fields = readLog().trim().split("\t");
   assert(fields[fields.indexOf("--model") + 1] === "claude-opus-4-8",
     `expected resolved caller model in flags, got: ${fields.join(" ")}`);
@@ -238,8 +238,8 @@ test("startJob threads its resolved model/effort into mintCard's flags", () => {
   try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-prov3"), { recursive: true, force: true }); } catch {}
 });
 
-test("startJob falls back to job-core's own model/effort defaults in mintCard's flags", () => {
-  startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov4" });
+await test("startJob falls back to job-core's own model/effort defaults in mintCard's flags", async () => {
+  await startJob({ prompt: "test", workFolder: REPO, jobId: "job-prov4" });
   const fields = readLog().trim().split("\t");
   assert(fields[fields.indexOf("--model") + 1] === "claude-sonnet-5",
     `expected default model in flags, got: ${fields.join(" ")}`);
@@ -249,8 +249,8 @@ test("startJob falls back to job-core's own model/effort defaults in mintCard's 
 });
 
 // Also verify startJob stores cardId in meta.json
-test("card-id recorded on start (startJob stores cardId in meta.json)", () => {
-  const result = startJob({ prompt: "test prompt", workFolder: REPO, jobId: "job-t1b" });
+await test("card-id recorded on start (startJob stores cardId in meta.json)", async () => {
+  const result = await startJob({ prompt: "test prompt", workFolder: REPO, jobId: "job-t1b" });
   const metaPath = path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-t1b", "meta.json");
   const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
   assert(meta.cardId === MOCK_ID, `meta.cardId should be ${MOCK_ID}, got ${meta.cardId}`);
@@ -261,7 +261,7 @@ test("card-id recorded on start (startJob stores cardId in meta.json)", () => {
 
 // ─── Test 2: done + artifact on clean exit with HEAD moved ────────────────────
 
-test("done + artifact on clean exit with HEAD moved", () => {
+await test("done + artifact on clean exit with HEAD moved", () => {
   // Advance the repo HEAD
   fs.writeFileSync(path.join(REPO, "b.txt"), "world");
   spawnSync("git", ["add", "."], { cwd: REPO });
@@ -278,7 +278,7 @@ test("done + artifact on clean exit with HEAD moved", () => {
 
 // ─── Test 3: no artifact when HEAD unchanged ──────────────────────────────────
 
-test("no artifact when HEAD unchanged", () => {
+await test("no artifact when HEAD unchanged", () => {
   const currentHead = spawnSync("git", ["rev-parse", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout.trim();
   closeCard(MOCK_ID, 0, REPO, currentHead);
   const log = readLog();
@@ -288,7 +288,7 @@ test("no artifact when HEAD unchanged", () => {
 
 // ─── Test 4: fail on nonzero exit ────────────────────────────────────────────
 
-test("fail on nonzero exit", () => {
+await test("fail on nonzero exit", () => {
   closeCard(MOCK_ID, 1, REPO, HEAD1);
   const log = readLog();
   assert(log.includes(`fail\t${MOCK_ID}`), `expected fail in log, got: ${log}`);
@@ -298,7 +298,7 @@ test("fail on nonzero exit", () => {
 
 // ─── Test 5: UNCARDED path — jobcard errors, job still runs ──────────────────
 
-test("UNCARDED: mintCard with bad cmd returns {error, cardId:null} without throwing", () => {
+await test("UNCARDED: mintCard with bad cmd returns {error, cardId:null} without throwing", () => {
   process.env.CLAUNKER_JOBCARD_CMD = ERROR_CMD;
   try {
     const { cardId, error } = mintCard("job-t5a", REPO);
@@ -309,11 +309,11 @@ test("UNCARDED: mintCard with bad cmd returns {error, cardId:null} without throw
   }
 });
 
-test("UNCARDED: startJob still dispatches when jobcard errors (note prefixed UNCARDED:)", () => {
+await test("UNCARDED: startJob still dispatches when jobcard errors (note prefixed UNCARDED:)", async () => {
   process.env.CLAUNKER_JOBCARD_CMD = ERROR_CMD;
   let result;
   try {
-    result = startJob({ prompt: "test", workFolder: REPO, jobId: "job-t5b" });
+    result = await startJob({ prompt: "test", workFolder: REPO, jobId: "job-t5b" });
   } finally {
     process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
   }

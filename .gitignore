@@ -25,3 +25,10 @@ daemon.err.log
 # e.g. claude-async-server.mjs.bak-preB
 *.bak
 *.bak-*
+
+# --- Test build artifacts ---
+# test/build-dummy-claude.ps1 compiles this on demand for test/detach-survival.mjs.
+test/dummy-claude.exe
+
+# --- Scratch snapshot test/detach-survival.mjs writes/removes at run time ---
+.job-core-before.mjs

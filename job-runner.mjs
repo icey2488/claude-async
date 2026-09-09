@@ -13,6 +13,11 @@
  * 60s while the child runs, and once in finish(). checkJob reads this to classify
  * running vs timed_out vs died without relying solely on pid re-stat.
  *
+ * runner.pid: writes its own process.pid to the job dir before doing anything else. On win32,
+ * job-core.mjs's launch() may spawn us indirectly through a PowerShell/CreateProcessW shell-out
+ * (to escape the caller's Job Object -- see the win32 note in job-core.mjs), in which case the
+ * pid spawn() hands back to job-core is the shell's, not ours; it reads this file instead.
+ *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
  * on the same volume. This prevents checkJob from reading a truncated file between the
@@ -25,6 +30,16 @@ import { closeCard } from "./card-hook.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
+
+// Written before anything else that could fail. On win32 the runner may be launched via the
+// CREATE_BREAKAWAY_FROM_JOB shell-out (see job-core.mjs launch()), so the pid job-core gets
+// back from spawn() is the wrapper's, not ours; it reads this file to learn our real pid.
+try {
+  const pidPath = path.join(path.dirname(specPath), "runner.pid");
+  const tmp = pidPath + ".tmp";
+  fs.writeFileSync(tmp, String(process.pid), "utf8");
+  fs.renameSync(tmp, pidPath);
+} catch { /* best-effort; launch() falls back to the wrapper's pid after a short timeout */ }
 
 let spec;
 try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
@@ -80,7 +95,10 @@ writeHeartbeat();
 
 // Periodic heartbeat while the child runs. unref() so the interval doesn't prevent exit if
 // the child is already gone (child.on("exit") listener is what keeps the loop alive).
-hbInterval = setInterval(writeHeartbeat, 60_000);
+// Override for tests (e.g. test/detach-survival.mjs) that need to observe progression in
+// seconds rather than minutes; production always uses the 60s default.
+const HEARTBEAT_MS = Number(process.env.CLAUDE_ASYNC_HEARTBEAT_MS) || 60_000;
+hbInterval = setInterval(writeHeartbeat, HEARTBEAT_MS);
 hbInterval.unref();
 
 let child;

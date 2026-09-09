@@ -113,6 +113,18 @@ recycled. `claude_check` simply reads that job's status and log tail from disk �
 instant. Because state lives on disk rather than in the live connection, a dropped or
 restarted bridge never costs you a running job.
 
+**On Windows**, "detached" alone isn't enough for that guarantee. `detached: true` only
+puts the worker in a new process group — it does not remove it from whatever Windows Job
+Object the bridge itself is running in, and Claude Desktop runs MCP servers in a job with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set (confirmed via `IsProcessInJob` +
+`QueryInformationJobObject` during the 2026-09-09 investigation on `fix/win32-detach`), so a
+naively-detached worker can die when the bridge does. `job-core.mjs`'s `launch()` works
+around this on win32 by shelling out to `win32-breakaway.ps1`, which calls `CreateProcessW`
+itself with `CREATE_BREAKAWAY_FROM_JOB` (falling back to a plain launch if the job's flags
+forbid breakaway — no worse than not having the workaround). See the win32 comment above
+`launchWin32()` in `job-core.mjs` for the mechanics, and `test/detach-survival.mjs` for a
+test that reproduces the failure against a throwaway Job Object and confirms the fix.
+
 ## Gotchas
 
 - **Server shows `running` but tools don't respond:** fully quit and relaunch the app;

@@ -8,11 +8,43 @@
  * run an unref'd server->client ping watchdog — any dead-peer signal exits the process so the
  * app respawns a fresh server. Nothing is lost: jobs are detached and durable on disk
  * (re-attach with claude_check by jobId). Tunable via CLAUDE_ASYNC_PING_MS / _PING_TIMEOUT_MS.
+ *
+ * Crash visibility: uncaughtException/unhandledRejection are logged (stack + timestamp) to
+ * stderr -- which Desktop captures into mcp-server-claude-async.log -- and to
+ * bridge-crash.log next to the jobs directory, before exiting non-zero. SIGTERM/SIGINT/exit
+ * also log a line, so a killed-from-outside bridge leaves a trace distinguishing "killed" from
+ * "crashed". Caveat: on Windows, a forceful kill (TerminateProcess, e.g. Task Manager "End
+ * Process" or `taskkill /F`) gives the process no chance to run any handler at all -- SIGTERM
+ * isn't a real Windows signal, so process.kill(pid, "SIGTERM") maps to TerminateProcess too. The
+ * SIGTERM/SIGINT handlers below are a best-effort trace for the cases Windows *can* deliver
+ * (console Ctrl+C / Ctrl+Break), not a guarantee for every kill path.
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { EmptyResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { registerTools, runSelfTest } from "./job-core.mjs";
+import { registerTools, runSelfTest, JOB_ROOT } from "./job-core.mjs";
+import fs from "node:fs";
+import path from "node:path";
+
+const CRASH_LOG = path.join(JOB_ROOT, "bridge-crash.log");
+
+function logTrace(kind, detail) {
+  const line = `[${new Date().toISOString()}] ${kind}: ${detail}\n`;
+  try { process.stderr.write(line); } catch {}
+  try { fs.appendFileSync(CRASH_LOG, line); } catch {}
+}
+
+process.on("uncaughtException", (err) => {
+  logTrace("uncaughtException", (err && err.stack) || String(err));
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  logTrace("unhandledRejection", (reason && reason.stack) || String(reason));
+  process.exit(1);
+});
+process.on("SIGTERM", () => { logTrace("SIGTERM", "received, exiting"); process.exit(0); });
+process.on("SIGINT", () => { logTrace("SIGINT", "received, exiting"); process.exit(0); });
+process.on("exit", (code) => { logTrace("exit", `code=${code}`); });
 
 if (process.argv.includes("--selftest")) {
   await runSelfTest();

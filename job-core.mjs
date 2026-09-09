@@ -21,6 +21,11 @@ const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
 const HEARTBEAT_FRESH_MS = 3 * 60 * 1000; // 3 minutes
 export const JOB_TIMEOUT_MS = Number(process.env.CLAUDE_ASYNC_JOB_TIMEOUT_MS) || 4 * 60 * 60 * 1000; // 4h
 const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runner.mjs");
+// win32-only: shells out through CreateProcessW(CREATE_BREAKAWAY_FROM_JOB) so job-runner.mjs
+// escapes whatever Job Object launch()'s caller is nested in (see launch()'s win32 comment).
+const WIN32_BREAKAWAY_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "win32-breakaway.ps1");
+const RUNNER_PID_POLL_MS = 2000;
+const RUNNER_PID_POLL_INTERVAL_MS = 50;
 // Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
 // preventing a project .mcp.json from recursively respawning claude-async.
 const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
@@ -101,15 +106,78 @@ function readTail(file, maxBytes) {
   } catch { return ""; }
 }
 
-function launch(p, command, argv, cwd) {
-  fs.writeFileSync(p.spec, JSON.stringify({ command, argv, cwd, out: p.out, err: p.err, exit: p.exit }));
-  const child = spawn(process.execPath, [RUNNER, p.spec],
-                      { detached: true, stdio: "ignore", windowsHide: true });
+// Records a launch()-time spawn failure (the shell/wrapper itself never started) the same way
+// job-runner.mjs records a run-time failure: an err.log line plus an exit_code file, so checkJob
+// reports "failed" with the reason in the stderr tail instead of an unhandled 'error' event
+// reaching the bridge process (which, with zero listeners, would crash it -- see the
+// uncaughtException/unhandledRejection handlers in claude-async-server.mjs for the last-resort
+// backstop if this ever gets bypassed).
+function recordLaunchFailure(p, message) {
+  try { fs.appendFileSync(p.err, `\n[job-core] launch failed: ${message}\n`); } catch {}
+  try { if (!fs.existsSync(p.exit)) fs.writeFileSync(p.exit, "126"); } catch {}
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function readRunnerPid(p, fallbackPid) {
+  const pidPath = path.join(p.d, "runner.pid");
+  const deadline = Date.now() + RUNNER_PID_POLL_MS;
+  while (Date.now() < deadline) {
+    try {
+      const raw = fs.readFileSync(pidPath, "utf8").trim();
+      if (raw) return Number(raw);
+    } catch { /* not written yet */ }
+    await sleep(RUNNER_PID_POLL_INTERVAL_MS);
+  }
+  // Timed out -- fall back to the pid we were handed (the wrapper's, on win32), noting the
+  // uncertainty so a future reader of meta.json/err.log understands why pid tracking may be off.
+  try { fs.appendFileSync(p.err, `\n[job-core] runner.pid did not appear within ${RUNNER_PID_POLL_MS}ms; ` +
+    `falling back to launcher pid ${fallbackPid} (may be a shell wrapper, not the runner itself)\n`); } catch {}
+  return fallbackPid;
+}
+
+// win32: node's child_process has no option to request CREATE_BREAKAWAY_FROM_JOB, and a plain
+// spawn({detached:true}) only creates a new process group -- the child still inherits whatever
+// Job Object the caller is nested in. Claude Desktop (Electron) runs this bridge inside a Job
+// Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set (confirmed via IsProcessInJob +
+// QueryInformationJobObject during the 2026-09-09 investigation), so a naively-detached
+// runner can still die when the bridge does. This shells out to win32-breakaway.ps1, which calls
+// CreateProcessW itself with CREATE_BREAKAWAY_FROM_JOB (falling back to a plain CreateProcessW if
+// the job's flags forbid breakaway -- no worse than the old behavior). The pid spawn() returns
+// here is the PowerShell wrapper's, not job-runner.mjs's, so readRunnerPid() polls the job dir
+// for the runner.pid file job-runner.mjs writes as its first action.
+//
+// The wrapper itself is spawned WITHOUT detached:true. On Windows, node's detached:true maps to
+// the DETACHED_PROCESS creation flag (no console at all, not merely hidden), and PowerShell's
+// console host silently no-ops -- exits 0 without running the -File script -- when it can't
+// attach to a console (verified empirically: identical spawn args with detached:true produced no
+// output). windowsHide:true (STARTF_USESHOWWINDOW/SW_HIDE) still keeps the window invisible; the
+// wrapper's own job/console membership doesn't matter since it just calls CreateProcessW and
+// exits within milliseconds, and job-runner.mjs (the actual long-lived target) gets its own
+// CREATE_NEW_PROCESS_GROUP + CREATE_NO_WINDOW from win32-breakaway.ps1 regardless.
+async function launchWin32(p) {
+  const child = spawn("powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+     "-File", WIN32_BREAKAWAY_SCRIPT, process.execPath, RUNNER, p.spec, p.err],
+    { detached: false, stdio: "ignore", windowsHide: true });
+  child.on("error", (e) => recordLaunchFailure(p, `failed to spawn win32 breakaway wrapper: ${e.message}`));
+  child.unref();
+  return readRunnerPid(p, child.pid);
+}
+
+function launchPosix(p) {
+  const child = spawn(process.execPath, [RUNNER, p.spec], { detached: true, stdio: "ignore" });
+  child.on("error", (e) => recordLaunchFailure(p, `failed to spawn job-runner: ${e.message}`));
   child.unref();
   return child.pid;
 }
 
-export function startJob({ prompt, workFolder, jobId, model, effort, intent }) {
+async function launch(p, command, argv, cwd) {
+  fs.writeFileSync(p.spec, JSON.stringify({ command, argv, cwd, out: p.out, err: p.err, exit: p.exit }));
+  return process.platform === "win32" ? launchWin32(p) : launchPosix(p);
+}
+
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent }) {
   const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
   const p = jobPaths(id);
   if (fs.existsSync(p.d)) return { error: `jobId ${id} already exists` };
@@ -132,7 +200,7 @@ export function startJob({ prompt, workFolder, jobId, model, effort, intent }) {
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
-  const pid = launch(p, CLAUDE_BIN, argv, cwd);
+  const pid = await launch(p, CLAUDE_BIN, argv, cwd);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
   const meta = { jobId: id, pid, workFolder: cwd, model: resolvedModel, effort: eff,
@@ -244,7 +312,7 @@ export function registerTools(server) {
         .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
                   "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),
     },
-  }, async (args) => ok(startJob(args)));
+  }, async (args) => ok(await startJob(args)));
 
   server.registerTool("claude_check", {
     description: "Check a background job's status and recent output. Returns status " +
@@ -270,7 +338,7 @@ export async function runSelfTest() {
   const id = `selftest-${Date.now()}`;
   const p = jobPaths(id);
   fs.mkdirSync(p.d, { recursive: true });
-  const pid = launch(p, process.execPath,
+  const pid = await launch(p, process.execPath,
     ["-e", "setTimeout(() => console.log('SELFTEST_OK'), 300)"], JOB_ROOT);
   fs.writeFileSync(p.meta, JSON.stringify({ jobId: id, pid, startedAt: new Date().toISOString() }));
 
