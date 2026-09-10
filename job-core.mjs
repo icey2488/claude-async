@@ -73,17 +73,43 @@ export function logIfPathextSanitized(logPath, originalEnv, sanitizedEnv, contex
 
 export const CLAUDE_BIN = process.env.CLAUDE_CLI_PATH || "claude";
 export const JOB_ROOT = process.env.CLAUDE_ASYNC_JOB_DIR || path.join(os.homedir(), ".claude-async-jobs");
+// win32 Task Scheduler launcher queue: deliberately NOT derived from JOB_ROOT/any env override.
+// job-launcher.mjs is started by the Task Scheduler service with its own fresh environment, not
+// a copy of the bridge process's -- a CLAUDE_ASYNC_JOB_DIR override set on the bridge would never
+// reach it, so it would scan the wrong directory for pending tickets. This path must be
+// computable identically by both processes from nothing but os.homedir(), which Task Scheduler's
+// per-user logon session always sets consistently. Individual jobs still live under JOB_ROOT
+// (wherever that points); each ticket in this queue just carries the absolute paths to them.
+export const LAUNCHER_QUEUE_DIR = path.join(os.homedir(), ".claude-async-launcher-queue");
 const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
 // Heartbeat classification thresholds. HEARTBEAT_FRESH_MS: a lastAlive within this window
 // is definitely running. JOB_TIMEOUT_MS: beyond this, the job is timed_out regardless of pid.
 const HEARTBEAT_FRESH_MS = 3 * 60 * 1000; // 3 minutes
 export const JOB_TIMEOUT_MS = Number(process.env.CLAUDE_ASYNC_JOB_TIMEOUT_MS) || 4 * 60 * 60 * 1000; // 4h
-const RUNNER = path.join(path.dirname(fileURLToPath(import.meta.url)), "job-runner.mjs");
+const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
+const RUNNER = path.join(REPO_DIR, "job-runner.mjs");
 // win32-only: shells out through CreateProcessW(CREATE_BREAKAWAY_FROM_JOB) so job-runner.mjs
-// escapes whatever Job Object launch()'s caller is nested in (see launch()'s win32 comment).
-const WIN32_BREAKAWAY_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "win32-breakaway.ps1");
+// escapes whatever Job Object launch()'s caller is nested in (see launchWin32Breakaway()'s
+// comment). FALLBACK ONLY as of the 2026-09-09 Task Scheduler launcher -- see launchWin32()'s
+// comment for why breakaway alone turned out not to be enough.
+const WIN32_BREAKAWAY_SCRIPT = path.join(REPO_DIR, "win32-breakaway.ps1");
+// win32-only: the Task Scheduler launcher path (primary as of the 2026-09-09 Task Scheduler
+// launcher work). See launchWin32Task()/job-launcher.mjs's own header for the full protocol.
+const LAUNCHER_SCRIPT = path.join(REPO_DIR, "job-launcher.mjs");
+const REGISTER_TASK_SCRIPT = path.join(REPO_DIR, "tools", "register-launcher-task.ps1");
+const TASK_NAME = "ClaudeAsyncRunner";
 const RUNNER_PID_POLL_MS = 2000;
+// The task path has more hops than a direct breakaway spawn (schtasks /Run -> Task Scheduler
+// service schedules a new instance -> job-launcher.mjs starts, imports job-core.mjs, scans and
+// claims -> spawns job-runner.mjs), so it gets a longer poll window before falling back.
+const TASK_RUNNER_PID_POLL_MS = 15000;
 const RUNNER_PID_POLL_INTERVAL_MS = 50;
+// CLAUDE_ASYNC_WIN32_LAUNCH_MODE: "auto" (default) tries the Task Scheduler path first and falls
+// back to win32-breakaway.ps1 only if task registration or the run trigger itself fails (or the
+// runner never shows up within TASK_RUNNER_PID_POLL_MS). "breakaway" skips the task path
+// entirely -- used by tests that specifically exercise win32-breakaway.ps1 mechanics (PATHEXT
+// repair, the wrapper-fallback pid path) that the Task Scheduler path doesn't go through at all.
+const WIN32_LAUNCH_MODE = (process.env.CLAUDE_ASYNC_WIN32_LAUNCH_MODE || "auto").toLowerCase();
 // Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
 // preventing a project .mcp.json from recursively respawning claude-async.
 const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
@@ -95,6 +121,7 @@ const DEFAULT_MODEL = process.env.CLAUDE_ASYNC_DEFAULT_MODEL || "claude-sonnet-5
 const DEFAULT_EFFORT = process.env.CLAUDE_ASYNC_DEFAULT_EFFORT || "medium";
 const FLAG_EFFORT = new Set(["low", "medium", "high", "xhigh", "max"]);
 fs.mkdirSync(JOB_ROOT, { recursive: true });
+if (process.platform === "win32") fs.mkdirSync(LAUNCHER_QUEUE_DIR, { recursive: true });
 
 const jobDir = (id) => path.join(JOB_ROOT, id);
 const jobPaths = (id) => {
@@ -207,9 +234,15 @@ function recordLaunchFailure(p, message) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-async function readRunnerPid(p, fallbackPid) {
+// fallbackPid: what to report if runner.pid never shows up in time. On the breakaway path this
+// is the PowerShell wrapper's pid (a real, if short-lived, process -- pidSource
+// "wrapper-fallback"). On the Task Scheduler path there is no wrapper process job-core.mjs
+// controls -- schtasks /Run hands back nothing usable -- so callers pass null, and a timeout
+// here is treated as an outright failure of that launch path (pidSource "task-timeout", pid
+// null), signaling launchWin32Task() to fall back to win32-breakaway.ps1 instead.
+async function readRunnerPid(p, fallbackPid, pollMs = RUNNER_PID_POLL_MS) {
   const pidPath = path.join(p.d, "runner.pid");
-  const deadline = Date.now() + RUNNER_PID_POLL_MS;
+  const deadline = Date.now() + pollMs;
   while (Date.now() < deadline) {
     try {
       const raw = fs.readFileSync(pidPath, "utf8").trim();
@@ -217,12 +250,17 @@ async function readRunnerPid(p, fallbackPid) {
     } catch { /* not written yet */ }
     await sleep(RUNNER_PID_POLL_INTERVAL_MS);
   }
+  if (fallbackPid == null) {
+    try { fs.appendFileSync(p.err, `\n[job-core] runner.pid did not appear within ${pollMs}ms via the ` +
+      `Task Scheduler path; treating as a failed launch attempt\n`); } catch {}
+    return { pid: null, pidSource: "task-timeout" };
+  }
   // Timed out -- fall back to the pid we were handed (the wrapper's, on win32), noting the
   // uncertainty so a future reader of meta.json/err.log understands why pid tracking may be off.
   // pidSource: "wrapper-fallback" flags this in meta.json so checkJob knows this pid may belong
   // to a process (the PowerShell wrapper) that exits within milliseconds of spawning the real
   // runner -- see checkJob's healMetaPid() for how a stale wrapper pid gets healed later.
-  try { fs.appendFileSync(p.err, `\n[job-core] runner.pid did not appear within ${RUNNER_PID_POLL_MS}ms; ` +
+  try { fs.appendFileSync(p.err, `\n[job-core] runner.pid did not appear within ${pollMs}ms; ` +
     `falling back to launcher pid ${fallbackPid} (may be a shell wrapper, not the runner itself)\n`); } catch {}
   return { pid: fallbackPid, pidSource: "wrapper-fallback" };
 }
@@ -255,7 +293,7 @@ async function readRunnerPid(p, fallbackPid) {
 // repairs it before this spawn (see that function's header comment above for why it's needed --
 // this is the first of the two hops it patches; job-runner.mjs's own spawn of the CLI is the
 // second, belt-and-suspenders in case a future launch path bypasses this one).
-async function launchWin32(p) {
+async function launchWin32Breakaway(p) {
   // A stray runner.pid can only exist here if a prior job dir at this same path was left behind
   // without a clean startJob() (startJob() itself refuses to reuse an existing job dir -- see
   // its fs.existsSync(p.d) guard -- so this is defense in depth, not a path this code expects to
@@ -286,11 +324,124 @@ async function launchWin32(p) {
   return { pid, pidSource, jobMembership };
 }
 
+// Curated env vars threaded through to job-launcher.mjs via launch.json (see writeLaunchTicket())
+// so a task-launched runner still sees whatever CLAUDE_*/ANTHROPIC_* overrides were set directly
+// on the bridge process, without snapshotting the bridge's entire environment (PATH/PATHEXT/etc.
+// must come from job-launcher.mjs's own Task-Scheduler-provided environment, not a stale copy of
+// the bridge's -- see job-launcher.mjs's buildRunnerEnv()).
+function collectEnvOverrides() {
+  const out = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (/^(CLAUDE_|ANTHROPIC_)/.test(k)) out[k] = v;
+  }
+  return out;
+}
+
+// Idempotently ensures the `ClaudeAsyncRunner` scheduled task exists and points at the current
+// node.exe + job-launcher.mjs. Cheap in the steady state: a `schtasks /Query` is a fast, local
+// call to the Task Scheduler service (no COM object churn), so this runs on every win32 launch;
+// the slow path (tools/register-launcher-task.ps1's Register-ScheduledTask) only runs when the
+// task is missing or its action has drifted (e.g. node.exe was reinstalled at a new path, or this
+// repo was moved).
+function ensureLauncherTask() {
+  const expectedAction = `${process.execPath} "${LAUNCHER_SCRIPT}"`;
+  const query = spawnSync("schtasks", ["/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"], { encoding: "utf8" });
+  if (query.status === 0) {
+    const line = (query.stdout || "").split(/\r?\n/).find((l) => l.startsWith("Task To Run:"));
+    const actual = line ? line.slice("Task To Run:".length).trim() : null;
+    if (actual === expectedAction) return { ok: true };
+  }
+  const register = spawnSync("powershell.exe",
+    ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", REGISTER_TASK_SCRIPT,
+     "-NodeExe", process.execPath, "-LauncherScript", LAUNCHER_SCRIPT],
+    { encoding: "utf8" });
+  if (register.status === 0 && /^REGISTERED\b/m.test(register.stdout || "")) return { ok: true };
+  return { ok: false, error: `register-launcher-task.ps1 exited ${register.status}: ` +
+    `${(register.stdout || "").trim()} ${(register.stderr || "").trim()}`.trim() };
+}
+
+// Writes the work ticket job-launcher.mjs claims (see that file's header for the full protocol).
+// Written to <jobId>.json in LAUNCHER_QUEUE_DIR (a fixed location -- see that const's comment for
+// why it's not simply p.d); job-launcher.mjs renames it to <jobId>.claimed.json in the same
+// directory as its atomic claim mechanism. jobDir is carried inside the ticket so job-launcher.mjs
+// can find/write the job's own artifacts (launched.marker) without needing to know JOB_ROOT.
+function writeLaunchTicket(p) {
+  const jobId = path.basename(p.d);
+  const ticket = {
+    jobId,
+    jobDir: p.d,
+    specPath: p.spec,
+    errPath: p.err,
+    nodeExe: process.execPath,
+    runnerScript: RUNNER,
+    envOverrides: collectEnvOverrides(),
+    createdAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(LAUNCHER_QUEUE_DIR, `${jobId}.json`), JSON.stringify(ticket, null, 2));
+}
+
+// Primary win32 launch path as of the 2026-09-09 Task Scheduler launcher work: gives
+// job-runner.mjs an ancestor (svchost's Task Scheduler service, via job-launcher.mjs) that was
+// never inside Claude Desktop's Job Object to begin with, rather than asking a runner already
+// inside that job to breakaway from it (win32-breakaway.ps1's approach, which still left runners
+// self-reporting membership in a job with KILL_ON_JOB_CLOSE set -- see RUNBOOK.md). Returns null
+// on any failure of the task path itself (registration, /Run, or the runner never showing up in
+// time) so launchWin32() can fall back to win32-breakaway.ps1; never throws.
+async function launchWin32Task(p) {
+  const reg = ensureLauncherTask();
+  if (!reg.ok) {
+    try { fs.appendFileSync(p.err, `\n[job-core] ensureLauncherTask() failed: ${reg.error}\n`); } catch {}
+    return null;
+  }
+
+  // Same defense-in-depth as launchWin32Breakaway(): a stray runner.pid must never survive from
+  // a prior occupant of this job dir.
+  try { fs.unlinkSync(path.join(p.d, "runner.pid")); } catch {}
+  writeLaunchTicket(p);
+
+  const run = spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" });
+  if (run.status !== 0) {
+    try { fs.appendFileSync(p.err, `\n[job-core] schtasks /Run /TN ${TASK_NAME} failed (status=${run.status}): ` +
+      `${(run.stdout || "").trim()} ${(run.stderr || "").trim()}\n`); } catch {}
+    return null;
+  }
+
+  const { pid, pidSource } = await readRunnerPid(p, null, TASK_RUNNER_PID_POLL_MS);
+  if (!pid) return null; // task-timeout -- caller falls back to breakaway
+
+  // Same job-membership query as the breakaway path, logged for the record -- but NOTE (verified
+  // 2026-09-09 while building this): inJob:true with limitFlags 0x3C00 is NOT reliable evidence
+  // of nesting inside Desktop's specific job. Windows places essentially any console-attached
+  // process into a default per-console job with those exact flags regardless of ancestry
+  // (confirmed: a bare `node -e ...` from a plain terminal, zero relation to Desktop, self-reports
+  // identically). The actual proof this launch path escapes Desktop's job is behavioral, not this
+  // flag -- see test/survival.mjs and RUNBOOK.md. This WARN is diagnostic breadcrumb, not a verdict.
+  const jobMembership = queryJobMembershipOnce(pid);
+  if (jobMembership.inJob) {
+    try { fs.appendFileSync(p.err, `\n[job-core] NOTE: task-launched runner pid=${pid} self-reports job ` +
+      `membership at launch time (jobMembership=${JSON.stringify(jobMembership)}) -- see RUNBOOK.md's ` +
+      `caveat on why this alone doesn't indicate a problem; test/survival.mjs is the real check\n`); } catch {}
+  }
+  return { pid, pidSource, jobMembership, launchPath: "task" };
+}
+
+async function launchWin32(p) {
+  if (WIN32_LAUNCH_MODE !== "breakaway") {
+    const viaTask = await launchWin32Task(p);
+    if (viaTask) return viaTask;
+    try { fs.appendFileSync(p.err,
+      "\n[job-core] Task Scheduler launch path unavailable/failed; falling back to win32-breakaway.ps1\n");
+    } catch {}
+  }
+  const viaBreakaway = await launchWin32Breakaway(p);
+  return { ...viaBreakaway, launchPath: "breakaway-fallback" };
+}
+
 function launchPosix(p) {
   const child = spawn(process.execPath, [RUNNER, p.spec], { detached: true, stdio: "ignore" });
   child.on("error", (e) => recordLaunchFailure(p, `failed to spawn job-runner: ${e.message}`));
   child.unref();
-  return { pid: child.pid, pidSource: "runner" };
+  return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
 async function launch(p, command, argv, cwd) {
@@ -321,10 +472,10 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
-  const { pid, pidSource, jobMembership } = await launch(p, CLAUDE_BIN, argv, cwd);
+  const { pid, pidSource, jobMembership, launchPath } = await launch(p, CLAUDE_BIN, argv, cwd);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
-  const meta = { jobId: id, pid, pidSource, ...(jobMembership ? { jobMembership } : {}),
+  const meta = { jobId: id, pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
                  workFolder: cwd, model: resolvedModel, effort: eff,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
@@ -453,9 +604,14 @@ export function registerTools(server) {
                  "running may include elapsed and lastAlive fields; stalled:true means heartbeat is stale " +
                  "but pid is still alive. died means the process exited without recording a result. " +
                  "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h). " +
-                 "On win32, jobMembership (recorded at launch) and runnerJobMembership (refreshed every " +
-                 "heartbeat by the runner itself) report Windows Job Object membership -- inJob:true on " +
-                 "either means the breakaway did not fully take effect.",
+                 "On win32, launchPath reports which launch mechanism was used (\"task\": Task Scheduler, " +
+                 "the default; \"breakaway-fallback\": win32-breakaway.ps1, used only if the task path " +
+                 "failed; \"spawn\": non-win32). jobMembership (recorded at launch) and " +
+                 "runnerJobMembership (refreshed every heartbeat by the runner itself) report Windows Job " +
+                 "Object membership, but inJob:true alone is NOT proof of an escape failure -- Windows " +
+                 "places most console-attached processes into a default per-console job with identical " +
+                 "limitFlags (0x3C00) regardless of ancestry, confirmed via RUNBOOK.md's verification. " +
+                 "Trust the survival behavior (test/survival.mjs), not this flag, when in doubt.",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),

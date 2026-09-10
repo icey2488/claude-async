@@ -130,8 +130,104 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   does not (and given the above, cannot) claim the full environment block is byte-for-byte
   identical across the win32-breakaway path. See `win32-breakaway.ps1`'s header for detail.
 - **A wrapper-fallback `meta.pid` can heal wrong if the poll window races a job dir reused across
-  restarts.** `launchWin32()`'s `readRunnerPid()` polls `runner.pid` for 2s before falling back to
-  the PowerShell wrapper's own (short-lived) pid; `checkJob()`'s `healMetaPid()` re-reads
-  `runner.pid` later and adopts it if that pid is alive and looks like ours. `launchWin32()` now
-  deletes any stray `runner.pid` before spawning to keep this from ever reading a stale file. See
-  `test/pid-heal.mjs`.
+  restarts.** `launchWin32Breakaway()`'s `readRunnerPid()` polls `runner.pid` for 2s before
+  falling back to the PowerShell wrapper's own (short-lived) pid; `checkJob()`'s `healMetaPid()`
+  re-reads `runner.pid` later and adopts it if that pid is alive and looks like ours.
+  `launchWin32Breakaway()` deletes any stray `runner.pid` before spawning to keep this from ever
+  reading a stale file. See `test/pid-heal.mjs`.
+
+## Field notes — 2026-09-09 Task Scheduler launcher (`fix/win32-detach`, continued)
+
+**Why breakaway alone wasn't enough.** Runners launched through `win32-breakaway.ps1` reported
+`breakaway=ok` yet still self-queried as members of a Job Object with `limitFlags 0x3C00`
+(`KILL_ON_JOB_CLOSE | BREAKAWAY_OK | SILENT_BREAKAWAY_OK`) — the same flags as Claude Desktop's
+job. Multiple runners were hard-terminated in the same second with no exit code. Breakaway only
+asks Windows to detach a process from an *existing* job ancestry; it doesn't change the fact that
+the runner's ultimate ancestor is still Claude Desktop. The fix instead gives the runner an
+ancestor that was never inside Desktop's process tree or job at all: the Windows Task Scheduler
+service.
+
+**⚠️ `inJob`/`limitFlags` are NOT reliable evidence of nesting inside a *specific* job.** While
+verifying this fix, a completely unrelated `node -e ...` process launched from a plain terminal —
+zero relation to Claude Desktop — self-reported `inJob:true, limitFlags:0x3C00,
+killOnClose:true` via the exact same self-query mechanism `job-runner.mjs` uses. Windows places
+essentially any console-attached process into a default per-console job with those flags,
+independent of ancestry. **The `jobMembership`/`runnerJobMembership` fields in `meta.json` /
+`claude_check` are diagnostic breadcrumbs, not proof of escape or failure to escape.** The only
+reliable test is behavioral: does the runner keep running after the *specific* job/process tree
+it descended from is torn down? That's what `test/survival.mjs` does, with three independent kill
+mechanisms (process-tree kill, external job-close, self job-close) — trust that over the flags.
+
+**Design: the `ClaudeAsyncRunner` scheduled task.**
+- A single, fixed, user-scope, no-elevation scheduled task named `ClaudeAsyncRunner` whose action
+  is always `node.exe job-launcher.mjs` — never a per-job command line, because
+  registering/reconfiguring a task (`Register-ScheduledTask`) is a slow COM round-trip, too slow
+  to pay on every `claude_start`.
+- `job-core.mjs`'s `ensureLauncherTask()` checks (`schtasks /Query /TN ClaudeAsyncRunner /FO LIST
+  /V`, fast) whether the task exists and its `Task To Run:` line matches the current `node.exe` +
+  `job-launcher.mjs` path, and only calls `tools/register-launcher-task.ps1`
+  (`Register-ScheduledTask`, slow) when it's missing or stale (e.g. after a Node reinstall or the
+  repo moving). Steady state: one fast query per launch, no registration calls.
+- `job-core.mjs` writes a work ticket to `<LAUNCHER_QUEUE_DIR>/<jobId>.json` (see below for why
+  this is a fixed location, not under the job's own directory) and runs `schtasks /Run /TN
+  ClaudeAsyncRunner`. The task's `MultipleInstances Parallel` setting means concurrent
+  `claude_start` calls each spawn their own `job-launcher.mjs` instance rather than queuing behind
+  one another.
+- Each `job-launcher.mjs` instance scans the queue directory and claims **at most one** ticket by
+  atomically renaming `<jobId>.json` → `<jobId>.claimed.json` (`fs.renameSync`, atomic on the same
+  NTFS volume — a losing instance sees `ENOENT` and moves to the next candidate, or exits 0
+  quietly if nothing is left). The winner spawns `job-runner.mjs` detached and writes
+  `launched.marker` (pid + timestamp) into the job's own directory.
+- `job-core.mjs`'s existing `readRunnerPid()` poll (unchanged mechanism) is what actually confirms
+  the runner started — just with a longer timeout on this path (`TASK_RUNNER_PID_POLL_MS`,
+  15s, vs 2s for the direct breakaway wrapper spawn) since Task Scheduler scheduling has more hops.
+
+**`LAUNCHER_QUEUE_DIR` is deliberately NOT under `JOB_ROOT`.** `job-launcher.mjs` is started by
+the Task Scheduler service with its own fresh environment, not a copy of the bridge process's —
+a `CLAUDE_ASYNC_JOB_DIR` override on the bridge would never reach it. `LAUNCHER_QUEUE_DIR`
+(`~/.claude-async-launcher-queue`) is computed identically in both processes from nothing but
+`os.homedir()`, and each ticket carries the job's real (possibly `JOB_ROOT`-overridden) directory
+as an absolute path. Discovered by an early manual test: with a `CLAUDE_ASYNC_JOB_DIR` override
+pointed at a temp dir, the task path silently timed out every time until this was fixed, because
+`job-launcher.mjs` was scanning the *default* `~/.claude-async-jobs` for a ticket that only ever
+existed in the temp dir.
+
+**Logon type: `Interactive`, not `S4U`.** `S4U` (doesn't require the user to be interactively
+logged on) was tried first and failed outright on this machine for a non-elevated, non-admin
+account: `Register-ScheduledTask` threw "Access is denied", no task created — most likely because
+granting/verifying `SeBatchLogonRight` for the account is itself a privileged operation this
+unelevated process can't perform. `Interactive` works unelevated and is used instead; it means the
+task can only run while that user has an interactive logon session, which is fine here since
+Claude Desktop itself is a desktop GUI app and is never running when nobody's logged on anyway.
+
+**Fallback order:** `task` (default) → `breakaway-fallback` (`win32-breakaway.ps1`, used only if
+`ensureLauncherTask()` fails, `schtasks /Run` fails, or the runner never appears within
+`TASK_RUNNER_PID_POLL_MS`) → (non-win32 only) `spawn`. The chosen path is recorded as
+`launchPath` in `meta.json` / `claude_check`. Override via `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=
+breakaway` to force the old path directly (used by `test/pid-heal.mjs`, `test/pathext-integrity.mjs`,
+and `test/env-integrity.mjs`, which specifically exercise breakaway-only mechanics — the PowerShell
+hop's PATHEXT repair and the wrapper-fallback pid path — that the task path never goes through).
+
+**Inspecting/removing the task:**
+```powershell
+Get-ScheduledTask ClaudeAsyncRunner | Get-ScheduledTaskInfo   # LastTaskResult 0 = healthy
+schtasks /Query /TN ClaudeAsyncRunner /FO LIST /V             # human-readable, incl. action path
+Get-Content "$env:USERPROFILE\.claude-async-launcher-queue\job-launcher.log" -Tail 50
+Unregister-ScheduledTask -TaskName ClaudeAsyncRunner -Confirm:$false   # remove entirely
+```
+Removing the task doesn't break anything — the next `claude_start` on win32 re-registers it
+automatically via `ensureLauncherTask()` (or falls back to `breakaway-fallback` if registration
+itself fails, e.g. `register-launcher-task.ps1` missing).
+
+**A stuck/orphaned `<jobId>.claimed.json` with no corresponding `launched.marker`** in the job's
+directory means a `job-launcher.mjs` instance claimed the ticket but died before spawning
+`job-runner.mjs` (e.g. killed mid-claim). This is rare and currently requires manual cleanup —
+delete the stale `.claimed.json` from `LAUNCHER_QUEUE_DIR` and retry `claude_start` with the same
+`jobId` if the job never actually started (check for an absent `runner.pid` in the job's directory
+to confirm before deleting).
+
+**IMPORTANT: restart the bridge to pick this up.** The running `claude-async` MCP server process
+has the pre-Task-Scheduler `job-core.mjs` loaded in memory; it keeps using the old
+`win32-breakaway.ps1`-only launch path until Claude Desktop (and this bridge with it) is
+restarted. This is true of any `job-core.mjs` change while the bridge is live, per the "Restarting
+the bridge" section above.

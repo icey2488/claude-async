@@ -47,6 +47,9 @@ if (build.status !== 0) {
 
 const jobDir = fs.mkdtempSync(path.join(os.tmpdir(), "pid-heal-"));
 process.env.CLAUDE_ASYNC_JOB_DIR = jobDir;
+// This test exercises win32-breakaway.ps1-specific mechanics (the wrapper-fallback pid path) that
+// the Task Scheduler launch path (default since 2026-09-09) doesn't go through at all -- force it.
+process.env.CLAUDE_ASYNC_WIN32_LAUNCH_MODE = "breakaway";
 process.env.CLAUDE_CLI_PATH = DUMMY_CLI;
 process.env.DUMMY_SLEEP_SECONDS = "30";
 process.env.CLAUDE_ASYNC_HEARTBEAT_MS = "1000";

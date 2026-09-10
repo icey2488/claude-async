@@ -118,12 +118,17 @@ puts the worker in a new process group — it does not remove it from whatever W
 Object the bridge itself is running in, and Claude Desktop runs MCP servers in a job with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` set (confirmed via `IsProcessInJob` +
 `QueryInformationJobObject` during the 2026-09-09 investigation on `fix/win32-detach`), so a
-naively-detached worker can die when the bridge does. `job-core.mjs`'s `launch()` works
-around this on win32 by shelling out to `win32-breakaway.ps1`, which calls `CreateProcessW`
-itself with `CREATE_BREAKAWAY_FROM_JOB` (falling back to a plain launch if the job's flags
-forbid breakaway — no worse than not having the workaround). See the win32 comment above
-`launchWin32()` in `job-core.mjs` for the mechanics, and `test/detach-survival.mjs` for a
-test that reproduces the failure against a throwaway Job Object and confirms the fix.
+naively-detached worker can die when the bridge does. An initial fix shelled out to
+`win32-breakaway.ps1` (`CreateProcessW` with `CREATE_BREAKAWAY_FROM_JOB`), but runners still
+self-reported job membership afterward and were still observed being hard-killed. The launch
+path now defaults instead to a small Windows Task Scheduler-based launcher
+(`job-launcher.mjs`, registered as the `ClaudeAsyncRunner` task by `job-core.mjs`'s
+`ensureLauncherTask()`) that gives the worker an ancestor — the Task Scheduler service — that
+was never inside Claude Desktop's process tree or job to begin with; `win32-breakaway.ps1` is
+kept as an automatic fallback if the task can't be registered or triggered. See
+`RUNBOOK.md`'s "Task Scheduler launcher" section for the full design and its verification, and
+`test/survival.mjs` for the tests (three independent kill mechanisms plus a launcher claim-race
+test).
 
 ## Gotchas
 

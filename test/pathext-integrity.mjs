@@ -55,6 +55,10 @@ async function runScenario(label, presetPathext) {
   deleteEnvCI("PATHEXT");
   if (presetPathext !== undefined) process.env.PATHEXT = presetPathext;
 
+  // This test proves PATHEXT repair on the win32-breakaway.ps1 powershell.exe hop specifically --
+  // the Task Scheduler launch path (default since 2026-09-09) never hops through PowerShell, so
+  // force the breakaway path to keep exercising the mechanic this test exists for.
+  process.env.CLAUDE_ASYNC_WIN32_LAUNCH_MODE = "breakaway";
   process.env.CLAUDE_ASYNC_JOB_DIR = jobDir;
   process.env.CLAUDE_CLI_PATH = DUMPER_EXE;
   process.env.ENV_DUMP_OUTPUT_PATH = dumpFile;

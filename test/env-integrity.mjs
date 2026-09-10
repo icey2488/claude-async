@@ -57,6 +57,11 @@ async function runScenario(label, coreModulePath, dumperExe, sentinel) {
   const jobDir = fs.mkdtempSync(path.join(os.tmpdir(), `env-integrity-${label}-`));
   const dumpFile = path.join(jobDir, "child-env.txt");
 
+  // The "after" scenario's assertions are specifically about the win32-breakaway.ps1
+  // powershell.exe hop (PATHEXT gains ".CPL"); the Task Scheduler launch path (default since
+  // 2026-09-09) never hops through PowerShell at all, so force breakaway here. Harmless for
+  // "before", which uses a pre-Task-Scheduler job-core.mjs snapshot with no such env var.
+  process.env.CLAUDE_ASYNC_WIN32_LAUNCH_MODE = "breakaway";
   process.env.CLAUDE_ASYNC_JOB_DIR = jobDir;
   process.env.CLAUDE_CLI_PATH = dumperExe;
   process.env.ENV_DUMP_OUTPUT_PATH = dumpFile;
