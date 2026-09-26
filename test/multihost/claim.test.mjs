@@ -218,6 +218,140 @@ test("pidAlive is injectable: a lock owned by a 'live' pid is not broken", () =>
 });
 
 // ---------------------------------------------------------------------------------------------
+// Lock identity: only ever unlink a lock (or marker) whose content is our pid. fs is patched in place
+// (launcher-claim.mjs calls fs.writeSync / fs.renameSync / fs.unlinkSync through the shared module
+// object) to run a callback at the exact instant a stalled launcher would have been suspended.
+// ---------------------------------------------------------------------------------------------
+
+const OTHER_PID = 4242; // any pid but ours; a fresh lock is never judged by liveness
+const otherOwner = () => JSON.stringify({ pid: OTHER_PID, at: "2026-01-01T00:00:00.000Z" });
+const lockPid = (file) => JSON.parse(fs.readFileSync(file, "utf8")).pid;
+
+// Patches fs[name] for the duration of body(): every call first runs before(callIndex, args) for its
+// side effects; if that returns "throw-eio" the call throws EIO instead of running.
+async function withPatchedFs(name, before, body) {
+  const orig = fs[name];
+  let calls = 0;
+  fs[name] = function (...args) {
+    if (before(calls++, args) === "throw-eio") throw Object.assign(new Error("injected EIO"), { code: "EIO" });
+    return orig.apply(this, args);
+  };
+  try { return await body(); } finally { fs[name] = orig; }
+}
+// Puts another launcher's live lock where ours is: what a breaker plus a second launcher leave behind
+// after our lock was broken while we were suspended.
+function replaceLockWithOthers(lock) {
+  fs.unlinkSync(lock);
+  fs.writeFileSync(lock, otherOwner());
+}
+
+test("identity: our lock replaced by another launcher's between create and write -> we lose it: no rename, no unlink of theirs, ticket left pending", async () => {
+  const q = mkQueue("id-lost");
+  putTicket(q, "a");
+  const lock = path.join(q, "a.lock");
+  const { lines, log } = collect();
+  let renames = 0;
+  const c = await withPatchedFs("renameSync", () => { renames++; }, () =>
+    withPatchedFs("writeSync", (n) => { if (n === 0) replaceLockWithOthers(lock); }, () => claimOneTicket({ queueDir: q, log })));
+  assert.equal(c, null);
+  assert.equal(renames, 0, "a launcher that lost its lock must not rename the ticket");
+  assert.equal(lockPid(lock), OTHER_PID, "the other launcher's live lock must survive untouched");
+  assert.deepEqual(listing(q), ["a.json", "a.lock"], "ticket still pending, no claimed file");
+  assert.ok(lines.some((l) => /lost the claim lock/.test(l)), lines.join("\n"));
+});
+
+test("identity: our lock deleted (broken, not yet replaced) between create and write -> we lose it and create nothing", async () => {
+  const q = mkQueue("id-gone");
+  putTicket(q, "a");
+  const { lines, log } = collect();
+  const c = await withPatchedFs("writeSync", (n) => { if (n === 0) fs.unlinkSync(path.join(q, "a.lock")); },
+    () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(c, null);
+  assert.deepEqual(listing(q), ["a.json"]);
+  assert.ok(lines.some((l) => /lost the claim lock/.test(l)), lines.join("\n"));
+});
+
+test("identity: the release after the rename leaves a replaced lock alone (the claim itself still stands)", async () => {
+  const q = mkQueue("id-finally");
+  putTicket(q, "a", { jobId: "a" });
+  const lock = path.join(q, "a.lock");
+  const { lines, log } = collect();
+  // The lock is replaced while we hold it (rename in flight), as if a 60 s stall had let a breaker in.
+  const c = await withPatchedFs("renameSync", (n) => { if (n === 0) replaceLockWithOthers(lock); },
+    () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(path.basename(c.claimedPath), "a.claimed.json");
+  assert.equal(lockPid(lock), OTHER_PID, "the other launcher's lock survives our release");
+  assert.deepEqual(listing(q), ["a.claimed.json", "a.lock"]);
+  assert.ok(lines.some((l) => /claim lock a\.lock is no longer ours/.test(l)), lines.join("\n"));
+});
+
+test("identity: the release after a FAILED rename also leaves a replaced lock alone", async () => {
+  const q = mkQueue("id-finally-fail");
+  putTicket(q, "a");
+  fs.mkdirSync(path.join(q, "a.claimed.json")); // makes the rename fail
+  const lock = path.join(q, "a.lock");
+  const { lines, log } = collect();
+  const c = await withPatchedFs("renameSync", (n) => { if (n === 0) replaceLockWithOthers(lock); },
+    () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(c, null);
+  assert.equal(lockPid(lock), OTHER_PID);
+  assert.ok(lines.some((l) => /rename under claim lock failed/.test(l)) && lines.some((l) => /no longer ours/.test(l)), lines.join("\n"));
+});
+
+test("identity: a lock write that fails after the lock was replaced does not unlink the replacement", async () => {
+  const q = mkQueue("id-writefail-replaced");
+  putTicket(q, "a");
+  const lock = path.join(q, "a.lock");
+  const { lines, log } = collect();
+  const c = await withPatchedFs("writeSync", (n) => { if (n === 0) { replaceLockWithOthers(lock); return "throw-eio"; } },
+    () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(c, null);
+  assert.equal(lockPid(lock), OTHER_PID);
+  assert.deepEqual(listing(q), ["a.json", "a.lock"]);
+  assert.ok(lines.some((l) => /could not write claim lock/.test(l)), lines.join("\n"));
+});
+
+test("identity: a lock whose write failed is empty, so not ours by content: left in place, then broken by the stale path", async () => {
+  const q = mkQueue("id-writefail-own");
+  putTicket(q, "a");
+  const lock = path.join(q, "a.lock");
+  const { lines, log } = collect();
+  const c = await withPatchedFs("writeSync", (n) => (n === 0 ? "throw-eio" : undefined), () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(c, null);
+  assert.equal(fs.readFileSync(lock, "utf8"), "", "the unwritten lock is left, not unlinked by name");
+  assert.deepEqual(listing(q), ["a.json", "a.lock"]);
+  assert.ok(lines.some((l) => /no longer ours/.test(l)), lines.join("\n"));
+  const mtime = fs.statSync(lock).mtimeMs;
+  const again = claimOneTicket({ queueDir: q, log, now: () => mtime + STALE_LOCK_MS + 1 });
+  assert.equal(path.basename(again.claimedPath), "a.claimed.json", "an empty lock ages out through the normal stale path");
+  assert.deepEqual(listing(q), ["a.claimed.json"]);
+});
+
+test("identity: a break marker replaced while we hold it is left alone; the break and the claim still complete", async () => {
+  const q = mkQueue("id-marker");
+  putTicket(q, "a");
+  putLock(q, "a", { pid: DEAD_PID, ageMs: STALE_AGE });
+  const marker = path.join(q, "a.lock.break");
+  const { lines, log } = collect();
+  // The stale lock is about to be unlinked (we hold the marker); the marker is swapped for someone else's.
+  const c = await withPatchedFs("unlinkSync", (n, [f]) => {
+    if (n === 0 && String(f).endsWith("a.lock")) { fs.unlinkSync(marker); fs.writeFileSync(marker, otherOwner()); }
+  }, () => claimOneTicket({ queueDir: q, log }));
+  assert.equal(path.basename(c.claimedPath), "a.claimed.json");
+  assert.equal(lockPid(marker), OTHER_PID, "someone else's marker is not ours to remove");
+  assert.ok(lines.some((l) => /break marker a\.lock\.break is no longer ours/.test(l)), lines.join("\n"));
+});
+
+test("identity: our own lock and marker are still removed on the normal paths (nothing lingers)", () => {
+  const q = mkQueue("id-normal");
+  putTicket(q, "a"); putTicket(q, "b");
+  putLock(q, "b", { pid: DEAD_PID, ageMs: STALE_AGE });
+  assert.ok(claimOneTicket({ queueDir: q })); // a
+  assert.ok(claimOneTicket({ queueDir: q })); // b, through a stale break
+  assert.deepEqual(listing(q), ["a.claimed.json", "b.claimed.json"]);
+});
+
+// ---------------------------------------------------------------------------------------------
 // Concurrency: N launcher processes, aligned to a shared instant, draining one queue per round
 // ---------------------------------------------------------------------------------------------
 

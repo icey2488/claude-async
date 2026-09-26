@@ -12,7 +12,8 @@
  * Claim protocol, per pending ticket <jobId>.json in queueDir:
  *   1. openSync(<jobId>.lock, "wx"). EEXIST (or any other error) => another launcher owns it (or the
  *      lock is unusable right now): skip, try the next ticket.
- *   2. Write {pid, at} into the lock and close it.
+ *   2. Write {pid, at} into the lock, close it, and READ IT BACK: the lock is ours only if the file
+ *      at that path now parses to our pid. See "Identity" below.
  *   3. renameSync(<jobId>.json, <jobId>.claimed.json). Only the lock holder ever renames a ticket,
  *      so renames of one ticket never overlap. ENOENT means a launcher that read the directory
  *      earlier than we did already claimed it and released its lock: skip.
@@ -32,6 +33,27 @@
  * launchers that both see the same stale lock therefore cannot both get a lock. A marker whose
  * holder crashed is deliberately NOT auto-broken (that would need a marker for the marker); the
  * ticket stays pending, the log says so, and RUNBOOK gives the manual fix.
+ *
+ * Identity: a lock is only ever unlinked by the process whose pid is inside it. Unlinking by name
+ * alone is unsafe because a launcher stalled between openSync and writeSync (VM pause, antivirus
+ * scan, a suspended process) for longer than staleMs looks like a dead owner with an unreadable lock:
+ * a breaker unlinks it and a second launcher creates and writes its own lock at the same path. When
+ * the first launcher wakes, its file descriptor points at the orphaned file, not at what is now at
+ * lockPath; a later unlink-by-name would delete the second launcher's live lock and let a third
+ * launcher claim the same ticket. So (a) after writing we read lockPath back and require our pid; a
+ * mismatch means we lost the lock: nothing is unlinked, renamed or claimed, and we skip the ticket.
+ * (b) Every later unlink of the lock (the release after the rename, and the write-failure cleanup)
+ * first checks ownsLock(). Once our pid is on disk the lock is fresh (mtime just set) and its owner
+ * is live, so no breaker can judge it stale and nobody else replaces it: the read-back is what closes
+ * the window, and it also shows we lost a lock whose file was replaced after our create. The one
+ * residue is the breaker's own check-then-unlink gap (assess -> unlinkSync, microseconds), which
+ * would have to coincide with a 60 s+ stall of the owner ending inside it; plain filesystem calls
+ * cannot make that step atomic. (c) The break marker is treated the same way: its holder unlinks it
+ * only if its content is our pid. Nobody auto-breaks markers, so the exposure is a hand-deleted
+ * marker recreated by another launcher; the pre-write empty window is the same, hence the same rule.
+ * The price of the rule: a lock or marker whose content write failed is empty, so it is not ours by
+ * content and is left behind (logged). An empty lock is broken by the normal stale path after
+ * staleMs; an empty marker needs the manual delete RUNBOOK describes.
  *
  * Only *.json files that are not *.claimed.json are tickets (isTicketName); *.lock and *.lock.break
  * are claim bookkeeping and every scan must ignore them.
@@ -54,6 +76,29 @@ export function isTicketName(name) {
 function defaultPidAlive(pid) {
   try { process.kill(pid, 0); return true; }
   catch (e) { return e.code === "EPERM"; }
+}
+
+// Delegated to qwen2.5-coder:7b (local ollama) with this exact signature and one example; accepted
+// after two edits (markdown fences stripped, a redundant empty-content check dropped -- JSON.parse
+// already throws on it). True only if lockPath parses as JSON whose pid is ours; false on any error.
+function ownsLock(lockPath) {
+  try {
+    const data = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    return typeof data === "object" && data !== null && data.pid === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+// Removes lockPath (a lock or a break marker) only if it still carries our pid; otherwise it belongs
+// to someone else (or is gone) and must be left exactly as it is.
+function releaseIfOwned(lockPath, ctx, what) {
+  if (!ownsLock(lockPath)) {
+    ctx.log(`${ctx.name}: ${what} ${path.basename(lockPath)} is no longer ours (missing, replaced or unwritten); leaving it alone`);
+    return;
+  }
+  try { fs.unlinkSync(lockPath); }
+  catch (e) { if (e.code !== "ENOENT") ctx.log(`${ctx.name}: could not remove ${what} ${path.basename(lockPath)}: ${e.code}: ${e.message}`); }
 }
 
 function readLockOwner(lockPath) {
@@ -102,7 +147,8 @@ function breakStaleLock(lockPath, ctx) {
     return "held";
   }
   try {
-    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); } catch {}
+    try { fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() })); }
+    catch (e) { log(`${name}: could not write ${path.basename(marker)}: ${e.code}: ${e.message}`); }
     try { fs.closeSync(fd); } catch {}
     // Re-check while holding the marker: a rival breaker may already have replaced the stale lock.
     const second = assessLock(lockPath, ctx);
@@ -117,7 +163,7 @@ function breakStaleLock(lockPath, ctx) {
     log(`${name}: failed to break stale claim lock: ${e.code}: ${e.message}; leaving the ticket pending`);
     return "held";
   } finally {
-    try { fs.unlinkSync(marker); } catch {}
+    releaseIfOwned(marker, ctx, "break marker");
   }
 }
 
@@ -138,10 +184,17 @@ function acquireLock(lockPath, ctx) {
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
       fs.closeSync(fd);
     } catch (e) {
-      // We created the file, so it is ours to remove; a half-written lock must not strand the ticket.
+      // Only remove what is ours by content: if we stalled and the lock was broken and replaced, the
+      // file at lockPath is another launcher's. An unwritten (empty) lock is not ours by content, so
+      // it stays and the stale path breaks it after staleMs.
       try { fs.closeSync(fd); } catch {}
-      try { fs.unlinkSync(lockPath); } catch {}
       ctx.log(`${ctx.name}: could not write claim lock: ${e.code}: ${e.message}`);
+      releaseIfOwned(lockPath, ctx, "claim lock");
+      return false;
+    }
+    if (!ownsLock(lockPath)) {
+      // We were suspended between create and write long enough for a breaker to replace the lock.
+      ctx.log(`${ctx.name}: lost the claim lock (the file at ${path.basename(lockPath)} is not ours after writing); leaving it and the ticket alone`);
       return false;
     }
     return true;
@@ -179,9 +232,9 @@ export function claimOneTicket({ queueDir, log = () => {}, staleMs = STALE_LOCK_
         ? `${name}: already claimed (ticket gone by the time we held the lock); trying the next ticket`
         : `${name}: rename under claim lock failed: ${e.code}: ${e.message}; trying the next ticket`);
     } finally {
-      // The claim is durable once renameSync returns; the lock has done its job either way.
-      try { fs.unlinkSync(lockPath); }
-      catch (e) { if (e.code !== "ENOENT") log(`${name}: could not remove claim lock: ${e.code}: ${e.message}`); }
+      // The claim is durable once renameSync returns; the lock has done its job either way. Only
+      // release it if it is still ours (see "Identity" in the header).
+      releaseIfOwned(lockPath, ctx, "claim lock");
     }
     if (!renamed) continue;
 
