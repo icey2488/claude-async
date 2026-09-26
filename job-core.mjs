@@ -503,23 +503,42 @@ export function preflight({ claudeBin = CLAUDE_BIN, cwd, hostLabel }) {
 // A job counts against the concurrency cap if it has no exit_code and either checkJob() calls it
 // running, or it has no meta.json yet (its dir was reserved by a start whose launch is still in
 // flight -- the task path can take up to TASK_RUNNER_PID_POLL_MS before meta.json lands).
-const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
-function countActiveJobs(nowMs) {
-  let n = 0;
+//
+// Fail closed: a dir whose meta.json is missing or unreadable (half-written, corrupt) must not
+// silently drop out of the count, or a running job could escape the cap. It counts as running if
+// the dir or its meta.json was modified within INFLIGHT_RESERVATION_MS (a running job's heartbeat
+// keeps touching its dir). An older one is not counted -- one corrupt dir can never permanently eat
+// a slot -- but is returned in `warnings` so the start response names it.
+// Returns { count, warnings }.
+export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
+export function countActiveJobs(nowMs) {
+  let count = 0;
+  const warnings = [];
   let ids = [];
   try { ids = fs.readdirSync(JOB_ROOT); } catch {}
   for (const id of ids) {
     const p = jobPaths(id);
+    let dirStat;
+    try { dirStat = fs.statSync(p.d); } catch { continue; } // raced away
+    if (!dirStat.isDirectory() || fs.existsSync(p.exit)) continue;
+    let unreadable = null;
+    let running = false;
     try {
-      if (!fs.statSync(p.d).isDirectory() || fs.existsSync(p.exit)) continue;
-      if (!fs.existsSync(p.meta)) {
-        if (nowMs - fs.statSync(p.d).mtimeMs < INFLIGHT_RESERVATION_MS) n++;
-        continue;
-      }
-      if (checkJob(id, 0).status === "running") n++;
-    } catch { /* unreadable job dir: not counted */ }
+      JSON.parse(fs.readFileSync(p.meta, "utf8"));
+      running = checkJob(id, 0).status === "running";
+    } catch (e) {
+      unreadable = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`;
+    }
+    if (!unreadable) { if (running) count++; continue; }
+    let lastModMs = dirStat.mtimeMs;
+    try { lastModMs = Math.max(lastModMs, fs.statSync(p.meta).mtimeMs); } catch {}
+    const ageMs = nowMs - lastModMs; // negative (clock skew) counts as recent: fail closed
+    if (ageMs < INFLIGHT_RESERVATION_MS) count++;
+    else warnings.push(`job dir ${id} ${unreadable} and was last modified ${Math.round(ageMs / 60000)} min ago ` +
+      `(outside the ${INFLIGHT_RESERVATION_MS / 60000} min reservation window), so it is NOT counted toward the ` +
+      `concurrency cap; repair or remove ${p.d}`);
   }
-  return n;
+  return { count, warnings };
 }
 
 // opts (all optional): host (executing host name, e.g. "claunker" -- recorded in meta and used in
@@ -549,9 +568,12 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const caps = resolveCaps(opts.caps);
   const reserved = await withStartLock(JOB_ROOT, () => {
     if (fs.existsSync(p.d)) return fail("duplicate", `jobId ${id} already exists`);
-    const capError = checkCaps({ running: countActiveJobs(nowMs), startsInWindow: recentStarts(JOB_ROOT, nowMs).length,
+    const active = countActiveJobs(nowMs);
+    const capError = checkCaps({ running: active.count, startsInWindow: recentStarts(JOB_ROOT, nowMs).length,
                                  caps, hostLabel });
-    if (capError) return fail(capError.errorCode, capError.error);
+    if (capError) {
+      return { ...fail(capError.errorCode, capError.error), ...(active.warnings.length ? { warnings: active.warnings } : {}) };
+    }
     // Non-recursive mkdir is the atomic duplicate check (EEXIST), even against a racer that
     // bypassed the lock; JOB_ROOT itself is created at module load.
     try { fs.mkdirSync(p.d); }
@@ -560,7 +582,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                                  : fail("invalid", `could not create job dir: ${e.message}`);
     }
     recordStart(JOB_ROOT, nowMs);
-    return { ok: true };
+    return { ok: true, warnings: active.warnings };
   });
   if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
 
@@ -596,7 +618,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const note = cardError
     ? `UNCARDED: ${cardError} — Job detached. Poll with claude_check(jobId). Safe across bridge restarts.`
     : "Job detached. Poll with claude_check(jobId). Safe across bridge restarts.";
-  return { ...meta, status: "running", preflight: PREFLIGHT_OK, note };
+  return { ...meta, status: "running", preflight: PREFLIGHT_OK, note,
+           ...(reserved.warnings?.length ? { warnings: reserved.warnings } : {}) };
 }
 
 export function checkJob(id, tailBytes = 8000) {

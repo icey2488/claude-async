@@ -16,7 +16,8 @@
  * The count-then-reserve step runs under a cross-process lock file (JOB_ROOT/.start.lock,
  * O_EXCL create) because several processes share one JOB_ROOT on Claunker (Desktop can run more
  * than one bridge, plus the API). The rolling-minute ledger (JOB_ROOT/.start-ledger.json) records
- * accepted starts only. Both are plain files, so listJobs() (directories only) never sees them.
+ * accepted starts only; if it is missing or corrupt it is rebuilt from the job dirs (the ground
+ * truth), never treated as empty. Both are plain files, so listJobs() (directories only) never sees them.
  *
  * Depth (CLAUDE_ASYNC_DEPTH env / X-Claude-Async-Depth header) is an ACCIDENT guard only, NOT a
  * security control: any caller can simply lie about it. Jobs are launched with depth+1; a start
@@ -91,16 +92,60 @@ export async function withStartLock(jobRoot, fn) {
 
 const ledgerPath = (jobRoot) => path.join(jobRoot, ".start-ledger.json");
 
-export function recentStarts(jobRoot, nowMs) {
-  try {
-    const arr = JSON.parse(fs.readFileSync(ledgerPath(jobRoot), "utf8"));
-    return Array.isArray(arr) ? arr.filter((t) => typeof t === "number" && nowMs - t < WINDOW_MS && t <= nowMs) : [];
-  } catch { return []; }
+// When a job dir was created, as best the filesystem can say: the EARLIER of its birthtime (when
+// the platform reports one) and its mtime. mtime alone is not enough -- a running job's runner
+// renames a heartbeat file inside its dir, which keeps bumping the dir's mtime forever -- while
+// birthtime alone is not trustworthy everywhere (0/epoch on some filesystems). Taking the minimum
+// means a dir only looks recent if BOTH signals say so, so a long-running job never masquerades as
+// a fresh start.
+export function dirCreatedMs(dir) {
+  const st = fs.statSync(dir);
+  return st.birthtimeMs > 0 ? Math.min(st.birthtimeMs, st.mtimeMs) : st.mtimeMs;
 }
 
+// The job dirs are the ground truth for "starts in the last minute": startJob creates one per
+// accepted start and nothing else does. Used when the ledger is missing or unreadable. Times a
+// little in the future (clock skew) are kept but clamped to now so they age out normally.
+function rebuildStarts(jobRoot, nowMs) {
+  const starts = [];
+  let names = [];
+  try { names = fs.readdirSync(jobRoot); } catch { return starts; }
+  for (const name of names) {
+    try {
+      const dir = path.join(jobRoot, name);
+      if (!fs.statSync(dir).isDirectory()) continue;
+      const t = dirCreatedMs(dir);
+      if (nowMs - t < WINDOW_MS && t - nowMs < WINDOW_MS) starts.push(Math.min(t, nowMs));
+    } catch { /* raced away or unreadable: cannot be evidence of a start */ }
+  }
+  return starts.sort((x, y) => x - y);
+}
+
+// { starts, rebuilt }. A missing, unparseable, or non-array ledger is NOT "no history" (that would
+// let a corrupt file wipe the rate limit): starts are rebuilt from the job dirs and the ledger is
+// rewritten atomically. Caller holds the start lock. The rewrite is best-effort -- if it fails the
+// next call simply rebuilds again, so the cap still holds.
+function loadLedger(jobRoot, nowMs) {
+  let arr = null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ledgerPath(jobRoot), "utf8"));
+    if (Array.isArray(parsed)) arr = parsed;
+  } catch { /* fall through to rebuild */ }
+  if (arr) return { starts: arr.filter((t) => typeof t === "number" && nowMs - t < WINDOW_MS && t <= nowMs), rebuilt: false };
+  const starts = rebuildStarts(jobRoot, nowMs);
+  try { writeJsonAtomic(ledgerPath(jobRoot), starts, { space: 0 }); } catch {}
+  return { starts, rebuilt: true };
+}
+
+export function recentStarts(jobRoot, nowMs) {
+  return loadLedger(jobRoot, nowMs).starts;
+}
+
+// Called after the new job dir exists. If the ledger had to be rebuilt right now (and its rewrite
+// failed earlier), the rebuild already counted the dir just created, so don't add it twice.
 export function recordStart(jobRoot, nowMs) {
-  const kept = [...recentStarts(jobRoot, nowMs), nowMs];
-  writeJsonAtomic(ledgerPath(jobRoot), kept, { space: 0 });
+  const { starts, rebuilt } = loadLedger(jobRoot, nowMs);
+  writeJsonAtomic(ledgerPath(jobRoot), rebuilt ? starts : [...starts, nowMs], { space: 0 });
 }
 
 // Returns { error, errorCode } if a cap is hit, else null. Caller holds the start lock.
