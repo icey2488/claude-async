@@ -521,9 +521,17 @@ export function preflight({ claudeBin = CLAUDE_BIN, cwd, hostLabel }) {
 // the dir or its meta.json was modified within INFLIGHT_RESERVATION_MS (a running job's heartbeat
 // keeps touching its dir). An older one is not counted -- one corrupt dir can never permanently eat
 // a slot -- but is returned in `warnings` so the start response names it.
-// Returns { count, warnings }.
+//
+// Three distinct problems, all on the same freshness rule (never skipped, which would fail open):
+// no meta.json; a meta.json that does not parse to a JSON object (truncated, or e.g. `null`); and a
+// readable meta.json whose checkJob() status check throws (an unreadable exit_code, say). The last
+// is labeled as its own thing so the warning does not blame a meta.json that is fine.
+// `check` is a test seam for checkJob. Returns { count, warnings }.
 export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
-export function countActiveJobs(nowMs) {
+export function isPlainObject(x) {
+  return x !== null && typeof x === "object" && !Array.isArray(x);
+}
+export function countActiveJobs(nowMs, { check = checkJob } = {}) {
   let count = 0;
   const warnings = [];
   let ids = [];
@@ -533,20 +541,22 @@ export function countActiveJobs(nowMs) {
     let dirStat;
     try { dirStat = fs.statSync(p.d); } catch { continue; } // raced away
     if (!dirStat.isDirectory() || fs.existsSync(p.exit)) continue;
-    let unreadable = null;
+    let problem = null;
     let running = false;
-    try {
-      JSON.parse(fs.readFileSync(p.meta, "utf8"));
-      running = checkJob(id, 0).status === "running";
-    } catch (e) {
-      unreadable = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`;
+    let meta;
+    try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); }
+    catch (e) { problem = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`; }
+    if (!problem && !isPlainObject(meta)) problem = "has an unreadable meta.json (not a JSON object)";
+    if (!problem) {
+      try { running = check(id, 0).status === "running"; }
+      catch (e) { problem = `has a readable meta.json but its status check failed (${e.message})`; }
     }
-    if (!unreadable) { if (running) count++; continue; }
+    if (!problem) { if (running) count++; continue; }
     let lastModMs = dirStat.mtimeMs;
     try { lastModMs = Math.max(lastModMs, fs.statSync(p.meta).mtimeMs); } catch {}
     const ageMs = nowMs - lastModMs; // negative (clock skew) counts as recent: fail closed
     if (ageMs < INFLIGHT_RESERVATION_MS) count++;
-    else warnings.push(`job dir ${id} ${unreadable} and was last modified ${Math.round(ageMs / 60000)} min ago ` +
+    else warnings.push(`job dir ${id} ${problem} and was last modified ${Math.round(ageMs / 60000)} min ago ` +
       `(outside the ${INFLIGHT_RESERVATION_MS / 60000} min reservation window), so it is NOT counted toward the ` +
       `concurrency cap; repair or remove ${p.d}`);
   }

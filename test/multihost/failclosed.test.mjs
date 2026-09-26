@@ -8,7 +8,7 @@ import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { dispatch, guard, fakeLaunch, tickets, jobDirs, resetState, completeAll, cfgFor, cleanupTmp, JOBS } from "./_setup.mjs";
+import { core, dispatch, guard, fakeLaunch, tickets, jobDirs, resetState, completeAll, cfgFor, cleanupTmp, JOBS } from "./_setup.mjs";
 
 after(cleanupTmp);
 beforeEach(resetState);
@@ -82,6 +82,49 @@ test("a recently rewritten meta.json keeps a dir counted even when the dir mtime
   const r = await start(now, { caps });
   assert.ok(!r.error, r.error);
   assert.match(r.warnings[0], /meta-fresh/);
+});
+
+// countActiveJobs separates "meta.json is bad" from "meta.json is fine but the status check threw",
+// and both follow the same freshness rule (a throw is never silently skipped: that would fail open).
+const throwingCheck = () => { throw Object.assign(new Error("EACCES: permission denied, open exit_code"), { code: "EACCES" }); };
+
+test("a checkJob throw on a readable meta.json in a fresh dir is counted, with no warning", () => {
+  const now = new Date(2026, 8, 25, 12, 0, 0);
+  garbageDir("chk-fresh", JSON.stringify({ jobId: "chk-fresh", pid: 1 }), now.getTime() - 20_000);
+  const r = core.countActiveJobs(now.getTime(), { check: throwingCheck });
+  assert.deepEqual(r, { count: 1, warnings: [] });
+});
+
+test("a checkJob throw in a stale dir is not counted, and the warning says status check failed (not unreadable meta.json)", () => {
+  const now = new Date(2026, 8, 25, 12, 0, 0);
+  garbageDir("chk-stale", JSON.stringify({ jobId: "chk-stale", pid: 1 }), now.getTime() - 10 * 60_000);
+  const r = core.countActiveJobs(now.getTime(), { check: throwingCheck });
+  assert.equal(r.count, 0);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /chk-stale/);
+  assert.match(r.warnings[0], /readable meta[.]json but its status check failed [(]EACCES: permission denied/);
+  assert.match(r.warnings[0], /NOT counted/);
+  assert.ok(!/unreadable meta[.]json/.test(r.warnings[0]), "must not blame a meta.json that parsed fine");
+});
+
+for (const [label, content] of [["JSON null", "null"], ["a JSON array", "[]"], ["a JSON string", "\"x\""], ["a JSON number", "7"]]) {
+  test(`meta.json that is ${label} is "unreadable meta.json (not a JSON object)", fresh -> counted, stale -> warned`, () => {
+    const now = new Date(2026, 8, 25, 12, 0, 0);
+    garbageDir("shape-fresh", content, now.getTime() - 10_000);
+    assert.deepEqual(core.countActiveJobs(now.getTime()), { count: 1, warnings: [] });
+    garbageDir("shape-stale", content, now.getTime() - 10 * 60_000);
+    const r = core.countActiveJobs(now.getTime());
+    assert.equal(r.count, 1, "only the fresh one");
+    assert.equal(r.warnings.length, 1);
+    assert.match(r.warnings[0], /shape-stale has an unreadable meta[.]json [(]not a JSON object[)]/);
+    assert.ok(!/status check failed/.test(r.warnings[0]));
+  });
+}
+
+test("isPlainObject: objects only", () => {
+  assert.equal(core.isPlainObject({ a: 1 }), true);
+  assert.equal(core.isPlainObject({}), true);
+  for (const x of [null, undefined, [], [1], "s", 7, true, () => 1]) assert.equal(core.isPlainObject(x), false, String(x));
 });
 
 // ---------------------------------------------------------------------------------------------
