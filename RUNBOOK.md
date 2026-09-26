@@ -41,9 +41,15 @@ Design and config are in README's "Multi-host" section. Operational notes:
   on purpose.
 - **Caps are per executing host** (4 running / 6 starts per minute by default): 4 or more
   still-running jobs (including `stalled`) block the 5th start. Raise them via `hosts.json` `caps`, not by retrying.
-  A start response with a `warnings` entry names a job dir with an unreadable `meta.json` older than 2
-  minutes (not counted toward the cap); repair or delete that dir. A stray `*.tmp` next to a state file is
-  the orphan of a write interrupted before its rename and is safe to delete.
+  A start response with a `warnings` entry names a job dir with an unreadable `meta.json` (or one whose
+  status check failed) older than 2 minutes (not counted toward the cap); repair or delete that dir. A
+  `warnings` entry "meta.json could not be written ... the job IS running" means the job launched but
+  `claude_check` will not find it by id; its output is in the job dir. A stray `*.tmp` next to a state file
+  is the orphan of a write interrupted before its rename and is safe to delete.
+- **Ledger rebuild vs. birthtime.** After a corrupt start ledger, `rebuildStarts` dates each job dir by
+  min(birthtime, mtime). On a filesystem without birthtime (`birthtimeMs` 0) it falls back to the dir mtime,
+  which a running job's heartbeat keeps fresh, so running jobs read as recent starts and can block new starts
+  for up to 60s until the rewritten ledger ages out. Claunker and the laptop are NTFS (birthtime supported).
 - **Host API live test** (Claunker, Tailscale up): `node host-api.mjs --new-token`, then
   `node host-api.mjs`. It prints `listening on http://100.x.y.z:7850` or refuses with the reason.
   Before merge, run it from a non-live checkout **only with
