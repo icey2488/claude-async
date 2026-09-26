@@ -55,6 +55,11 @@
  * content and is left behind (logged). An empty lock is broken by the normal stale path after
  * staleMs; an empty marker needs the manual delete RUNBOOK describes.
  *
+ * The bridge is a claimant too: before job-core.mjs starts a job by the breakaway fallback while its
+ * ticket is still pending, it calls withdrawTicket(), which takes the same <jobId>.lock and unlinks
+ * the ticket (see the function for the four outcomes). A launcher and the bridge therefore cannot both
+ * own one ticket, and a fallback-launched job cannot be started a second time by a late launcher.
+ *
  * Only *.json files that are not *.claimed.json are tickets (isTicketName); *.lock and *.lock.break
  * are claim bookkeeping and every scan must ignore them.
  *
@@ -247,4 +252,33 @@ export function claimOneTicket({ queueDir, log = () => {}, staleMs = STALE_LOCK_
     return { claimedPath, ticket };
   }
   return null;
+}
+
+// The bridge's side of the protocol: before it launches a job itself (the breakaway fallback) it must
+// take its own still-pending ticket out of the queue, or a launcher that starts later would run the
+// job a second time. It uses the very same lock a launcher does, so it and a launcher can never both
+// own the ticket:
+//   "removed" -- we held the lock and unlinked <jobId>.json; no launcher can claim it now. Safe to
+//                launch the job another way.
+//   "claimed" -- the ticket was already gone (a launcher renamed it to <jobId>.claimed.json).
+//   "held"    -- a launcher holds <jobId>.lock right now (about to claim, or a stale lock we may not
+//                break); the ticket is not ours to remove.
+//   "error"   -- the unlink failed for another reason; the ticket may still be pending.
+// Anything but "removed" means: do NOT launch the job another way.
+export function withdrawTicket({ queueDir, jobId, log = () => {}, staleMs = STALE_LOCK_MS,
+                                 pidAlive = defaultPidAlive, now = Date.now }) {
+  const ticketPath = path.join(queueDir, jobId + ".json");
+  const lockPath = path.join(queueDir, jobId + LOCK_SUFFIX);
+  const ctx = { name: jobId + ".json", log, staleMs, pidAlive, now };
+  if (!acquireLock(lockPath, ctx)) return "held";
+  try {
+    fs.unlinkSync(ticketPath);
+    return "removed";
+  } catch (e) {
+    if (e.code === "ENOENT") return "claimed";
+    log(`${ctx.name}: could not remove the pending ticket: ${e.code}: ${e.message}`);
+    return "error";
+  } finally {
+    releaseIfOwned(lockPath, ctx, "claim lock");
+  }
 }

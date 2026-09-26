@@ -5,7 +5,8 @@ import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { core, fakeLaunch, tickets, resetState, BIG_CAPS, cleanupTmp, JOBS } from "./_setup.mjs";
+import { core, fakeLaunch, tickets, resetState, BIG_CAPS, cleanupTmp, JOBS, QUEUE } from "./_setup.mjs";
+import { claimOneTicket } from "../../launcher-claim.mjs";
 
 after(cleanupTmp);
 beforeEach(resetState);
@@ -69,7 +70,7 @@ function taskSeams(over = {}) {
   const calls = [];
   return { calls, mode: "auto",
     ensureTask: () => ({ ok: true }),
-    writeTicket: () => { calls.push("ticket"); },
+    writeTicket: () => { calls.push("ticket"); }, // stub: writes nothing; fbSeams() below writes the real ticket
     runTask: () => { calls.push("run"); return { status: 0, stdout: "", stderr: "" }; },
     breakaway: async () => { calls.push("breakaway"); return { pid: 4242, pidSource: "runner" }; },
     ...over };
@@ -98,7 +99,8 @@ test("launchWin32 takes the breakaway fallback when the ticket write throws (no 
 
 test("control: with a working ticket write the task path proceeds to /Run (ticket first), not to the fallback", async () => {
   const p = jobP("tkt-ok");
-  const s = taskSeams({ runTask: () => { s.calls.push("run"); return { status: 1, stdout: "", stderr: "denied" }; } });
+  // real ticket: a stub that wrote nothing would look like "a launcher already took it" to the bridge
+  const s = fbSeams({ runTask: () => { s.calls.push("run"); return { status: 1, stdout: "", stderr: "denied" }; } });
   assert.equal(await core.launchWin32Task(p, {}, s), null, "a failed /Run also returns null (existing behavior)");
   assert.deepEqual(s.calls, ["ticket", "run"]);
   assert.match(fs.readFileSync(p.err, "utf8"), /schtasks [/]Run .* failed [(]status=1[)]/);
@@ -114,4 +116,102 @@ test("startJob end to end: a ticket failure inside the real launchWin32 still yi
   assert.equal(r.launchPath, "breakaway-fallback");
   assert.equal(r.pid, 4242);
   assert.equal(JSON.parse(fs.readFileSync(path.join(JOBS, "tkt-e2e", "meta.json"), "utf8")).pid, 4242);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The breakaway fallback vs the still-pending ticket: the ticket must leave the queue (under the
+// launchers' claim lock) BEFORE the fallback starts the job, or a launcher that runs later starts it
+// a second time. If a launcher already owns the ticket, the bridge must not launch a second way.
+// ---------------------------------------------------------------------------------------------
+
+// Real ticket into the temp queue (never schtasks); short poll windows so "no runner ever" is quick.
+function fbSeams(over = {}) {
+  const s = taskSeams({ pollMs: 80, extraPollMs: 80, ...over });
+  s.writeTicket = (p, env) => { s.calls.push("ticket"); core.writeLaunchTicket(p, env); };
+  return s;
+}
+const queueFiles = () => fs.readdirSync(QUEUE).sort();
+const errLog = (p) => fs.readFileSync(p.err, "utf8");
+const writeRunnerPid = (p, pid) => fs.writeFileSync(path.join(p.d, "runner.pid"), String(pid));
+
+test("fallback fires with the ticket still pending: the ticket is removed first, the job is launched exactly once, and no launcher can claim it later", async () => {
+  const p = jobP("fb-pending");
+  const s = fbSeams({
+    runTask: () => { s.calls.push("run"); assert.deepEqual(queueFiles(), ["fb-pending.json"], "the ticket is pending when the task is poked"); return { status: 0, stdout: "", stderr: "" }; },
+    breakaway: async () => { s.calls.push("breakaway"); assert.deepEqual(queueFiles(), [], "ticket already gone when the fallback starts the job"); return { pid: 4242, pidSource: "runner" }; },
+  });
+  const r = await core.launchWin32(p, {}, s);
+  assert.deepEqual(s.calls, ["ticket", "run", "breakaway"]);
+  assert.equal(s.calls.filter((c) => c === "breakaway").length, 1, "exactly one launch");
+  assert.equal(r.launchPath, "breakaway-fallback");
+  assert.deepEqual(queueFiles(), [], "no ticket, lock or claimed file left");
+  assert.equal(claimOneTicket({ queueDir: QUEUE }), null, "a launcher that starts now finds nothing to run a second time");
+  assert.match(errLog(p), /removed the still-pending launch ticket before falling back/);
+});
+
+test("fallback after a failed schtasks /Run also removes the ticket first (any later launcher would otherwise run it)", async () => {
+  const p = jobP("fb-runfail");
+  const s = fbSeams({ runTask: () => { s.calls.push("run"); return { status: 1, stdout: "", stderr: "denied" }; } });
+  const r = await core.launchWin32(p, {}, s);
+  assert.deepEqual(s.calls, ["ticket", "run", "breakaway"]);
+  assert.equal(r.launchPath, "breakaway-fallback");
+  assert.deepEqual(queueFiles(), []);
+});
+
+test("a launcher claims the ticket first: the fallback does NOT launch; a runner that shows up during the extra wait is reported as launchPath \"task\"", async () => {
+  const p = jobP("fb-claimed");
+  const s = fbSeams({ pollMs: 60, extraPollMs: 1500,
+    runTask: () => { // a launcher claims it right away, then its runner is slow to write runner.pid
+      s.calls.push("run");
+      assert.equal(path.basename(claimOneTicket({ queueDir: QUEUE }).claimedPath), "fb-claimed.claimed.json");
+      setTimeout(() => writeRunnerPid(p, process.pid), 200);
+      return { status: 0, stdout: "", stderr: "" };
+    } });
+  const r = await core.launchWin32(p, {}, s);
+  assert.ok(!s.calls.includes("breakaway"), "must not launch a second way");
+  assert.equal(r.launchPath, "task");
+  assert.equal(r.pid, process.pid);
+  assert.deepEqual(queueFiles(), ["fb-claimed.claimed.json"], "the launcher's claimed ticket is untouched");
+  assert.match(errLog(p), /launch ticket not withdrawn \(claimed\)/);
+});
+
+test("a launcher holds the ticket's lock (mid-claim): the bridge leaves the ticket alone and does not launch a second way", async () => {
+  const p = jobP("fb-held");
+  const s = fbSeams({ runTask: () => {
+    s.calls.push("run");
+    fs.writeFileSync(path.join(QUEUE, "fb-held.lock"), JSON.stringify({ pid: 4242, at: new Date().toISOString() }));
+    return { status: 0, stdout: "", stderr: "" };
+  } });
+  const r = await core.launchWin32(p, {}, s);
+  assert.ok(!s.calls.includes("breakaway"));
+  assert.equal(r.launchPath, "task");
+  assert.equal(r.pid, null);
+  assert.equal(r.pidSource, "task-claimed-no-runner");
+  assert.deepEqual(queueFiles(), ["fb-held.json", "fb-held.lock"], "neither the ticket nor the launcher's lock was touched");
+  assert.match(errLog(p), /launch ticket not withdrawn \(held\)/);
+});
+
+test("a launcher claimed the ticket but no runner ever appears: no second launch, pid null, and err.log says what to do", async () => {
+  const p = jobP("fb-nevermind");
+  const s = fbSeams({ runTask: () => { s.calls.push("run"); claimOneTicket({ queueDir: QUEUE }); return { status: 0, stdout: "", stderr: "" }; } });
+  const r = await core.launchWin32(p, {}, s);
+  assert.deepEqual(s.calls, ["ticket", "run"]);
+  assert.equal(r.pid, null);
+  assert.equal(r.pidSource, "task-claimed-no-runner");
+  assert.match(errLog(p), /never started it .* retry claude_start with the same jobId/);
+});
+
+test("control: when the runner appears within the normal wait the ticket is never withdrawn and no fallback runs", async () => {
+  const p = jobP("fb-normal");
+  const s = fbSeams({ pollMs: 1500, runTask: () => {
+    s.calls.push("run");
+    claimOneTicket({ queueDir: QUEUE });
+    setTimeout(() => writeRunnerPid(p, process.pid), 100);
+    return { status: 0, stdout: "", stderr: "" };
+  } });
+  const r = await core.launchWin32(p, {}, s);
+  assert.deepEqual(s.calls, ["ticket", "run"]);
+  assert.equal(r.launchPath, "task");
+  assert.equal(r.pid, process.pid);
+  assert.ok(!/withdrawn|removed the still-pending/.test(errLog(p)));
 });

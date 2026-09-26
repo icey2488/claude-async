@@ -27,7 +27,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { claimOneTicket, isTicketName, STALE_LOCK_MS } from "../../launcher-claim.mjs";
+import { claimOneTicket, withdrawTicket, isTicketName, STALE_LOCK_MS } from "../../launcher-claim.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..", "..");
@@ -357,6 +357,48 @@ test("identity: our own lock and marker are still removed on the normal paths (n
   assert.ok(claimOneTicket({ queueDir: q })); // a
   assert.ok(claimOneTicket({ queueDir: q })); // b, through a stale break
   assert.deepEqual(listing(q), ["a.claimed.json", "b.claimed.json"]);
+});
+
+test("withdrawTicket: an unclaimed ticket is removed under the lock and nothing is left behind", () => {
+  const q = mkQueue("wd-removed");
+  putTicket(q, "a"); putTicket(q, "b");
+  assert.equal(withdrawTicket({ queueDir: q, jobId: "a" }), "removed");
+  assert.deepEqual(listing(q), ["b.json"]);
+  assert.equal(claimOneTicket({ queueDir: q }).claimedPath, path.join(q, "b.claimed.json"), "a launcher sees only the other ticket");
+});
+
+test("withdrawTicket: a ticket a launcher already claimed is reported \"claimed\" and the claimed file is untouched", () => {
+  const q = mkQueue("wd-claimed");
+  putTicket(q, "a");
+  assert.ok(claimOneTicket({ queueDir: q }));
+  assert.equal(withdrawTicket({ queueDir: q, jobId: "a" }), "claimed");
+  assert.deepEqual(listing(q), ["a.claimed.json"]);
+});
+
+test("withdrawTicket: a lock held by a launcher means \"held\": the ticket and the lock are not touched", () => {
+  const q = mkQueue("wd-held");
+  putTicket(q, "a");
+  const lock = putLock(q, "a", { pid: OTHER_PID, ageMs: 0 });
+  assert.equal(withdrawTicket({ queueDir: q, jobId: "a" }), "held");
+  assert.deepEqual(listing(q), ["a.json", "a.lock"]);
+  assert.equal(lockPid(lock), OTHER_PID);
+});
+
+test("withdrawTicket: a stale lock from a dead launcher is broken like for any launcher, then the ticket is removed", () => {
+  const q = mkQueue("wd-stale");
+  putTicket(q, "a");
+  putLock(q, "a", { pid: DEAD_PID, ageMs: STALE_AGE });
+  assert.equal(withdrawTicket({ queueDir: q, jobId: "a" }), "removed");
+  assert.deepEqual(listing(q), []);
+});
+
+test("withdrawTicket: an unlink that fails for another reason is reported \"error\" and the lock is still released", async () => {
+  const q = mkQueue("wd-error");
+  putTicket(q, "a");
+  const r = await withPatchedFs("unlinkSync", (n, [f]) => (String(f).endsWith("a.json") ? "throw-eio" : undefined),
+    () => withdrawTicket({ queueDir: q, jobId: "a" }));
+  assert.equal(r, "error");
+  assert.deepEqual(listing(q), ["a.json"]);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import crypto from "node:crypto";
 import { mintCard, failCard } from "./card-hook.mjs";
 import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
+import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 
@@ -105,6 +106,10 @@ const RUNNER_PID_POLL_MS = 2000;
 // service schedules a new instance -> job-launcher.mjs starts, imports job-core.mjs, scans and
 // claims -> spawns job-runner.mjs), so it gets a longer poll window before falling back.
 const TASK_RUNNER_PID_POLL_MS = 15000;
+// Extra wait when the fallback found its own ticket already taken by a launcher (see launchWin32Task):
+// a launcher that has claimed a job is on its way to spawning the runner, so the bridge keeps waiting
+// for runner.pid instead of launching the job a second time.
+const TASK_CLAIMED_EXTRA_POLL_MS = 15000;
 const RUNNER_PID_POLL_INTERVAL_MS = 50;
 // CLAUDE_ASYNC_WIN32_LAUNCH_MODE: "auto" (default) tries the Task Scheduler path first and falls
 // back to win32-breakaway.ps1 only if task registration or the run trigger itself fails (or the
@@ -390,14 +395,26 @@ export function writeLaunchTicket(p, extraEnv = {}) {
 // never inside Claude Desktop's Job Object to begin with, rather than asking a runner already
 // inside that job to breakaway from it (win32-breakaway.ps1's approach, which still left runners
 // self-reporting membership in a job with KILL_ON_JOB_CLOSE set -- see RUNBOOK.md). Returns null
-// on any failure of the task path itself (registration, /Run, or the runner never showing up in
-// time) so launchWin32() can fall back to win32-breakaway.ps1; never throws. That includes a failed
-// launch-ticket write: it is logged to err.log and treated like a failed /Run, so the breakaway
-// fallback still launches the job instead of startJob throwing with a reserved dir and no runner.
-// seams (tests only): ensureTask, writeTicket, runTask replace the schtasks-touching steps.
+// when the task path failed AND its ticket is provably out of the queue, so launchWin32() can fall
+// back to win32-breakaway.ps1 without the job ever running twice; never throws. A failed ticket
+// write is logged to err.log and treated like a failed /Run, so the breakaway fallback still
+// launches the job instead of startJob throwing with a reserved dir and no runner.
+//
+// The ticket is the hazard: any launcher instance claims any pending ticket, so a ticket left in the
+// queue while the fallback starts the job would run the job a second time whenever a launcher next
+// ran (this job's late-starting instance, or one triggered by another claude_start). So before
+// returning null with a ticket written (a failed /Run, or no runner.pid within TASK_RUNNER_PID_POLL_MS)
+// the ticket is removed under the launchers' own claim lock (withdrawTicket). If a launcher got there
+// first (the ticket is gone or its lock is held) the launcher owns the job: no fallback. The bridge
+// keeps polling runner.pid for TASK_CLAIMED_EXTRA_POLL_MS more and reports launchPath "task" if the
+// runner shows up; if it never does the result carries pid null / pidSource "task-claimed-no-runner"
+// and an err.log line (checkJob heals a late runner's pid from runner.pid, or reports it died).
+// seams (tests only): ensureTask, writeTicket, runTask replace the schtasks-touching steps; pollMs
+// and extraPollMs shorten the two runner.pid waits.
 export async function launchWin32Task(p, extraEnv, seams = {}) {
   const { ensureTask = ensureLauncherTask, writeTicket = writeLaunchTicket,
-          runTask = () => spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" }) } = seams;
+          runTask = () => spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" }),
+          pollMs = TASK_RUNNER_PID_POLL_MS, extraPollMs = TASK_CLAIMED_EXTRA_POLL_MS } = seams;
   const reg = ensureTask();
   if (!reg.ok) {
     try { fs.appendFileSync(p.err, `\n[job-core] ensureLauncherTask() failed: ${reg.error}\n`); } catch {}
@@ -413,16 +430,6 @@ export async function launchWin32Task(p, extraEnv, seams = {}) {
     return null;
   }
 
-  const run = runTask();
-  if (run.status !== 0) {
-    try { fs.appendFileSync(p.err, `\n[job-core] schtasks /Run /TN ${TASK_NAME} failed (status=${run.status}): ` +
-      `${(run.stdout || "").trim()} ${(run.stderr || "").trim()}\n`); } catch {}
-    return null;
-  }
-
-  const { pid, pidSource } = await readRunnerPid(p, null, TASK_RUNNER_PID_POLL_MS);
-  if (!pid) return null; // task-timeout -- caller falls back to breakaway
-
   // Same job-membership query as the breakaway path, logged for the record -- but NOTE (verified
   // 2026-09-09 while building this): inJob:true with limitFlags 0x3C00 is NOT reliable evidence
   // of nesting inside Desktop's specific job. Windows places essentially any console-attached
@@ -430,13 +437,39 @@ export async function launchWin32Task(p, extraEnv, seams = {}) {
   // (confirmed: a bare `node -e ...` from a plain terminal, zero relation to Desktop, self-reports
   // identically). The actual proof this launch path escapes Desktop's job is behavioral, not this
   // flag -- see test/survival.mjs and RUNBOOK.md. This WARN is diagnostic breadcrumb, not a verdict.
-  const jobMembership = queryJobMembershipOnce(pid);
-  if (jobMembership.inJob) {
-    try { fs.appendFileSync(p.err, `\n[job-core] NOTE: task-launched runner pid=${pid} self-reports job ` +
-      `membership at launch time (jobMembership=${JSON.stringify(jobMembership)}) -- see RUNBOOK.md's ` +
-      `caveat on why this alone doesn't indicate a problem; test/survival.mjs is the real check\n`); } catch {}
+  const viaTask = (pid, pidSource) => {
+    const jobMembership = queryJobMembershipOnce(pid);
+    if (jobMembership.inJob) {
+      try { fs.appendFileSync(p.err, `\n[job-core] NOTE: task-launched runner pid=${pid} self-reports job ` +
+        `membership at launch time (jobMembership=${JSON.stringify(jobMembership)}) -- see RUNBOOK.md's ` +
+        `caveat on why this alone doesn't indicate a problem; test/survival.mjs is the real check\n`); } catch {}
+    }
+    return { pid, pidSource, jobMembership, launchPath: "task" };
+  };
+
+  const run = runTask();
+  if (run.status === 0) {
+    const { pid, pidSource } = await readRunnerPid(p, null, pollMs);
+    if (pid) return viaTask(pid, pidSource);
+  } else {
+    try { fs.appendFileSync(p.err, `\n[job-core] schtasks /Run /TN ${TASK_NAME} failed (status=${run.status}): ` +
+      `${(run.stdout || "").trim()} ${(run.stderr || "").trim()}\n`); } catch {}
   }
-  return { pid, pidSource, jobMembership, launchPath: "task" };
+
+  // The task path did not produce a runner. Before anyone else launches this job, take the ticket back.
+  const outcome = withdrawTicket({ queueDir: LAUNCHER_QUEUE_DIR, jobId: path.basename(p.d),
+    log: (l) => { try { fs.appendFileSync(p.err, `\n[job-core] ${l}\n`); } catch {} } });
+  if (outcome === "removed") {
+    try { fs.appendFileSync(p.err, "\n[job-core] removed the still-pending launch ticket before falling back\n"); } catch {}
+    return null; // caller falls back to breakaway
+  }
+  try { fs.appendFileSync(p.err, `\n[job-core] launch ticket not withdrawn (${outcome}): a launcher owns this job, so it is NOT ` +
+    `launched a second way; waiting up to ${extraPollMs}ms more for runner.pid\n`); } catch {}
+  const late = await readRunnerPid(p, null, extraPollMs);
+  if (late.pid) return viaTask(late.pid, late.pidSource);
+  try { fs.appendFileSync(p.err, "\n[job-core] no runner.pid after the extra wait; the launcher that claimed this job never started " +
+    "it (see job-launcher.log in the launcher queue dir). Not launching it a second way; retry claude_start with the same jobId\n"); } catch {}
+  return { pid: null, pidSource: "task-claimed-no-runner", launchPath: "task" };
 }
 
 // seams (tests only): mode overrides WIN32_LAUNCH_MODE, breakaway replaces launchWin32Breakaway, and
