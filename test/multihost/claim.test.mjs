@@ -94,6 +94,16 @@ test("each call claims at most one ticket", () => {
   assert.equal(claimOneTicket({ queueDir: q }), null);
 });
 
+test("the lock does not linger: a re-queued ticket with the same jobId is claimable right after its first claim (RUNBOOK's retry recipe)", () => {
+  const q = mkQueue("requeue");
+  putTicket(q, "j", { jobId: "j", attempt: 1 });
+  assert.equal(claimOneTicket({ queueDir: q }).ticket.attempt, 1);
+  putTicket(q, "j", { jobId: "j", attempt: 2 }); // j.claimed.json from attempt 1 is still there
+  const again = claimOneTicket({ queueDir: q });
+  assert.equal(again.ticket.attempt, 2);
+  assert.deepEqual(listing(q), ["j.claimed.json"]);
+});
+
 test("an unparseable claimed ticket is still claimed (ticket: null) and the lock is released", () => {
   const q = mkQueue("garbage");
   fs.writeFileSync(path.join(q, "bad.json"), "{ not json");
