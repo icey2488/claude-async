@@ -18,8 +18,8 @@ import { HOSTS, loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, readL
          lastSeenPath } from "./hosts.mjs";
 import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
 
-const FORWARD_TIMEOUT_MS = 20_000; // a remote start includes its own launch (task path: up to ~15s)
-const LIST_TIMEOUT_MS = 5_000;
+export const FORWARD_TIMEOUT_MS = 20_000; // start/check: a remote start includes its own launch (task path: up to ~15s)
+export const LIST_TIMEOUT_MS = 5_000;
 
 // ctx: { cfg (loadHostsConfig result), fetch, lastSeenFile, startOptions (job-core startJob opts
 // seams, tests only) }. Built fresh per tool call so hosts.json edits apply without a restart.
@@ -52,10 +52,19 @@ async function forward(ctx, route, method, pathAndQuery, body, timeoutMs) {
     return { unreachable: true, error: `host ${route.host} unreachable at ${route.url}: ${e.cause?.code || e.message}` };
   }
   recordLastSeen(route.host, new Date(), ctx.lastSeenFile);
-  let json = null;
-  try { json = await res.json(); } catch {}
+  let json;
+  let parsed = false;
+  try { json = await res.json(); parsed = true; } catch {}
   if (res.status === 401) return { error: `host ${route.host} rejected the registry token (HTTP 401)` };
-  if (!json || typeof json !== "object") return { error: `host ${route.host} returned HTTP ${res.status} with no JSON body` };
+  if (!parsed) return { error: `host ${route.host} returned HTTP ${res.status} with no JSON body` };
+  // The peer is only trusted to speak the API's format: every response is a plain JSON object. An
+  // array, null, or primitive would be spread into the caller's response as garbage (or as indexed
+  // keys), so it is refused here, naming the host.
+  if (json === null || typeof json !== "object" || Array.isArray(json)) {
+    const got = json === null ? "null" : Array.isArray(json) ? "an array" : `a ${typeof json}`;
+    return { error: `host ${route.host} returned a malformed response (registry-format error): expected a JSON ` +
+                    `object, got ${got} (HTTP ${res.status})` };
+  }
   return json;
 }
 

@@ -196,3 +196,66 @@ test("claude_jobs aggregates remote rows tagged with host + hostname", async () 
   assert.ok(j.jobs.some((r) => r.host === "claunker" && r.jobId.startsWith("claunker.") && r.hostname === HOSTNAME));
   assert.ok(j.jobs.every((r) => "hostname" in r && "host" in r));
 });
+
+// ---------------------------------------------------------------------------------------------
+// forward() trusts a peer only to speak the API's format: a plain JSON object.
+// ---------------------------------------------------------------------------------------------
+
+const fakePeer = (body, { status = 200, seen } = {}) => async (url, init) => {
+  seen?.push({ url, init });
+  return new Response(typeof body === "string" && body.startsWith("RAW:") ? body.slice(4) : JSON.stringify(body), { status });
+};
+const laptopCtx = (fetch) => ctxFor({ file: "f", localHost: "laptop", hosts: { claunker: { url: "http://100.100.1.1:7850", token: "t" } } }, { fetch });
+
+for (const [label, body, got] of [
+  ["an array", [{ jobId: "x" }], "an array"],
+  ["null", null, "null"],
+  ["a string", "hello", "a string"],
+  ["a number", 42, "a number"],
+  ["a boolean", true, "a boolean"],
+]) {
+  test(`forward(): a peer response that is ${label} is rejected as a registry-format error naming the host`, async () => {
+    const start = await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(fakePeer(body)));
+    assert.match(start.error, /^host claunker returned a malformed response \(registry-format error\): expected a JSON object, got /);
+    assert.ok(start.error.includes(`got ${got} (HTTP 200)`), start.error);
+    assert.equal(start.host, "claunker");
+    assert.equal(start.jobId, undefined, "nothing from the bad body leaks into the response");
+    assert.equal(Object.keys(start).some((k) => /^\d+$/.test(k)), false, "an array body is not spread into indexed keys");
+    const chk = await dispatch.dispatchCheck("claunker.x-20260925-abcdefgh", 100, laptopCtx(fakePeer(body)));
+    assert.match(chk.error, /malformed response \(registry-format error\)/);
+    const jobs = await dispatch.dispatchJobs(laptopCtx(fakePeer(body)));
+    const row = jobs.jobs.find((r) => r.host === "claunker");
+    assert.equal(row.status, "error");
+    assert.match(row.note, /host claunker returned a malformed response \(registry-format error\)/);
+    assert.equal(tickets().length, 0);
+  });
+}
+
+test("forward(): a non-JSON body is still its own error, and a well-formed object still passes through", async () => {
+  const notJson = await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(fakePeer("RAW:<html>", { status: 502 })));
+  assert.equal(notJson.error, "host claunker returned HTTP 502 with no JSON body");
+  const ok = await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(fakePeer({ jobId: "claunker.j-20260925-abcdefgh", status: "running" })));
+  assert.equal(ok.jobId, "claunker.j-20260925-abcdefgh");
+  assert.ok(!ok.error);
+});
+
+test("forward(): every forwarded call carries a request timeout (start/check 20s, list 5s)", async () => {
+  assert.equal(dispatch.FORWARD_TIMEOUT_MS, 20_000);
+  assert.equal(dispatch.LIST_TIMEOUT_MS, 5_000);
+  const seen = [];
+  const f = fakePeer({ jobs: [], status: "running" }, { seen });
+  await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(f));
+  await dispatch.dispatchCheck("claunker.x-20260925-abcdefgh", 100, laptopCtx(f));
+  await dispatch.dispatchJobs(laptopCtx(f));
+  assert.equal(seen.length, 3);
+  for (const { init } of seen) assert.ok(init.signal instanceof AbortSignal && !init.signal.aborted, "an AbortSignal.timeout is attached");
+  // a peer that never answers is cut off by the signal and reported as unreachable, not hung
+  const hang = (url, init) => new Promise((_, reject) => init.signal.addEventListener("abort", () => reject(new Error("aborted"))));
+  const realTimeout = AbortSignal.timeout;
+  AbortSignal.timeout = (ms) => realTimeout.call(AbortSignal, Math.min(ms, 50)); // same code path, test-speed clock
+  try {
+    const r = await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(hang));
+    assert.equal(r.unreachable, true);
+    assert.match(r.error, /^host claunker unreachable at http:\/\/100\.100\.1\.1:7850/);
+  } finally { AbortSignal.timeout = realTimeout; }
+});
