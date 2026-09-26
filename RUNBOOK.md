@@ -63,7 +63,9 @@ Design and config are in README's "Multi-host" section. Operational notes:
   default. From a worktree or scratch copy, run them with `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=breakaway`
   (and a temp `USERPROFILE` so the launcher queue is a temp dir). `test/survival.mjs` exercises
   the task path deliberately, so run it only from the live checkout. `test/multihost/*` never
-  reaches `launch()` (it injects a fake that writes the real ticket into a temp queue).
+  reaches `launch()` (it injects a fake that writes the real ticket into a temp queue). The one
+  exception is `claim.test.mjs`, which runs real `job-launcher.mjs` copies, but only against a temp
+  home it verifies first (see "Claim protocol" in the Task Scheduler notes below).
 - **Never export `GIT_DIR` around the test suites.** `test-card-hook.mjs` runs `git init` /
   `git config user.*` / `git commit` in a temp dir. With `GIT_DIR` set, those hit the real repo:
   `core.bare` flips to `true`, `[user]` is overwritten, and junk commits land on the checked-out branch.
@@ -217,10 +219,11 @@ mechanisms (process-tree kill, external job-close, self job-close) — trust tha
   ClaudeAsyncRunner`. The task's `MultipleInstances Parallel` setting means concurrent
   `claude_start` calls each spawn their own `job-launcher.mjs` instance rather than queuing behind
   one another.
-- Each `job-launcher.mjs` instance scans the queue directory and claims **at most one** ticket by
-  atomically renaming `<jobId>.json` → `<jobId>.claimed.json` (`fs.renameSync`, atomic on the same
-  NTFS volume — a losing instance sees `ENOENT` and moves to the next candidate, or exits 0
-  quietly if nothing is left). The winner spawns `job-runner.mjs` detached and writes
+- Each `job-launcher.mjs` instance scans the queue directory and claims **at most one** ticket
+  (`launcher-claim.mjs`): it exclusive-creates `<jobId>.lock`, renames `<jobId>.json` →
+  `<jobId>.claimed.json`, then removes the lock. A losing instance (`EEXIST` on the lock) moves to
+  the next candidate, or exits 0 quietly if nothing is left. **The rename alone is not a safe
+  claim** — see "Claim protocol" below. The winner spawns `job-runner.mjs` detached and writes
   `launched.marker` (pid + timestamp) into the job's own directory.
 - `job-core.mjs`'s existing `readRunnerPid()` poll (unchanged mechanism) is what actually confirms
   the runner started — just with a longer timeout on this path (`TASK_RUNNER_PID_POLL_MS`,
@@ -262,6 +265,67 @@ Unregister-ScheduledTask -TaskName ClaudeAsyncRunner -Confirm:$false   # remove 
 Removing the task doesn't break anything — the next `claude_start` on win32 re-registers it
 automatically via `ensureLauncherTask()` (or falls back to `breakaway-fallback` if registration
 itself fails, e.g. `register-launcher-task.ps1` missing).
+
+**Claim protocol (`fix/claim-lock`, 2026-09-26; `launcher-claim.mjs`).**
+- **Why a lock.** On Windows two launchers renaming the *same* ticket at nearly the same instant can
+  **both succeed** (neither gets `ENOENT`): one job ran twice and another ticket was never claimed.
+  Measured on Claunker with 4 aligned processes: the old rename-only claim double-claimed 1,149–1,404
+  of 1,800 tickets per 600-round run; three real `job-launcher.mjs` copies double-claimed 64–88 of 360
+  tickets per 120 rounds (and left other tickets pending, unclaimed). Exclusive create
+  (`fs.openSync(path, "wx")`) let exactly one caller through (0 doubles over 3,000 tight rounds on the
+  laptop, 0 over 5,400 tickets here). Rename-to-a-unique-name-then-verify still double-claimed 3–5%
+  and must not be used.
+- **Sequence.** `openSync(<jobId>.lock, "wx")` (`EEXIST`/any error: skip this ticket) → write
+  `{pid, at}` → `renameSync(<jobId>.json, <jobId>.claimed.json)` → unlink the lock. The lock is
+  **removed as soon as the rename returns**, not kept: the retry recipe below reuses a `jobId`, and a
+  leftover lock would block that retry until it aged out. A launcher whose directory listing predates
+  another's claim gets the lock, hits `ENOENT` on the rename, and moves on.
+- **Only `<jobId>.json` is a ticket.** `*.claimed.json`, `*.lock`, `*.lock.break`, `job-launcher.log`
+  and `*.tmp` are ignored by every scan (`isTicketName`).
+- **Stale locks.** A launcher killed between creating the lock and the rename strands its ticket
+  behind the lock. A lock is broken only if it is **at least 60 s old and its owner pid is dead (or
+  unreadable — the owner died between creating and writing the file)**. Breaking first
+  exclusive-creates `<jobId>.lock.break`, re-checks staleness while holding it, unlinks the lock, and
+  removes the marker, so two launchers that see the same stale lock cannot both take it. Every break
+  is logged: `grep "BROKE stale claim lock" job-launcher.log`. Everything else leaves the ticket
+  **pending** and logs why: a live owner ("owner pid=N is alive"), a lock under 60 s old, a lock dated
+  in the future, or an existing marker.
+- **Manual cleanup** (rare; the log line names the file). A `<jobId>.lock` older than a minute whose pid
+  was *reused* by an unrelated live process looks alive and is never broken: check
+  `Get-Process -Id <pid>` in the lock's JSON, and if it is not a `node` running `job-launcher.mjs`,
+  delete the lock. A `<jobId>.lock.break` older than a minute means its breaker crashed inside a
+  microsecond window; it is deliberately not auto-cleared (that would need a marker for the marker) —
+  delete it by hand. Neither loses work: the ticket is still `<jobId>.json` and the next launcher
+  picks it up. (The bridge's breakaway fallback may already have started that job after 15 s; check
+  for `runner.pid` in the job dir before deleting a pending ticket you do not want to run twice.)
+- **Not covered:** a launcher frozen for over a minute between creating the lock and writing its pid
+  (VM pause) can be mis-judged stale; a live launcher is never broken once its pid is written.
+  Launchers from before this fix still in flight during a deploy do not take the lock.
+- **Tests** (`npm run test:multihost`, temp dirs only, no schtasks): `test/multihost/claim.test.mjs` has
+  unit tests for the protocol; a 4-process race behind a shared high-resolution barrier (600 rounds ×
+  3 tickets; claim starts land within ~3 µs of each other) asserting no ticket claimed twice, none
+  lost, no lock left; a stale-lock break race (4 launchers, one stale lock, 300 rounds: claimed once,
+  broken once); and the real `job-launcher.mjs`, 3 copies × 120 rounds against a temp home
+  (`USERPROFILE`/`HOME`; it aborts before spawning if that override does not take, since a launcher
+  that resolved the live queue would claim live tickets) with a stub runner. To re-measure the old
+  behavior: `CLAIM_RACE_VARIANT=old node --test --test-name-pattern="claim race"
+  test/multihost/claim.test.mjs` reports the double-claim count instead of asserting;
+  `git show 72ef9bb:job-launcher.mjs > job-launcher.old.mjs` in the repo dir plus
+  `CLAIM_TEST_LAUNCHER=<that path>` does the same for the real-launcher variant (delete the copy).
+  `CLAIM_RACE_ROUNDS`, `CLAIM_RACE_WORKERS`, `CLAIM_RACE_TICKETS` and `CLAIM_LAUNCHER_ROUNDS` resize them.
+- **Deploying.** Only `job-launcher.mjs` and the new `launcher-claim.mjs` changed (not `job-core.mjs`),
+  and Task Scheduler starts a fresh `node` per launch, so no bridge restart is needed for the launcher
+  to pick this up; both files must be present in the checkout the task points at.
+- **After deploying, rerun `node test/survival.mjs` on BOTH hosts (Claunker and the laptop), from the
+  live checkout.** It was not run as part of this change (it deliberately uses the live queue and the
+  `ClaudeAsyncRunner` task). Its race scenario now exercises the lock claim, and scenario (c) now
+  reports a harness timeout as a timeout instead of a silent vanish.
+- **Spaces in the repo path** (the laptop's is `...\CC bridge\claude-async`).
+  `test/job-close-harness.ps1` used `Start-Process -ArgumentList @(...)`, which Windows PowerShell 5.1
+  joins with spaces and no quoting, so node received a split path (`Cannot find module '...\CC'`), no
+  marker was written, and scenario (c) timed out. It now quotes each argument.
+  `test/multihost/harness-quoting.test.mjs` runs both harnesses from a spaced temp path with a stub child
+  (`CLOSE_HARNESS_SCRIPT=<path>` runs another copy of the close harness, e.g. the old one, to see the failure).
 
 **A stuck/orphaned `<jobId>.claimed.json` with no corresponding `launched.marker`** in the job's
 directory means a `job-launcher.mjs` instance claimed the ticket but died before spawning
