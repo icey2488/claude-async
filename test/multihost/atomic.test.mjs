@@ -1,5 +1,5 @@
 // writeJsonAtomic: crash between temp write and rename leaves the old target intact; bounded
-// EPERM/EBUSY retry; and a source scan proving no state file in this branch is written with a
+// EPERM/EBUSY/EACCES retry (~1s budget); and a source scan proving no state file in this branch is written with a
 // truncating writeFileSync (red if one is reintroduced).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -58,7 +58,37 @@ test("EPERM/EBUSY on rename is retried a bounded number of times, then succeeds"
   assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { ok: true });
 });
 
-test("a permanent EPERM gives up after 6 attempts (bounded), cleans up and rethrows", () => {
+test("EACCES on rename (antivirus holding the temp file) is retried, then succeeds", () => {
+  const f = path.join(dir, "eacces.json");
+  let calls = 0;
+  const av = { ...fs, renameSync(a, b) {
+    if (++calls <= 4) throw Object.assign(new Error("access denied"), { code: "EACCES" });
+    return fs.renameSync(a, b);
+  } };
+  writeJsonAtomic(f, { ok: true }, { fsImpl: av });
+  assert.equal(calls, 5);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { ok: true });
+  assert.deepEqual(leftovers("eacces.json"), []);
+});
+
+test("a permanent EACCES gives up after 11 attempts over ~1s (bounded), cleans up the temp and rethrows", () => {
+  const f = path.join(dir, "stuck-eacces.json");
+  writeJsonAtomic(f, { version: "old" });
+  let calls = 0;
+  const stuck = { ...fs, renameSync() {
+    if (++calls > 50) throw new Error("unbounded retry");
+    throw Object.assign(new Error("access denied"), { code: "EACCES" });
+  } };
+  const t0 = Date.now();
+  assert.throws(() => writeJsonAtomic(f, { version: "new" }, { fsImpl: stuck }), (e) => e.code === "EACCES");
+  const elapsed = Date.now() - t0;
+  assert.equal(calls, 11);
+  assert.ok(elapsed >= 800, `backoff budget is about 1s, only slept ${elapsed}ms`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { version: "old" });
+  assert.deepEqual(leftovers("stuck-eacces.json"), []);
+});
+
+test("a permanent EPERM gives up after 11 attempts (bounded), cleans up and rethrows", () => {
   const f = path.join(dir, "stuck.json");
   writeJsonAtomic(f, { version: "old" });
   let calls = 0;
@@ -67,17 +97,19 @@ test("a permanent EPERM gives up after 6 attempts (bounded), cleans up and rethr
     throw Object.assign(new Error("locked"), { code: "EPERM" });
   } };
   assert.throws(() => writeJsonAtomic(f, { version: "new" }, { fsImpl: stuck }), (e) => e.code === "EPERM");
-  assert.equal(calls, 6);
+  assert.equal(calls, 11);
   assert.deepEqual(JSON.parse(fs.readFileSync(f, "utf8")), { version: "old" });
   assert.deepEqual(leftovers("stuck.json"), []);
 });
 
 test("a non-retryable rename error is not retried", () => {
-  const f = path.join(dir, "enoent.json");
-  let calls = 0;
-  const bad = { ...fs, renameSync() { calls++; throw Object.assign(new Error("gone"), { code: "ENOENT" }); } };
-  assert.throws(() => writeJsonAtomic(f, {}, { fsImpl: bad }), (e) => e.code === "ENOENT");
-  assert.equal(calls, 1);
+  for (const code of ["ENOENT", "EIO", "ENOSPC"]) {
+    const f = path.join(dir, "nonretry.json");
+    let calls = 0;
+    const bad = { ...fs, renameSync() { calls++; throw Object.assign(new Error("nope"), { code }); } };
+    assert.throws(() => writeJsonAtomic(f, {}, { fsImpl: bad }), (e) => e.code === code);
+    assert.equal(calls, 1, code);
+  }
 });
 
 // Source scan: the only truncating writeFileSync calls left in the multihost files are the lock file
