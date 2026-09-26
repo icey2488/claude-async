@@ -49,6 +49,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { sanitizeEnvForWin32, logIfPathextSanitized, LAUNCHER_QUEUE_DIR } from "./job-core.mjs";
+import { writeJsonAtomic } from "./atomic.mjs";
 
 function log(line) {
   try {
@@ -159,7 +160,7 @@ function main() {
     // rewriting the command field in place here is what actually takes effect. Nothing else in
     // the codebase reads spec.json besides job-runner.mjs (verified: only its own specPath argv).
     spec.command = resolvedCommand;
-    try { fs.writeFileSync(specPath, JSON.stringify(spec)); }
+    try { writeJsonAtomic(specPath, spec, { space: 0 }); }
     catch (e) { log(`jobId=${jobId}: failed to rewrite resolved command into spec.json: ${e.message}`); }
   }
 
