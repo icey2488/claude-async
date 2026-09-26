@@ -248,8 +248,9 @@ task can only run while that user has an interactive logon session, which is fin
 Claude Desktop itself is a desktop GUI app and is never running when nobody's logged on anyway.
 
 **Fallback order:** `task` (default) → `breakaway-fallback` (`win32-breakaway.ps1`, used only if
-`ensureLauncherTask()` fails, `schtasks /Run` fails, or the runner never appears within
-`TASK_RUNNER_PID_POLL_MS`) → (non-win32 only) `spawn`. The chosen path is recorded as
+`ensureLauncherTask()` fails, the ticket write fails, `schtasks /Run` fails, or the runner never appears within
+`TASK_RUNNER_PID_POLL_MS` **and the bridge has first taken its own pending ticket back out of the queue**;
+if a launcher already owns the ticket there is no fallback, see "Fallback vs the pending ticket" below) → (non-win32 only) `spawn`. The chosen path is recorded as
 `launchPath` in `meta.json` / `claude_check`. Override via `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=
 breakaway` to force the old path directly (used by `test/pid-heal.mjs`, `test/pathext-integrity.mjs`,
 and `test/env-integrity.mjs`, which specifically exercise breakaway-only mechanics — the PowerShell
@@ -276,12 +277,29 @@ itself fails, e.g. `register-launcher-task.ps1` missing).
   laptop, 0 over 5,400 tickets here). Rename-to-a-unique-name-then-verify still double-claimed 3–5%
   and must not be used.
 - **Sequence.** `openSync(<jobId>.lock, "wx")` (`EEXIST`/any error: skip this ticket) → write
-  `{pid, at}` → `renameSync(<jobId>.json, <jobId>.claimed.json)` → unlink the lock. The lock is
+  `{pid, at}` → **read the lock back; it must parse to our pid, otherwise we lost it and skip the ticket
+  (nothing is unlinked or renamed)** → `renameSync(<jobId>.json, <jobId>.claimed.json)` → unlink the lock
+  **only if it still holds our pid**. The lock is
   **removed as soon as the rename returns**, not kept: the retry recipe below reuses a `jobId`, and a
   leftover lock would block that retry until it aged out. A launcher whose directory listing predates
   another's claim gets the lock, hits `ENOENT` on the rename, and moves on.
 - **Only `<jobId>.json` is a ticket.** `*.claimed.json`, `*.lock`, `*.lock.break`, `job-launcher.log`
   and `*.tmp` are ignored by every scan (`isTicketName`).
+- **Identity (a lock is only ever unlinked by the pid inside it).** Without this, a launcher suspended
+  between creating the lock and writing its pid for over 60 s (VM pause, antivirus) looked like a dead owner:
+  a breaker unlinked its lock, a second launcher created its own, and the first launcher's later
+  unlink-by-name deleted the second's live lock, so a third could claim the same ticket. Now the read-back
+  after the write shows the first launcher it lost (once our pid is written the lock is fresh with a live
+  owner, so no breaker touches it), and the release after the rename, the write-failure cleanup and the
+  break-marker cleanup all check the file still carries our pid first; otherwise they log
+  `no longer ours ... leaving it alone` and leave it. The break marker has the same pre-write empty window
+  and the same rule. Consequence: a lock whose pid write failed is empty, so it is left behind (logged) and
+  breaks through the normal stale path after 60 s; an empty marker needs the manual delete below. One
+  residue remains: the breaker's own check-then-unlink gap (microseconds) would have to coincide with the end
+  of a 60 s+ stall of the owner; plain filesystem calls cannot make that step atomic.
+- **Tickets are written atomically.** `writeLaunchTicket` uses `writeJsonAtomic` (temp file
+  `<jobId>.json.<pid>.<rand>.tmp`, then rename), so a launcher never sees a half-written ticket to claim and
+  drop. The temp name ends in `.tmp` and is not a ticket; an orphaned `*.tmp` from a crash is safe to delete.
 - **Stale locks.** A launcher killed between creating the lock and the rename strands its ticket
   behind the lock. A lock is broken only if it is **at least 60 s old and its owner pid is dead (or
   unreadable — the owner died between creating and writing the file)**. Breaking first
@@ -296,26 +314,62 @@ itself fails, e.g. `register-launcher-task.ps1` missing).
   delete the lock. A `<jobId>.lock.break` older than a minute means its breaker crashed inside a
   microsecond window; it is deliberately not auto-cleared (that would need a marker for the marker) —
   delete it by hand. Neither loses work: the ticket is still `<jobId>.json` and the next launcher
-  picks it up. (The bridge's breakaway fallback may already have started that job after 15 s; check
-  for `runner.pid` in the job dir before deleting a pending ticket you do not want to run twice.)
+  picks it up. (The bridge's breakaway fallback withdraws its own ticket before it starts a job, so a pending
+  ticket is not a duplicate-run risk from that; still check for `runner.pid` in the job dir before deleting
+  a pending ticket you do not want to run.) An empty `<jobId>.lock.break` left by a failed marker write is
+  deleted the same way.
+- **Fallback vs the pending ticket (`job-core.mjs`, `launchWin32Task`).** Before this fix, when the task
+  path failed (`schtasks /Run` failed, or no `runner.pid` within 15 s) the bridge started the job through
+  `win32-breakaway.ps1` and **left its ticket in the queue**, so any launcher that ran later (that job's slow
+  instance, or one triggered by another `claude_start`) claimed the ticket and started the job a second time.
+  Now the bridge first takes its ticket back with the same claim lock (`withdrawTicket` in
+  `launcher-claim.mjs`: exclusive-create `<jobId>.lock`, unlink the ticket, release). If that succeeds it
+  launches the fallback (`launchPath: "breakaway-fallback"`, err.log: `removed the still-pending launch
+  ticket before falling back`). If it loses (the ticket is already `<jobId>.claimed.json`, a launcher holds
+  the lock, or the unlink failed) a launcher owns the job, so the bridge does **not** launch it a second way:
+  it keeps polling `runner.pid` for 15 s more and reports `launchPath: "task"` if it appears (err.log:
+  `launch ticket not withdrawn (claimed|held|error)`). If it never appears the start returns
+  `pid: null`, `pidSource: "task-claimed-no-runner"` and err.log says the launcher never started it; check
+  `job-launcher.log`, then retry `claude_start` with the same `jobId` (after deleting the stale
+  `.claimed.json` per the note below). `claude_check` heals a late runner's pid from `runner.pid`.
 - **Not covered:** a launcher frozen for over a minute between creating the lock and writing its pid
-  (VM pause) can be mis-judged stale; a live launcher is never broken once its pid is written.
-  Launchers from before this fix still in flight during a deploy do not take the lock.
+  (VM pause) may still be judged stale and have its lock broken, but it can no longer damage anyone: its
+  read-back fails, so it claims nothing and unlinks nothing (the ticket stays pending for the next launcher).
+  A live launcher is never broken once its pid is written, apart from the microsecond gap named under
+  Identity. A read-back that fails for a transient reason (antivirus holding the file) also gives up the
+  ticket for that launcher and leaves its lock; launchers exit after one claim, so the dead pid lets the lock
+  age out after 60 s. Launchers from before this fix still in flight during a deploy do not take the lock.
 - **Tests** (`npm run test:multihost`, temp dirs only, no schtasks): `test/multihost/claim.test.mjs` has
   unit tests for the protocol; a 4-process race behind a shared high-resolution barrier (600 rounds ×
-  3 tickets; claim starts land within ~3 µs of each other) asserting no ticket claimed twice, none
-  lost, no lock left; a stale-lock break race (4 launchers, one stale lock, 300 rounds: claimed once,
+  3 tickets; claim starts land together, median spread measured 0.003–0.04 ms) asserting no ticket
+  claimed twice, none lost, no lock left; a stale-lock break race (4 launchers, one stale lock, 300 rounds: claimed once,
   broken once); and the real `job-launcher.mjs`, 3 copies × 120 rounds against a temp home
   (`USERPROFILE`/`HOME`; it aborts before spawning if that override does not take, since a launcher
-  that resolved the live queue would claim live tickets) with a stub runner. To re-measure the old
-  behavior: `CLAIM_RACE_VARIANT=old node --test --test-name-pattern="claim race"
-  test/multihost/claim.test.mjs` reports the double-claim count instead of asserting;
-  `git show 72ef9bb:job-launcher.mjs > job-launcher.old.mjs` in the repo dir plus
-  `CLAIM_TEST_LAUNCHER=<that path>` does the same for the real-launcher variant (delete the copy).
+  that resolved the live queue would claim live tickets) with a stub runner. Unit tests also cover the
+  identity checks (fs patched to inject the stall: lost lock, replaced lock at release, replaced marker) and
+  `withdrawTicket`; `postlaunch.test.mjs` covers fallback-vs-ticket with fake seams.
+  **The concurrency tests fail rather than pass when they were not actually concurrent:** every worker must be
+  released together (median claim-start spread under 1 ms, printed in the failure message). A round with a worker
+  released more than 5 ms after the shared instant is still checked for double claims but is redone instead of
+  counted, within a budget of 2% of the rounds (about 1 round in 300 hits it on an idle box); a run that
+  blows the budget, or whose median spread is over 1 ms, fails with its timing. `LEAD_MS` is 50.
+  To re-measure the old behavior: `CLAIM_RACE_VARIANT=old node --test --test-name-pattern="claim race"
+  test/multihost/claim.test.mjs` reports the double-claim count (and still asserts alignment); add
+  `CLAIM_RACE_STRICT=1` to apply the normal assertions, which the old claim fails. For the real-launcher
+  variant: `git show 72ef9bb:job-launcher.mjs > job-launcher.old.mjs` in the repo dir plus
+  `CLAIM_RACE_VARIANT=old CLAIM_TEST_LAUNCHER=<that path>` (delete the copy afterwards). **The old variant
+  without `CLAIM_TEST_LAUNCHER` skips the real-launcher tests with a message** (it used to run the new
+  launcher under an "OLD" label). Measured on Claunker 2026-09-26: old claim 1,573 double-claimed of 1,800
+  tickets (600 rounds); old launcher copy 49 double-claimed tickets and 101 jobs not started exactly once
+  (120 rounds); new claim and new launcher 0.
   `CLAIM_RACE_ROUNDS`, `CLAIM_RACE_WORKERS`, `CLAIM_RACE_TICKETS` and `CLAIM_LAUNCHER_ROUNDS` resize them.
-- **Deploying.** Only `job-launcher.mjs` and the new `launcher-claim.mjs` changed (not `job-core.mjs`),
-  and Task Scheduler starts a fresh `node` per launch, so no bridge restart is needed for the launcher
-  to pick this up; both files must be present in the checkout the task points at.
+- **Deploying: a bridge restart IS required.** The fallback fix changes `job-core.mjs` (it now imports
+  `launcher-claim.mjs` and withdraws the ticket), and the running bridge has the old `job-core.mjs` in memory,
+  so it keeps leaving the ticket behind until Claude Desktop restarts it (follow "Restarting the bridge"
+  above, including the warmup). The launcher side (`job-launcher.mjs`, `launcher-claim.mjs`) needs no
+  restart: Task Scheduler starts a fresh `node` per launch; both files must be present in the checkout the
+  task points at. (An earlier version of this note said no restart was needed; that was true only before
+  `job-core.mjs` changed.)
 - **After deploying, rerun `node test/survival.mjs` on BOTH hosts (Claunker and the laptop), from the
   live checkout.** It was not run as part of this change (it deliberately uses the live queue and the
   `ClaudeAsyncRunner` task). Its race scenario now exercises the lock claim, and scenario (c) now
