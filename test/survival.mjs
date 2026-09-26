@@ -23,8 +23,9 @@
  * CloseHandle()s its own last handle to that job -- terminating itself (and P, if not escaped)
  * synchronously inside that call.
  *
- * Race test: directly exercises job-launcher.mjs's claim logic (LAUNCHER_QUEUE_DIR, atomic
- * rename-to-claim) by writing two tickets and spawning two launcher instances concurrently,
+ * Race test: directly exercises job-launcher.mjs's claim logic (LAUNCHER_QUEUE_DIR, exclusive-create
+ * lock + rename-to-claim; see launcher-claim.mjs) by writing two tickets and spawning two launcher
+ * instances concurrently,
  * bypassing schtasks entirely for determinism -- asserts both runners start and neither ticket is
  * claimed twice.
  *
@@ -192,6 +193,12 @@ async function scenarioSelfJobClose() {
 
   let harnessOut = "";
   harness.stdout.on("data", (d) => { harnessOut += d.toString(); });
+  harness.stderr.on("data", (d) => { harnessOut += d.toString(); });
+  // Settle on the child's own 'exit' event. This used to poll pidAlive(), which is a blocking
+  // spawnSync(tasklist): it froze the event loop, so a harness that printed TIMEOUT and exited was
+  // seen as gone before its final stdout chunk was read, and a timeout was reported as a silent vanish.
+  const exited = new Promise((res) => harness.once("exit", (code, signal) => res({ code, signal })));
+  const closed = new Promise((res) => harness.once("close", res));
 
   try {
     if (!await waitFor(() => /READY pid=\d+/.test(harnessOut), 10000)) {
@@ -199,20 +206,22 @@ async function scenarioSelfJobClose() {
       return { label, ok: false, reason: `harness never reported READY: ${harnessOut}` };
     }
     // The harness itself waits for marker+heartbeat, then calls CloseHandle() on its own job --
-    // no external trigger needed. We just wait for its own pid to disappear (proof the close+
-    // kill-on-close actually fired), or for it to print CLOSED (proof it did NOT -- i.e. it
-    // escaped its own job too, which would only happen if this harness itself broke away).
-    const settled = await waitFor(
-      () => !pidAlive(harness.pid) || /CLOSED|TIMEOUT/.test(harnessOut), 25000);
-    if (!settled) {
+    // no external trigger needed. Normally the close kills the harness inside that call (proof the
+    // close+kill-on-close actually fired); it prints CLOSED only if it did NOT die (i.e. it escaped
+    // its own job too, which would only happen if this harness itself broke away), or TIMEOUT if it
+    // gave up waiting for the marker/heartbeat.
+    const exit = await Promise.race([exited, sleep(25000).then(() => null)]);
+    if (!exit) {
       spawnSync("taskkill", ["/PID", String(harness.pid), "/F"]);
-      return { label, ok: false, reason: `harness never settled: ${harnessOut}` };
+      return { label, ok: false, reason: `harness never exited: ${harnessOut}` };
     }
+    // 'exit' can fire before the last stdout chunk has been read; give the pipe a moment to drain.
+    await Promise.race([closed, sleep(2000)]);
     if (/TIMEOUT/.test(harnessOut)) {
-      return { label, ok: false, reason: `harness reported a timeout: ${harnessOut}` };
+      return { label, ok: false, reason: `harness reported a timeout (exit code ${exit.code}): ${harnessOut}` };
     }
     if (!fs.existsSync(markerPath)) {
-      return { label, ok: false, reason: `no marker despite harness settling: ${harnessOut}` };
+      return { label, ok: false, reason: `no marker although the harness exited (code ${exit.code}): ${harnessOut}` };
     }
     const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
     const runnerPid = marker.result && marker.result.pid;
@@ -221,7 +230,8 @@ async function scenarioSelfJobClose() {
     // The kill-on-close (if it fired) already happened by the time we get here -- assertSurvives'
     // killFn is a no-op wait, since the "kill" already occurred inside the harness.
     const result = await assertSurvives(label, runnerPid, hbPath, async () => { await sleep(200); });
-    return { ...result, launchPath, harnessSelfTerminated: !pidAlive(harness.pid) };
+    // Terminated inside CloseHandle (never got to print CLOSED), as opposed to surviving its own close.
+    return { ...result, launchPath, harnessSelfTerminated: !/CLOSED/.test(harnessOut), harnessExit: exit };
   } finally {
     try { const m = JSON.parse(fs.readFileSync(markerPath, "utf8")); if (m.result?.pid) {
       process.kill(m.result.pid, "SIGKILL"); spawnSync("taskkill", ["/PID", String(m.result.pid), "/T", "/F"]);
@@ -286,7 +296,11 @@ async function raceClaimTest() {
     return { label, ok, detail: { stillPending, bothClaimed, runnerPids, bothStarted, distinctPids } };
   } finally {
     for (const id of ids) {
-      try { for (const p of [`${id}.json`, `${id}.claimed.json`]) fs.rmSync(path.join(LAUNCHER_QUEUE_DIR, p), { force: true }); } catch {}
+      try {
+        for (const p of [`${id}.json`, `${id}.claimed.json`, `${id}.lock`, `${id}.lock.break`]) {
+          fs.rmSync(path.join(LAUNCHER_QUEUE_DIR, p), { force: true });
+        }
+      } catch {}
     }
     for (const d of Object.values(jobDirs)) {
       try {

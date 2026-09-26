@@ -107,8 +107,18 @@ try {
 $assignOk = [JobCloseHarness]::AssignProcessToJobObject($hJob, [JobCloseHarness]::GetCurrentProcess())
 if (-not $assignOk) { throw "AssignProcessToJobObject(self) failed err=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
 
-$proc = Start-Process -FilePath $NodeExe -ArgumentList @($ParentScript, $JobDir, $DummyCli, $CoreModule, $MarkerPath) `
-    -WindowStyle Hidden -PassThru
+# Windows PowerShell 5.1's Start-Process joins an -ArgumentList array with spaces and NO quoting, so
+# any path containing a space (e.g. "...\CC bridge\claude-async") reached node split in two ("Cannot
+# find module '...\CC'"), no marker was ever written, and this harness timed out. Quote each element
+# by CommandLineToArgvW's rules and hand Start-Process one pre-built string instead.
+function ConvertTo-CommandLineArg([string]$s) {
+    if ($s -ne '' -and $s -notmatch '[\s"]') { return $s }
+    $s = $s -replace '(\\*)"', '$1$1\"'   # backslashes before a quote are doubled, the quote escaped
+    $s = $s -replace '(\\+)$', '$1$1'      # trailing backslashes would escape our closing quote
+    return '"' + $s + '"'
+}
+$argLine = (@($ParentScript, $JobDir, $DummyCli, $CoreModule, $MarkerPath) | ForEach-Object { ConvertTo-CommandLineArg $_ }) -join ' '
+$proc = Start-Process -FilePath $NodeExe -ArgumentList $argLine -WindowStyle Hidden -PassThru
 Set-Content -Path $ParentPidFile -Value $proc.Id -Encoding utf8 -NoNewline
 Write-Output "READY pid=$($proc.Id) jobFlags=0x$($JobFlags.ToString('X'))"
 
