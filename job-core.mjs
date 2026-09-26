@@ -541,10 +541,26 @@ export function countActiveJobs(nowMs) {
   return { count, warnings };
 }
 
+// Writes the new job's meta.json AFTER the runner is already launched and a card minted, so this
+// must never throw: there is no old meta.json for atomicity to protect (the file does not exist
+// yet), and a throw would leave a running job with a card and no meta. Atomic write first, then a
+// direct write, then -- if both fail -- an err.log line. Returns null on success, else the error
+// message of the last failure (the caller turns it into a response warning).
+function writeNewMeta(p, meta, fsImpl = fs) {
+  try { writeJsonAtomic(p.meta, meta, { fsImpl }); return null; } catch {}
+  try { fsImpl.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); return null; }
+  catch (e) {
+    try { fsImpl.appendFileSync(p.err, `\n[job-core] meta.json could not be written: ${e.message}; ` +
+      `the job IS running as pid ${meta.pid}\n`); } catch {}
+    return e.message;
+  }
+}
+
 // opts (all optional): host (executing host name, e.g. "claunker" -- recorded in meta and used in
 // error text), caps (see guard.mjs resolveCaps), depth (the CALLER's dispatch depth; default from
 // CLAUDE_ASYNC_DEPTH), now (Date, tests), claudeBin + launch (test seams: the preflight binary and
-// a replacement for launch() so tests never touch schtasks or spawn a runner).
+// a replacement for launch() so tests never touch schtasks or spawn a runner), fsImpl (test seam
+// for the post-launch meta.json write, see writeNewMeta()).
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
 export async function startJob({ prompt, workFolder, jobId, model, effort, intent }, opts = {}) {
   const hostname = os.hostname();
@@ -614,12 +630,14 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
-  writeJsonAtomic(p.meta, meta);
+  const metaError = writeNewMeta(p, meta, opts.fsImpl);
+  const warnings = [...(reserved.warnings || []),
+    ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
   const note = cardError
     ? `UNCARDED: ${cardError} — Job detached. Poll with claude_check(jobId). Safe across bridge restarts.`
     : "Job detached. Poll with claude_check(jobId). Safe across bridge restarts.";
   return { ...meta, status: "running", preflight: PREFLIGHT_OK, note,
-           ...(reserved.warnings?.length ? { warnings: reserved.warnings } : {}) };
+           ...(warnings.length ? { warnings } : {}) };
 }
 
 export function checkJob(id, tailBytes = 8000) {

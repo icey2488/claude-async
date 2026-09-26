@@ -113,10 +113,11 @@ test("a non-retryable rename error is not retried", () => {
 });
 
 // Source scan: the only truncating writeFileSync calls left in the multihost files are the lock file
-// (an O_EXCL mutex, not state) and the tiny exit_code marker (pre-existing, existence-checked flag).
+// (an O_EXCL mutex, not state), the tiny exit_code marker (pre-existing, existence-checked flag), and
+// startJob's last-resort direct write of a meta.json that does not exist yet (nothing to protect).
 test("no state file in the multihost sources is written with a bare writeFileSync", () => {
   const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const allowed = [/flag: "wx"/, /p\.exit, "126"/];
+  const allowed = [/flag: "wx"/, /p\.exit, "126"/, /fsImpl\.writeFileSync\(p\.meta,/];
   const offenders = [];
   for (const f of ["job-core.mjs", "guard.mjs", "hosts.mjs", "host-api.mjs", "dispatch.mjs"]) {
     fs.readFileSync(path.join(root, f), "utf8").split(/\r?\n/).forEach((line, i) => {
