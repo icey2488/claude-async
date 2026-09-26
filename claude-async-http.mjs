@@ -15,7 +15,8 @@ import https from "node:https";
 import fs from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { registerTools, runSelfTest } from "./job-core.mjs";
+import { runSelfTest } from "./job-core.mjs";
+import { registerTools } from "./dispatch.mjs";
 
 if (process.argv.includes("--selftest")) {
   await runSelfTest(); // exits the process

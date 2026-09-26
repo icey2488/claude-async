@@ -22,7 +22,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { EmptyResultSchema } from "@modelcontextprotocol/sdk/types.js";
-import { registerTools, runSelfTest, JOB_ROOT } from "./job-core.mjs";
+import { runSelfTest, JOB_ROOT } from "./job-core.mjs";
+import { registerTools } from "./dispatch.mjs";
 import fs from "node:fs";
 import path from "node:path";
 

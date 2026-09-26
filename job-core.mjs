@@ -12,7 +12,6 @@
  * a usable value before both spawns that matter; see its own header comment for the full story
  * and test/pathext-integrity.mjs for the regression test.
  */
-import { z } from "zod";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
@@ -21,6 +20,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { mintCard, failCard } from "./card-hook.mjs";
 import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
+import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
+         DEPTH_ENV } from "./guard.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -293,15 +294,16 @@ async function readRunnerPid(p, fallbackPid, pollMs = RUNNER_PID_POLL_MS) {
 // repairs it before this spawn (see that function's header comment above for why it's needed --
 // this is the first of the two hops it patches; job-runner.mjs's own spawn of the CLI is the
 // second, belt-and-suspenders in case a future launch path bypasses this one).
-async function launchWin32Breakaway(p) {
+async function launchWin32Breakaway(p, extraEnv = {}) {
   // A stray runner.pid can only exist here if a prior job dir at this same path was left behind
   // without a clean startJob() (startJob() itself refuses to reuse an existing job dir -- see
   // its fs.existsSync(p.d) guard -- so this is defense in depth, not a path this code expects to
   // hit in practice). Removing it up front guarantees readRunnerPid() below can only observe a
   // runner.pid written by the runner.mjs we are about to spawn, never a leftover from one we didn't.
   try { fs.unlinkSync(path.join(p.d, "runner.pid")); } catch {}
-  const env = sanitizeEnvForWin32(process.env);
-  logIfPathextSanitized(p.err, process.env, env, "spawning the win32 breakaway wrapper");
+  const baseEnv = { ...process.env, ...extraEnv };
+  const env = sanitizeEnvForWin32(baseEnv);
+  logIfPathextSanitized(p.err, baseEnv, env, "spawning the win32 breakaway wrapper");
   const child = spawn("powershell.exe",
     ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
      "-File", WIN32_BREAKAWAY_SCRIPT, process.execPath, RUNNER, p.spec, p.err],
@@ -365,7 +367,9 @@ function ensureLauncherTask() {
 // why it's not simply p.d); job-launcher.mjs renames it to <jobId>.claimed.json in the same
 // directory as its atomic claim mechanism. jobDir is carried inside the ticket so job-launcher.mjs
 // can find/write the job's own artifacts (launched.marker) without needing to know JOB_ROOT.
-function writeLaunchTicket(p) {
+// extraEnv (e.g. CLAUDE_ASYNC_DEPTH for the new job) rides in the existing envOverrides field, so
+// job-launcher.mjs needs no change to honor it.
+export function writeLaunchTicket(p, extraEnv = {}) {
   const jobId = path.basename(p.d);
   const ticket = {
     jobId,
@@ -374,7 +378,7 @@ function writeLaunchTicket(p) {
     errPath: p.err,
     nodeExe: process.execPath,
     runnerScript: RUNNER,
-    envOverrides: collectEnvOverrides(),
+    envOverrides: { ...collectEnvOverrides(), ...extraEnv },
     createdAt: new Date().toISOString(),
   };
   fs.writeFileSync(path.join(LAUNCHER_QUEUE_DIR, `${jobId}.json`), JSON.stringify(ticket, null, 2));
@@ -387,7 +391,7 @@ function writeLaunchTicket(p) {
 // self-reporting membership in a job with KILL_ON_JOB_CLOSE set -- see RUNBOOK.md). Returns null
 // on any failure of the task path itself (registration, /Run, or the runner never showing up in
 // time) so launchWin32() can fall back to win32-breakaway.ps1; never throws.
-async function launchWin32Task(p) {
+async function launchWin32Task(p, extraEnv) {
   const reg = ensureLauncherTask();
   if (!reg.ok) {
     try { fs.appendFileSync(p.err, `\n[job-core] ensureLauncherTask() failed: ${reg.error}\n`); } catch {}
@@ -397,7 +401,7 @@ async function launchWin32Task(p) {
   // Same defense-in-depth as launchWin32Breakaway(): a stray runner.pid must never survive from
   // a prior occupant of this job dir.
   try { fs.unlinkSync(path.join(p.d, "runner.pid")); } catch {}
-  writeLaunchTicket(p);
+  writeLaunchTicket(p, extraEnv);
 
   const run = spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" });
   if (run.status !== 0) {
@@ -425,37 +429,140 @@ async function launchWin32Task(p) {
   return { pid, pidSource, jobMembership, launchPath: "task" };
 }
 
-async function launchWin32(p) {
+async function launchWin32(p, extraEnv) {
   if (WIN32_LAUNCH_MODE !== "breakaway") {
-    const viaTask = await launchWin32Task(p);
+    const viaTask = await launchWin32Task(p, extraEnv);
     if (viaTask) return viaTask;
     try { fs.appendFileSync(p.err,
       "\n[job-core] Task Scheduler launch path unavailable/failed; falling back to win32-breakaway.ps1\n");
     } catch {}
   }
-  const viaBreakaway = await launchWin32Breakaway(p);
+  const viaBreakaway = await launchWin32Breakaway(p, extraEnv);
   return { ...viaBreakaway, launchPath: "breakaway-fallback" };
 }
 
-function launchPosix(p) {
-  const child = spawn(process.execPath, [RUNNER, p.spec], { detached: true, stdio: "ignore" });
+function launchPosix(p, extraEnv = {}) {
+  const child = spawn(process.execPath, [RUNNER, p.spec],
+    { detached: true, stdio: "ignore", env: { ...process.env, ...extraEnv } });
   child.on("error", (e) => recordLaunchFailure(p, `failed to spawn job-runner: ${e.message}`));
   child.unref();
   return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
-async function launch(p, command, argv, cwd) {
+async function launch(p, command, argv, cwd, extraEnv = {}) {
   fs.writeFileSync(p.spec, JSON.stringify({ command, argv, cwd, out: p.out, err: p.err, exit: p.exit }));
-  return process.platform === "win32" ? launchWin32(p) : launchPosix(p);
+  return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent }) {
-  const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
-  const p = jobPaths(id);
-  if (fs.existsSync(p.d)) return { error: `jobId ${id} already exists` };
-  fs.mkdirSync(p.d, { recursive: true });
+// Job ids reach the filesystem as a directory name under JOB_ROOT (and, via host-api.mjs, arrive
+// from the network), so anything that could escape JOB_ROOT ("..", separators) is refused outright.
+export function isSafeJobId(id) {
+  return typeof id === "string" && id.length > 0 && id.length <= 200 && /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(id);
+}
 
+// Resolves the Claude Code binary the way the launch path will actually find it, or null. A path
+// must be an existing file. A bare name is searched on PATH as libuv's spawn() would (as-is if it
+// already has an extension, else .com/.exe on win32), then job-launcher.mjs's resolveCommand()
+// fallback (~/.local/bin/<name>.exe), so preflight agrees with what the launcher can run.
+export function resolveBinary(bin, env = process.env) {
+  if (!bin) return null;
+  const isFile = (f) => { try { return fs.statSync(f).isFile(); } catch { return false; } };
+  if (/[\\/]/.test(bin)) return isFile(bin) ? bin : null;
+  const win = process.platform === "win32";
+  const exts = win && !path.extname(bin) ? [".com", ".exe"] : [""];
+  const pathKey = Object.keys(env).find((k) => k.toLowerCase() === "path");
+  for (const dir of String(pathKey ? env[pathKey] : "").split(path.delimiter).filter(Boolean)) {
+    for (const ext of exts) {
+      const candidate = path.join(dir, bin + ext);
+      if (isFile(candidate)) return candidate;
+    }
+  }
+  if (win) {
+    const fallback = path.join(os.homedir(), ".local", "bin", `${bin}.exe`);
+    if (isFile(fallback)) return fallback;
+  }
+  return null;
+}
+
+export const PREFLIGHT_OK = "preflight passed, execution unverified";
+
+// Design item 7: checked on the EXECUTING host before anything is written or detached. Success
+// only means the binary and workFolder exist -- the runner still records any startup failure in
+// the job record, which is why the success wording says "execution unverified".
+export function preflight({ claudeBin = CLAUDE_BIN, cwd, hostLabel }) {
+  if (!resolveBinary(claudeBin)) {
+    return { error: `preflight failed on ${hostLabel}: Claude Code binary ${JSON.stringify(claudeBin)} not found` };
+  }
+  let isDir = false;
+  try { isDir = fs.statSync(cwd).isDirectory(); } catch {}
+  if (!isDir) return { error: `preflight failed on ${hostLabel}: workFolder ${JSON.stringify(cwd)} does not exist` };
+  return { ok: PREFLIGHT_OK };
+}
+
+// A job counts against the concurrency cap if it has no exit_code and either checkJob() calls it
+// running, or it has no meta.json yet (its dir was reserved by a start whose launch is still in
+// flight -- the task path can take up to TASK_RUNNER_PID_POLL_MS before meta.json lands).
+const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
+function countActiveJobs(nowMs) {
+  let n = 0;
+  let ids = [];
+  try { ids = fs.readdirSync(JOB_ROOT); } catch {}
+  for (const id of ids) {
+    const p = jobPaths(id);
+    try {
+      if (!fs.statSync(p.d).isDirectory() || fs.existsSync(p.exit)) continue;
+      if (!fs.existsSync(p.meta)) {
+        if (nowMs - fs.statSync(p.d).mtimeMs < INFLIGHT_RESERVATION_MS) n++;
+        continue;
+      }
+      if (checkJob(id, 0).status === "running") n++;
+    } catch { /* unreadable job dir: not counted */ }
+  }
+  return n;
+}
+
+// opts (all optional): host (executing host name, e.g. "claunker" -- recorded in meta and used in
+// error text), caps (see guard.mjs resolveCaps), depth (the CALLER's dispatch depth; default from
+// CLAUDE_ASYNC_DEPTH), now (Date, tests), claudeBin + launch (test seams: the preflight binary and
+// a replacement for launch() so tests never touch schtasks or spawn a runner).
+// Order is deliberate: every rejection happens before the job dir or ticket exists.
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent }, opts = {}) {
+  const hostname = os.hostname();
+  const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
+  const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
+
+  const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
+  if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
   const cwd = workFolder || DEFAULT_CWD;
+
+  const pf = preflight({ claudeBin: opts.claudeBin, cwd, hostLabel });
+  if (pf.error) return fail("preflight", pf.error);
+
+  const d = opts.depth !== undefined ? parseDepth(opts.depth) : parseDepth(process.env[DEPTH_ENV]);
+  if (d.error) return fail("depth", `${d.error}; no job started`);
+  const depthError = checkDepth(d.depth);
+  if (depthError) return fail("depth", depthError);
+
+  const p = jobPaths(id);
+  const nowMs = (opts.now || new Date()).getTime();
+  const caps = resolveCaps(opts.caps);
+  const reserved = await withStartLock(JOB_ROOT, () => {
+    if (fs.existsSync(p.d)) return fail("duplicate", `jobId ${id} already exists`);
+    const capError = checkCaps({ running: countActiveJobs(nowMs), startsInWindow: recentStarts(JOB_ROOT, nowMs).length,
+                                 caps, hostLabel });
+    if (capError) return fail(capError.errorCode, capError.error);
+    // Non-recursive mkdir is the atomic duplicate check (EEXIST), even against a racer that
+    // bypassed the lock; JOB_ROOT itself is created at module load.
+    try { fs.mkdirSync(p.d); }
+    catch (e) {
+      return e.code === "EEXIST" ? fail("duplicate", `jobId ${id} already exists`)
+                                 : fail("invalid", `could not create job dir: ${e.message}`);
+    }
+    recordStart(JOB_ROOT, nowMs);
+    return { ok: true };
+  });
+  if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
+
   const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   const resolvedModel = model || DEFAULT_MODEL;
   argv.push("--model", resolvedModel);
@@ -472,11 +579,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
-  const { pid, pidSource, jobMembership, launchPath } = await launch(p, CLAUDE_BIN, argv, cwd);
+  // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
+  const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
+  const { pid, pidSource, jobMembership, launchPath } =
+    await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
-  const meta = { jobId: id, pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
-                 workFolder: cwd, model: resolvedModel, effort: eff,
+  const meta = { jobId: id, ...(opts.host ? { host: opts.host } : {}), hostname,
+                 pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
+                 workFolder: cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
@@ -484,12 +595,14 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const note = cardError
     ? `UNCARDED: ${cardError} — Job detached. Poll with claude_check(jobId). Safe across bridge restarts.`
     : "Job detached. Poll with claude_check(jobId). Safe across bridge restarts.";
-  return { ...meta, status: "running", note };
+  return { ...meta, status: "running", preflight: PREFLIGHT_OK, note };
 }
 
 export function checkJob(id, tailBytes = 8000) {
+  const hostname = os.hostname();
+  if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
-  if (!fs.existsSync(p.meta)) return { jobId: id, status: "unknown", error: "no such job" };
+  if (!fs.existsSync(p.meta)) return { jobId: id, hostname, status: "unknown", error: "no such job" };
   const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
   let state, exitCode = null, finishedAt = null;
   const extra = {};
@@ -556,7 +669,7 @@ export function checkJob(id, tailBytes = 8000) {
 
   const runnerJobMembership = readRunnerJobMembership(p);
 
-  return { ...meta, status: state, exitCode, finishedAt, ...extra,
+  return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
@@ -574,56 +687,6 @@ export function listJobs() {
     if (s.pidNote) row.pidNote = s.pidNote;
     return row;
   }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
-}
-
-export function registerTools(server) {
-  const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
-
-  server.registerTool("claude_start", {
-    description: "Start a Claude Code task as a detached background job and return a jobId immediately. " +
-                 "Use for any work that might run longer than ~30s. Poll with claude_check.",
-    inputSchema: {
-      prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
-      intent: z.string().optional().describe("Optional one-line intent that becomes the dispatch card's " +
-                  "TITLE (the board face most users actually see — the jobId never appears there). " +
-                  "When supplied it is used verbatim (bounded); otherwise a heuristic summary of the " +
-                  "prompt's opener is used. Prefer supplying this for a clean card face."),
-      workFolder: z.string().optional().describe("Directory to run in (default: $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
-      jobId: z.string().optional().describe("Custom job id; otherwise one is generated."),
-      model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-5. " +
-                  "Default claude-sonnet-5 (fail-safe; override via CLAUDE_ASYNC_DEFAULT_MODEL)."),
-      effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultracode"]).optional()
-        .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
-                  "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),
-    },
-  }, async (args) => ok(await startJob(args)));
-
-  server.registerTool("claude_check", {
-    description: "Check a background job's status and recent output. Returns status " +
-                 "(running | completed | failed | died | timed_out), exit code, and a tail of stdout/stderr. " +
-                 "running may include elapsed and lastAlive fields; stalled:true means heartbeat is stale " +
-                 "but pid is still alive. died means the process exited without recording a result. " +
-                 "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h). " +
-                 "On win32, launchPath reports which launch mechanism was used (\"task\": Task Scheduler, " +
-                 "the default; \"breakaway-fallback\": win32-breakaway.ps1, used only if the task path " +
-                 "failed; \"spawn\": non-win32). jobMembership (recorded at launch) and " +
-                 "runnerJobMembership (refreshed every heartbeat by the runner itself) report Windows Job " +
-                 "Object membership, but inJob:true alone is NOT proof of an escape failure -- Windows " +
-                 "places most console-attached processes into a default per-console job with identical " +
-                 "limitFlags (0x3C00) regardless of ancestry, confirmed via RUNBOOK.md's verification. " +
-                 "Trust the survival behavior (test/survival.mjs), not this flag, when in doubt.",
-    inputSchema: {
-      jobId: z.string(),
-      tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
-    },
-  }, async ({ jobId, tailBytes }) => ok(checkJob(jobId, tailBytes || 8000)));
-
-  server.registerTool("claude_jobs", {
-    description: "List all known background jobs with their current status.",
-    inputSchema: {},
-  }, async () => ok({ count: listJobs().length, jobs: listJobs() }));
-
-  return server;
 }
 
 export async function runSelfTest() {

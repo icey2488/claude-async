@@ -6,7 +6,9 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node claude-async-server.mjs",
-    "selftest": "node claude-async-server.mjs --selftest"
+    "selftest": "node claude-async-server.mjs --selftest",
+    "test:multihost": "node --test \"test/multihost/*.test.mjs\"",
+    "host-api": "node host-api.mjs"
   },
   "keywords": [],
   "author": "",
