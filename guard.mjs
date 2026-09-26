@@ -131,7 +131,14 @@ function loadLedger(jobRoot, nowMs) {
     const parsed = JSON.parse(fs.readFileSync(ledgerPath(jobRoot), "utf8"));
     if (Array.isArray(parsed)) arr = parsed;
   } catch { /* fall through to rebuild */ }
-  if (arr) return { starts: arr.filter((t) => typeof t === "number" && nowMs - t < WINDOW_MS && t <= nowMs), rebuilt: false };
+  // Same clock-skew rule as rebuildStarts: an entry up to WINDOW_MS in the FUTURE (the clock stepped
+  // backward since it was recorded) is kept, clamped to now, so it ages out normally. Dropping it
+  // would empty the window and fail open; only implausibly distant futures are discarded.
+  if (arr) {
+    const starts = arr.filter((t) => typeof t === "number" && nowMs - t < WINDOW_MS && t - nowMs < WINDOW_MS)
+      .map((t) => Math.min(t, nowMs));
+    return { starts, rebuilt: false };
+  }
   const starts = rebuildStarts(jobRoot, nowMs);
   try { writeJsonAtomic(ledgerPath(jobRoot), starts, { space: 0 }); } catch {}
   return { starts, rebuilt: true };

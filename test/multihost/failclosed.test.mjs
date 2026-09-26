@@ -170,6 +170,36 @@ test("a corrupt ledger does not lock out all starts: with no recent dirs, the re
   assert.equal(JSON.parse(fs.readFileSync(ledger(), "utf8")).length, 1);
 });
 
+// A backward clock step leaves ledger entries in the future. They must still count (clamped to now),
+// exactly like rebuildStarts treats future dir times, or the rate cap silently opens.
+const CAPS6 = { maxConcurrent: 100, maxStartsPerMinute: 6 };
+
+test("a valid ledger with 6 entries 30s in the future (clock stepped back) still blocks the 7th start", async () => {
+  const now = new Date(2026, 8, 25, 12, 0, 0);
+  fs.writeFileSync(ledger(), JSON.stringify(Array.from({ length: 6 }, (_, i) => now.getTime() + 30_000 + i)));
+  const r = await start(now, { caps: CAPS6 });
+  assert.equal(r.errorCode, "cap_rate");
+  assert.match(r.error, /6 starts in the last 60s [(]max 6 per minute[)]; no job started/);
+  assert.equal(tickets().length, 0);
+  assert.equal(jobDirs().length, 0);
+});
+
+test("future ledger entries are clamped to now when read, and recordStart persists them clamped so they age out 60s after now", () => {
+  const now = new Date(2026, 8, 25, 12, 0, 0).getTime();
+  fs.writeFileSync(ledger(), JSON.stringify([now + 30_000, now + 10_000, now - 5_000]));
+  assert.deepEqual(guard.recentStarts(JOBS, now), [now, now, now - 5_000]);
+  guard.recordStart(JOBS, now);
+  assert.deepEqual(JSON.parse(fs.readFileSync(ledger(), "utf8")), [now, now, now - 5_000, now]);
+  assert.equal(guard.recentStarts(JOBS, now + 59_000).length, 3, "the clamped entries are still inside the window");
+  assert.equal(guard.recentStarts(JOBS, now + 61_000).length, 0, "and gone 60s after now, not 60s after their raw future time");
+});
+
+test("ledger entries a full window or more in the future, and non-numbers, are discarded (same bound as rebuildStarts)", () => {
+  const now = new Date(2026, 8, 25, 12, 0, 0).getTime();
+  fs.writeFileSync(ledger(), JSON.stringify([now + 60_000, now + 3_600_000, "x", null, now - 61_000, now + 59_000]));
+  assert.deepEqual(guard.recentStarts(JOBS, now), [now]);
+});
+
 test("dirCreatedMs is the earlier of birthtime and mtime (a heartbeat-touched dir does not look new)", () => {
   const dir = path.join(JOBS, "born");
   fs.mkdirSync(dir);
