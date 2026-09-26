@@ -159,6 +159,13 @@ host). Success says exactly `preflight passed, execution unverified`: the runner
 and records that in the job. `CLAUDE_ASYNC_DEPTH` / `X-Claude-Async-Depth` (depth > 1 rejected)
 is an **accident guard only, not a security control**. Anyone can send any value.
 
+The guard **fails closed on corrupt state**. A job dir whose `meta.json` is missing or unreadable
+still counts as running if it changed in the last 2 minutes; an older one is not counted but is named
+in a `warnings` array on the start response (repair or delete it). A missing or corrupt
+`.start-ledger.json` is rebuilt from the job dirs created in the last 60 s, never treated as empty.
+State files (`meta.json`, tickets, the ledger, `last-seen.json`, `api.json`) are written
+atomically (temp file + rename), so a crash mid-write cannot truncate them.
+
 ## How it works
 
 `claude_start` writes a small job record and spawns a detached worker
