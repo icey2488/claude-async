@@ -9,9 +9,16 @@
 //   CLAIM_LAUNCHER_ROUNDS                                        real-launcher rounds
 //   CLAIM_RACE_VARIANT=old      run the race harness against the pre-fix rename-only claim and REPORT
 //                               the double-claim count instead of asserting zero (proves the harness
-//                               catches the bug)
+//                               catches the bug). The real-launcher tests then need CLAIM_TEST_LAUNCHER
+//                               (an old job-launcher copy) and are skipped with a message without it, so
+//                               the NEW launcher is never run under an OLD label.
+//   CLAIM_RACE_STRICT=1         with the old variant: apply the normal assertions instead of reporting,
+//                               i.e. show that the old claim FAILS this test
 //   CLAIM_TEST_LAUNCHER=<path>  launcher script for the real-launcher variant (default: the repo's
 //                               job-launcher.mjs); must sit in the repo dir to resolve its imports
+// The concurrency tests also assert that they really were concurrent (no worker released more than
+// 5 ms after the shared instant; median start spread under MAX_MEDIAN_SPREAD_MS): a run whose workers
+// were not aligned proves nothing, so it fails with the timing summary instead of passing.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { fork, spawn, spawnSync } from "node:child_process";
@@ -29,6 +36,7 @@ after(() => { try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch {
 
 const IS_WIN = process.platform === "win32";
 const OLD = process.env.CLAIM_RACE_VARIANT === "old";
+const REPORT_ONLY = OLD && !process.env.CLAIM_RACE_STRICT;
 const nowHr = () => performance.timeOrigin + performance.now();
 const DEAD_PID = 2_000_000_000; // above every real pid range: process.kill(pid, 0) -> ESRCH
 let dirSeq = 0;
@@ -358,7 +366,15 @@ test("identity: our own lock and marker are still removed on the normal paths (n
 const ROUNDS = Number(process.env.CLAIM_RACE_ROUNDS) || (IS_WIN ? 600 : 300);
 const WORKERS = Number(process.env.CLAIM_RACE_WORKERS) || 4;
 const TICKETS = Number(process.env.CLAIM_RACE_TICKETS) || 3;
-const LEAD_MS = 20; // head start between "go" being sent and the instant every worker starts claiming
+// Head start between "go" being sent and the instant every worker starts claiming. It has to cover the
+// IPC delivery to the slowest worker even on a loaded box; 20 ms was measured fine on an idle one, 50 ms
+// leaves headroom. (Measured on Claunker, idle: every worker released within a few microseconds.)
+const LEAD_MS = 50;
+const MAX_LATE_MS = 5; // a worker released this long after the shared instant did not race anyone
+// Median gap between the first and last worker's claim start in a round. Measured ~0.003 ms on an idle
+// Claunker (RUNBOOK); 1 ms is ~300x that, yet far below the several ms of startup jitter that lets
+// claims serialise and the old rename-only bug hide.
+const MAX_MEDIAN_SPREAD_MS = 1;
 const WORKER = path.join(HERE, "claim-worker.mjs");
 
 async function startWorkers(n) {
@@ -384,13 +400,39 @@ function runRound(workers, round, queueDir) {
 
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : 0; };
 
+// Alignment bookkeeping for the concurrency tests: a "race" whose workers were not released together
+// (loaded box, slow IPC) is not a race, so it must FAIL with its timing rather than pass vacuously.
+// Only aligned rounds count toward the target. A round with a worker released more than MAX_LATE_MS after
+// the shared instant is still checked for double claims (a double is a double) but does not count and is
+// redone, within a budget of 2% of the target: even on an idle 16-core box the OS occasionally deschedules
+// one spinning worker for a few ms (about 1 round in 300 here), so "zero late rounds" outright would fail
+// healthy runs, while a run that is misaligned as a whole blows the budget and fails with its timing.
+const lateBudget = (target) => Math.max(2, Math.ceil(target * 0.02));
+function newAlignment(target) { return { target, spreads: [], lateRounds: 0 }; }
+// Returns true if the round was aligned (and so counts).
+function noteAlignment(al, starts, lates) {
+  if (lates.some((l) => l > MAX_LATE_MS)) { al.lateRounds++; return false; }
+  al.spreads.push(Math.max(...starts) - Math.min(...starts));
+  return true;
+}
+const alignmentOver = (al) => al.lateRounds > lateBudget(al.target);
+const alignmentText = (al) => `claim start spread median ${median(al.spreads).toFixed(3)} ms, max ${al.spreads.length ? Math.max(...al.spreads).toFixed(3) : "n/a"} ms over ` +
+  `${al.spreads.length}/${al.target} aligned rounds; ${al.lateRounds} rounds discarded for a worker >${MAX_LATE_MS} ms late (budget ${lateBudget(al.target)}; ` +
+  `limits: median spread < ${MAX_MEDIAN_SPREAD_MS} ms)`;
+function assertAligned(al, summary) {
+  const why = `workers were not aligned, so the race proved nothing: ${summary}`;
+  assert.ok(al.lateRounds <= lateBudget(al.target), why);
+  assert.equal(al.spreads.length, al.target, why);
+  assert.ok(median(al.spreads) < MAX_MEDIAN_SPREAD_MS, why);
+}
+
 test(`claim race: ${WORKERS} aligned launchers x ${ROUNDS} rounds x ${TICKETS} tickets -> no ticket claimed twice, none lost`,
   { timeout: 900_000 }, async (t) => {
     const workers = await startWorkers(WORKERS);
-    const doubles = [], lost = [], leftovers = [], spreads = [];
-    let late = 0;
+    const doubles = [], lost = [], leftovers = [];
+    const align = newAlignment(ROUNDS);
     try {
-      for (let r = 0; r < ROUNDS; r++) {
+      for (let r = 0; align.spreads.length < ROUNDS && !alignmentOver(align); r++) {
         const dir = mkQueue(`race${r}`);
         const ids = Array.from({ length: TICKETS }, (_, i) => `r${r}-t${i}`);
         for (const id of ids) putTicket(dir, id);
@@ -403,35 +445,35 @@ test(`claim race: ${WORKERS} aligned launchers x ${ROUNDS} rounds x ${TICKETS} t
         const extra = fs.readdirSync(dir).filter((f) => !f.endsWith(".claimed.json"));
         if (extra.length) leftovers.push(`round ${r}: ${extra.join(", ")}`);
 
-        const starts = replies.map((x) => x.startedAt);
-        spreads.push(Math.max(...starts) - Math.min(...starts));
-        if (replies.some((x) => x.late > 5)) late++;
+        noteAlignment(align, replies.map((x) => x.startedAt), replies.map((x) => x.late));
         fs.rmSync(dir, { recursive: true, force: true });
       }
     } finally { stopWorkers(workers); }
 
-    const summary = `${OLD ? "OLD rename-only claim" : "lock claim"}: ${ROUNDS} rounds, ${WORKERS} workers, ${TICKETS} tickets/round: ` +
-      `${doubles.length} double-claimed tickets, ${lost.length} lost, ${leftovers.length} rounds with leftovers; ` +
-      `claim start spread median ${median(spreads).toFixed(3)} ms, max ${Math.max(...spreads).toFixed(3)} ms; ${late} rounds with a late worker`;
+    const summary = `${OLD ? "OLD rename-only claim" : "lock claim"}: ${align.spreads.length + align.lateRounds} rounds run, ${WORKERS} workers, ${TICKETS} tickets/round: ` +
+      `${doubles.length} double-claimed tickets, ${lost.length} lost, ${leftovers.length} rounds with leftovers; ${alignmentText(align)}`;
     t.diagnostic(summary);
-    if (OLD) { console.log(summary); return; } // measuring the bug, not asserting
+    assertAligned(align, summary);
+    if (REPORT_ONLY) { console.log(summary); return; } // measuring the bug, not asserting
     assert.deepEqual(doubles, [], summary);
     assert.deepEqual(lost, [], summary);
     assert.deepEqual(leftovers, [], `${summary}\nno .lock/.lock.break/.json may remain after a drained queue`);
   });
 
 test(`stale-lock break race: ${WORKERS} aligned launchers find the same stale lock x ${Math.min(ROUNDS, 300)} rounds -> claimed exactly once, broken exactly once`,
-  { timeout: 900_000, skip: OLD ? "only meaningful for the lock protocol" : false }, async () => {
+  { timeout: 900_000, skip: OLD ? "only meaningful for the lock protocol" : false }, async (t) => {
     const rounds = Math.min(ROUNDS, 300);
     const workers = await startWorkers(WORKERS);
     const problems = [];
+    const align = newAlignment(rounds);
     try {
-      for (let r = 0; r < rounds; r++) {
+      for (let r = 0; align.spreads.length < rounds && !alignmentOver(align); r++) {
         const dir = mkQueue(`stale${r}`);
         const id = `s${r}`;
         putTicket(dir, id);
         putLock(dir, id, { pid: DEAD_PID, ageMs: STALE_AGE });
         const replies = await runRound(workers, r, dir);
+        noteAlignment(align, replies.map((x) => x.startedAt), replies.map((x) => x.late));
         const claimers = replies.filter((x) => x.claimed.includes(`${id}.claimed.json`)).length;
         const breaks = replies.flatMap((x) => x.logs).filter((l) => /BROKE stale claim lock/.test(l)).length;
         const extra = fs.readdirSync(dir).filter((f) => !f.endsWith(".claimed.json"));
@@ -441,7 +483,10 @@ test(`stale-lock break race: ${WORKERS} aligned launchers find the same stale lo
         fs.rmSync(dir, { recursive: true, force: true });
       }
     } finally { stopWorkers(workers); }
-    assert.deepEqual(problems, []);
+    const summary = `stale-lock break: ${align.spreads.length + align.lateRounds} rounds run, ${WORKERS} workers, ${problems.length} problems; ${alignmentText(align)}`;
+    t.diagnostic(summary);
+    assertAligned(align, summary);
+    assert.deepEqual(problems, [], summary);
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -454,7 +499,13 @@ const STUB_RUNNER = path.join(HERE, "claim-stub-runner.mjs");
 const LAUNCHER_ROUNDS = Number(process.env.CLAIM_LAUNCHER_ROUNDS) || 120;
 const LAUNCHERS = 3;
 const BATCH = 4; // rounds run side by side (each in its own home + queue), sharing one go-instant
-const realIt = IS_WIN ? test : test.skip; // the launcher is the Windows Task Scheduler entry point
+// The launcher is the Windows Task Scheduler entry point. Under CLAIM_RACE_VARIANT=old the tests only make
+// sense against an old launcher copy the caller names; without one they would run the NEW launcher under
+// an OLD label, so they skip with that said.
+const realSkip = !IS_WIN ? "the launcher is the Windows Task Scheduler entry point"
+  : OLD && !process.env.CLAIM_TEST_LAUNCHER ? "CLAIM_RACE_VARIANT=old needs CLAIM_TEST_LAUNCHER=<old job-launcher copy in the repo dir> (RUNBOOK has the recipe); refusing to run the NEW launcher labelled OLD"
+  : false;
+const realIt = (name, opts, fn) => test(name, { ...opts, skip: realSkip || opts.skip || false }, fn);
 
 function launcherEnv(home, goAt) {
   return { ...process.env, USERPROFILE: home, HOME: home, CLAUDE_ASYNC_JOB_DIR: path.join(home, "jobs"),
@@ -507,14 +558,22 @@ realIt(`real job-launcher.mjs: ${LAUNCHERS} copies x ${LAUNCHER_ROUNDS} rounds a
   { timeout: 900_000 }, async (t) => {
     assertLauncherHomeIsTemp(makeHome("safety", []).home);
     const problems = [];
+    const align = newAlignment(LAUNCHER_ROUNDS);
     const all = []; // { ids, jobDirs } per round, for the after-the-fact runner check
-    for (let start = 0; start < LAUNCHER_ROUNDS; start += BATCH) {
-      const ks = Array.from({ length: Math.min(BATCH, LAUNCHER_ROUNDS - start) }, (_, i) => start + i);
+    // Rounds whose launchers were not released together are checked but redone (see noteAlignment).
+    for (let start = 0; align.spreads.length < LAUNCHER_ROUNDS && !alignmentOver(align);) {
+      const ks = Array.from({ length: Math.min(BATCH, LAUNCHER_ROUNDS - align.spreads.length) }, (_, i) => start + i);
+      start += ks.length;
       const homes = ks.map((k) => makeHome(`lr${k}`, Array.from({ length: LAUNCHERS }, (_, i) => `lr${k}-job${i}`)));
       const goAt = nowHr() + 600; // enough for every process to boot and pre-import before the spin ends
       const exits = await Promise.all(homes.flatMap((h) => Array.from({ length: LAUNCHERS }, () => runLauncher(h.home, goAt))));
-      if (exits.some((c) => c !== 0)) problems.push(`batch at round ${start}: launcher exit codes ${JSON.stringify(exits)}`);
+      if (exits.some((c) => c !== 0)) problems.push(`batch at round ${ks[0]}: launcher exit codes ${JSON.stringify(exits)}`);
       homes.forEach((h, i) => {
+        // The preload's release instants: how close together this round's launchers really were.
+        const gos = fs.readdirSync(h.home).filter((f) => /^go-\d+\.json$/.test(f))
+          .map((f) => JSON.parse(fs.readFileSync(path.join(h.home, f), "utf8")));
+        if (gos.length !== LAUNCHERS) problems.push(`round ${ks[i]}: ${gos.length} launchers recorded a release time, expected ${LAUNCHERS}`);
+        else noteAlignment(align, gos.map((g) => g.releasedAt), gos.map((g) => g.releasedAt - g.goAt));
         const ids = h.jobDirs.map((d) => path.basename(d));
         const counts = new Map();
         for (const id of claimedIds(h.queue)) counts.set(id, (counts.get(id) || 0) + 1);
@@ -540,14 +599,17 @@ realIt(`real job-launcher.mjs: ${LAUNCHERS} copies x ${LAUNCHER_ROUNDS} rounds a
       const n = runFiles(d).length;
       if (n !== 1) { runDoubles++; problems.push(`${path.basename(d)}: runner started ${n}x`); }
     }
-    const summary = `${OLD ? "OLD launcher" : "launcher"}: ${LAUNCHER_ROUNDS} rounds x ${LAUNCHERS} copies: ` +
-      `${claimDoubles} double-claimed tickets, ${runDoubles} jobs not started exactly once, ${problems.length} problems`;
+    const summary = `${OLD ? "OLD launcher" : "launcher"} (${path.basename(LAUNCHER)}): ${align.spreads.length + align.lateRounds} rounds x ${LAUNCHERS} copies: ` +
+      `${claimDoubles} double-claimed tickets, ${runDoubles} jobs not started exactly once, ${problems.length} problems; ` +
+      `launcher release ${alignmentText(align)}`;
     t.diagnostic(summary);
-    if (OLD) { console.log(summary); console.log(problems.slice(0, 20).join("\n")); return; }
+    assertAligned(align, summary);
+    if (REPORT_ONLY) { console.log(summary); console.log(problems.slice(0, 20).join("\n")); return; }
     assert.deepEqual(problems, [], summary);
   });
 
-realIt("real job-launcher.mjs: a stale lock (dead owner) is broken and logged; a fresh lock is left alone", { timeout: 60_000 }, async () => {
+realIt("real job-launcher.mjs: a stale lock (dead owner) is broken and logged; a fresh lock is left alone",
+  { timeout: 60_000, skip: OLD ? "only meaningful for the lock protocol" : false }, async () => {
   const stale = makeHome("real-stale", ["s1"]);
   assertLauncherHomeIsTemp(stale.home);
   putLock(stale.queue, "s1", { pid: DEAD_PID, ageMs: STALE_AGE });
