@@ -391,9 +391,14 @@ export function writeLaunchTicket(p, extraEnv = {}) {
 // inside that job to breakaway from it (win32-breakaway.ps1's approach, which still left runners
 // self-reporting membership in a job with KILL_ON_JOB_CLOSE set -- see RUNBOOK.md). Returns null
 // on any failure of the task path itself (registration, /Run, or the runner never showing up in
-// time) so launchWin32() can fall back to win32-breakaway.ps1; never throws.
-async function launchWin32Task(p, extraEnv) {
-  const reg = ensureLauncherTask();
+// time) so launchWin32() can fall back to win32-breakaway.ps1; never throws. That includes a failed
+// launch-ticket write: it is logged to err.log and treated like a failed /Run, so the breakaway
+// fallback still launches the job instead of startJob throwing with a reserved dir and no runner.
+// seams (tests only): ensureTask, writeTicket, runTask replace the schtasks-touching steps.
+export async function launchWin32Task(p, extraEnv, seams = {}) {
+  const { ensureTask = ensureLauncherTask, writeTicket = writeLaunchTicket,
+          runTask = () => spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" }) } = seams;
+  const reg = ensureTask();
   if (!reg.ok) {
     try { fs.appendFileSync(p.err, `\n[job-core] ensureLauncherTask() failed: ${reg.error}\n`); } catch {}
     return null;
@@ -402,9 +407,13 @@ async function launchWin32Task(p, extraEnv) {
   // Same defense-in-depth as launchWin32Breakaway(): a stray runner.pid must never survive from
   // a prior occupant of this job dir.
   try { fs.unlinkSync(path.join(p.d, "runner.pid")); } catch {}
-  writeLaunchTicket(p, extraEnv);
+  try { writeTicket(p, extraEnv); }
+  catch (e) {
+    try { fs.appendFileSync(p.err, `\n[job-core] launch ticket could not be written: ${e.message}\n`); } catch {}
+    return null;
+  }
 
-  const run = spawnSync("schtasks", ["/Run", "/TN", TASK_NAME], { encoding: "utf8" });
+  const run = runTask();
   if (run.status !== 0) {
     try { fs.appendFileSync(p.err, `\n[job-core] schtasks /Run /TN ${TASK_NAME} failed (status=${run.status}): ` +
       `${(run.stdout || "").trim()} ${(run.stderr || "").trim()}\n`); } catch {}
@@ -430,15 +439,18 @@ async function launchWin32Task(p, extraEnv) {
   return { pid, pidSource, jobMembership, launchPath: "task" };
 }
 
-async function launchWin32(p, extraEnv) {
-  if (WIN32_LAUNCH_MODE !== "breakaway") {
-    const viaTask = await launchWin32Task(p, extraEnv);
+// seams (tests only): mode overrides WIN32_LAUNCH_MODE, breakaway replaces launchWin32Breakaway, and
+// the rest are passed through to launchWin32Task.
+export async function launchWin32(p, extraEnv, seams = {}) {
+  const { mode = WIN32_LAUNCH_MODE, breakaway = launchWin32Breakaway } = seams;
+  if (mode !== "breakaway") {
+    const viaTask = await launchWin32Task(p, extraEnv, seams);
     if (viaTask) return viaTask;
     try { fs.appendFileSync(p.err,
       "\n[job-core] Task Scheduler launch path unavailable/failed; falling back to win32-breakaway.ps1\n");
     } catch {}
   }
-  const viaBreakaway = await launchWin32Breakaway(p, extraEnv);
+  const viaBreakaway = await breakaway(p, extraEnv);
   return { ...viaBreakaway, launchPath: "breakaway-fallback" };
 }
 
