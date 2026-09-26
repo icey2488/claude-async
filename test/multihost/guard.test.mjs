@@ -41,11 +41,50 @@ test("caps: 5th concurrent start rejected, no ticket, no job dir", async () => {
   assert.ok(!r6.error, r6.error);
 });
 
-test("caps: a reserved-but-not-yet-launched job dir counts as running", async () => {
-  for (let i = 0; i < 4; i++) fs.mkdirSync(path.join(JOBS, `inflight-${i}`)); // no meta.json yet
-  const r = await start(at(0));
-  assert.equal(r.errorCode, "cap_concurrent");
-  assert.equal(tickets().length, 0);
+// The clock is frozen at three different times of day and every dir mtime is set explicitly
+// relative to that frozen clock (fs.utimesSync), so nothing compares a frozen clock to a real
+// filesystem timestamp. (The first version of this test passed only because a noon "now" minus a
+// real mkdir mtime went negative whenever the suite ran after noon.)
+const FROZEN_CLOCKS = [["06:00", 6, 0], ["12:00", 12, 0], ["23:59", 23, 59]];
+const frozenAt = (h, m) => { const d = new Date(); d.setHours(h, m, 0, 0); return d; };
+const reserveDir = (name, mtimeMs) => { // a dir reserved by a start whose launch has not written meta.json yet
+  const dir = path.join(JOBS, name);
+  fs.mkdirSync(dir);
+  fs.utimesSync(dir, new Date(mtimeMs), new Date(mtimeMs));
+};
+
+for (const [label, h, m] of FROZEN_CLOCKS) {
+  test(`caps: a reserved-but-not-yet-launched job dir counts as running (clock frozen at ${label})`, async () => {
+    const now = frozenAt(h, m);
+    for (let i = 0; i < 4; i++) reserveDir(`inflight-${i}`, now.getTime() - 30_000 - i * 1000); // no meta.json yet
+    const r = await start(now);
+    assert.equal(r.errorCode, "cap_concurrent");
+    assert.match(r.error, /: 4 jobs already running [(]max 4 concurrent[)]/);
+    assert.equal(tickets().length, 0);
+    assert.equal(jobDirs().length, 4);
+  });
+
+  test(`caps: a reserved dir older than the 2 min window is NOT counted, and is surfaced (clock frozen at ${label})`, async () => {
+    const now = frozenAt(h, m);
+    for (let i = 0; i < 4; i++) reserveDir(`stale-${i}`, now.getTime() - 3 * 60_000);
+    const r = await start(now);
+    assert.ok(!r.error, r.error);
+    assert.equal(r.warnings.length, 4);
+    for (let i = 0; i < 4; i++) assert.ok(r.warnings.some((w) => w.includes(`stale-${i}`)), `warning names stale-${i}`);
+    assert.match(r.warnings[0], /has no meta[.]json/);
+    assert.equal(tickets().length, 1);
+  });
+}
+
+test("caps: the reservation window edge is exactly 2 minutes, measured against the frozen clock", async () => {
+  const now = frozenAt(12, 0);
+  reserveDir("edge-in", now.getTime() - 119_000);
+  reserveDir("edge-out", now.getTime() - 121_000);
+  const r = await start(now, { caps: { maxConcurrent: 1, maxStartsPerMinute: 100 } });
+  assert.equal(r.errorCode, "cap_concurrent", "the 119s-old reservation counts, filling the single slot");
+  assert.match(r.error, /: 1 jobs already running/);
+  assert.equal(r.warnings.length, 1);
+  assert.match(r.warnings[0], /edge-out/);
 });
 
 test("caps: 7th start within a minute rejected, no ticket; window rolls", async () => {
