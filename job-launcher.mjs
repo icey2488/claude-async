@@ -27,10 +27,12 @@
  *      JOB_ROOT-overridden) directory as an absolute path instead.
  *   2. Task Scheduler spawns a fresh instance of THIS script (MultipleInstances=Parallel, so
  *      concurrent claude_start calls each get their own instance running at the same time).
- *   3. Each instance scans LAUNCHER_QUEUE_DIR for *.json tickets without a matching
- *      *.claimed.json, and claims AT MOST ONE by atomically renaming <jobId>.json ->
- *      <jobId>.claimed.json (fs.renameSync -- MoveFileExW is atomic on the same NTFS volume; a
- *      losing instance sees ENOENT and moves on to the next candidate).
+ *   3. Each instance scans LAUNCHER_QUEUE_DIR for *.json tickets (not *.claimed.json) and claims AT
+ *      MOST ONE, under an exclusive-create lock (<jobId>.lock, fs.openSync "wx") and then renaming
+ *      <jobId>.json -> <jobId>.claimed.json. The lock is required: two concurrent renameSync calls
+ *      on the same ticket can BOTH succeed on Windows, so the rename alone let one job run twice.
+ *      An instance that loses the lock moves on to the next candidate. The whole protocol, including
+ *      stale-lock handling, lives in launcher-claim.mjs.
  *   4. The winning instance spawns job-runner.mjs (detached, unref'd, stdio ignored -- it opens
  *      its own out/err files from spec.json) and writes launched.marker (with the runner's pid)
  *      into the JOB's own directory (from the ticket), not the queue dir.
@@ -50,6 +52,7 @@ import os from "node:os";
 import path from "node:path";
 import { sanitizeEnvForWin32, logIfPathextSanitized, LAUNCHER_QUEUE_DIR } from "./job-core.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
+import { claimOneTicket } from "./launcher-claim.mjs";
 
 function log(line) {
   try {
@@ -96,42 +99,8 @@ function resolveCommand(command, env) {
   return command;
 }
 
-// Finds one unclaimed ticket in LAUNCHER_QUEUE_DIR (a *.json file, excluding already-claimed
-// *.claimed.json ones) and atomically claims it by renaming <jobId>.json -> <jobId>.claimed.json
-// in that same fixed directory. Returns { claimedPath, ticket } or null if nothing was claimable
-// (either nothing pending, or every candidate lost its race to another launcher instance).
-function claimOneTicket() {
-  let entries;
-  try { entries = fs.readdirSync(LAUNCHER_QUEUE_DIR); }
-  catch (e) { log(`readdir(${LAUNCHER_QUEUE_DIR}) failed: ${e.message}`); return null; }
-
-  for (const name of entries) {
-    if (!name.endsWith(".json") || name.endsWith(".claimed.json")) continue;
-    const ticketPath = path.join(LAUNCHER_QUEUE_DIR, name);
-    const claimedPath = path.join(LAUNCHER_QUEUE_DIR, name.replace(/\.json$/, ".claimed.json"));
-
-    try {
-      fs.renameSync(ticketPath, claimedPath);
-    } catch (e) {
-      // Another instance won the race (ENOENT: it already renamed the ticket away) or some other
-      // transient issue -- either way, this ticket isn't ours; try the next candidate.
-      log(`lost claim race for ${name}: ${e.message}`);
-      continue;
-    }
-
-    let ticket;
-    try { ticket = JSON.parse(fs.readFileSync(claimedPath, "utf8")); }
-    catch (e) {
-      log(`claimed ${name} but it was unparseable: ${e.message}`);
-      return { claimedPath, ticket: null };
-    }
-    return { claimedPath, ticket };
-  }
-  return null;
-}
-
 function main() {
-  const claim = claimOneTicket();
+  const claim = claimOneTicket({ queueDir: LAUNCHER_QUEUE_DIR, log });
   if (!claim) {
     log("no pending ticket found; exiting quietly");
     process.exit(0);
