@@ -82,9 +82,9 @@ If you'd rather not use the prompt above, or you're not on Windows:
 
 | Tool | Input | Returns |
 |---|---|---|
-| `claude_start` | `prompt` (required), `workFolder?`, `jobId?`, `model?` | `jobId` immediately; the job runs detached |
-| `claude_check` | `jobId` (required), `tailBytes?` | `status`, `exitCode`, and a tail of stdout/stderr |
-| `claude_jobs` | — | every known job with its current status |
+| `claude_start` | `host` (required: `claunker` \| `laptop`), `prompt` (required), `workFolder?`, `jobId?` (descriptor), `model?`, `effort?`, `intent?` | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
+| `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
+| `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
 `status` is one of `running | completed | failed | orphaned | unknown`. `completed` is
 reported only when the job exited with code 0; a non-zero exit is `failed`.
@@ -102,6 +102,62 @@ Optional environment variables:
 | `CLAUDE_ASYNC_DEFAULT_CWD` | `$HOME` | Default working directory for jobs |
 | `CLAUDE_ASYNC_DEFAULT_MODEL` | `claude-sonnet-5` | Model used when `claude_start`'s `model` param is omitted |
 | `CLAUDE_ASYNC_DEFAULT_EFFORT` | `medium` | Reasoning effort used when `claude_start`'s `effort` param is omitted |
+| `CLAUDE_ASYNC_CONFIG_DIR` | `~/.claude-async` | Where `hosts.json`, `api.json`, `last-seen.json` live (see Multi-host) |
+| `CLAUDE_ASYNC_MAX_CONCURRENT` | `4` | Max running jobs on this host (`hosts.json` `caps.maxConcurrent` wins) |
+| `CLAUDE_ASYNC_MAX_STARTS_PER_MINUTE` | `6` | Max starts per rolling 60s on this host (`hosts.json` `caps.maxStartsPerMinute` wins) |
+
+## Multi-host (Claunker + laptop)
+
+Two hosts, one-way: **`claunker` is the only remote dispatch target**; the laptop never
+exposes an API. `claude_start` requires `host` (no default):
+
+| This machine (`localHost`) | `host: claunker` | `host: laptop` |
+|---|---|---|
+| `laptop` | forwarded to Claunker's host API over Tailscale | runs locally (fallback when Claunker is offline) |
+| `claunker` | runs locally | error: `laptop is not a remote dispatch target` |
+
+Job ids are `<host>.<descriptor>-YYYYMMDD-<8 random [a-z0-9]>`, minted by the executing host.
+A prefix counts only if it exactly matches `claunker`/`laptop`, so older un-prefixed ids are
+still checked locally. The forwarder stores nothing: the job record lives only on the executing
+host, and `claude_check` / `claude_jobs` ask it live.
+
+**Config (user profile, never the repo; `CLAUDE_ASYNC_CONFIG_DIR` overrides the directory):**
+
+- `~/.claude-async/hosts.json` (both machines). Local-host identity is explicit, never guessed:
+
+  ```json
+  { "localHost": "laptop",
+    "hosts": { "claunker": { "url": "http://100.x.y.z:7850", "token": "<token from --new-token>" } },
+    "caps": { "maxConcurrent": 4, "maxStartsPerMinute": 6 } }
+  ```
+
+  On Claunker: `{ "localHost": "claunker" }` (a registry is not needed there). With no
+  `hosts.json`, `claude_start` refuses with an error naming the file; un-prefixed
+  `claude_check` still works.
+- `~/.claude-async/api.json` (Claunker only): `{ "port": 7850, "tokenSha256": "<hex>",
+  "bindAddress": "100.x.y.z" }`. Holds only the token's sha256; `bindAddress` is optional
+  (required only if more than one Tailscale address is present).
+- `~/.claude-async/last-seen.json`: last successful contact per remote host, used only for the
+  `unreachable (last seen …)` row.
+
+**Host API (`host-api.mjs`, Claunker only).** `POST /v1/start`, `GET /v1/check?jobId=`,
+`GET /v1/jobs`, all behind `Authorization: Bearer <token>` (bare `401` on failure, checked before
+anything is read or written). It binds only to a Tailscale address (100.64.0.0/10) that is present
+on an interface and refuses to start otherwise; it never binds `0.0.0.0` or loopback. Starts go
+through the same guarded `startJob()` and the same launcher queue as the MCP bridge.
+
+```
+node host-api.mjs --new-token   # once: stores sha256 in api.json, prints the token once
+node host-api.mjs               # run (foreground)
+```
+
+**Guard (one, server-side).** Every start on the executing host, local or via the API, is
+checked for caps: max concurrent running jobs (default 4) and max starts per rolling minute
+(default 6). Over a cap it is rejected with a clear error and no ticket. Duplicate ids are rejected
+at create time. A preflight checks that the Claude binary and `workFolder` exist (errors name the
+host). Success says exactly `preflight passed, execution unverified`: the runner may still fail,
+and records that in the job. `CLAUDE_ASYNC_DEPTH` / `X-Claude-Async-Depth` (depth > 1 rejected)
+is an **accident guard only, not a security control**. Anyone can send any value.
 
 ## How it works
 

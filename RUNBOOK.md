@@ -29,6 +29,41 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   cause `spawn ENAMETOOLONG` (exit 127). Pass large content via files instead of inline in
   the prompt.
 
+## Multi-host dispatch (`feat/multihost`)
+
+Design and config are in README's "Multi-host" section. Operational notes:
+
+- **Before restarting a bridge that runs this code, create `~/.claude-async/hosts.json`**
+  (`{"localHost": "claunker"}` on Claunker, `{"localHost": "laptop", "hosts": {"claunker": {...}}}`
+  on the laptop). Without it every `claude_start` refuses with an error naming the file
+  (un-prefixed `claude_check` keeps working).
+- **Every `claude_start` now needs `host`.** Callers or prompts that omit it fail schema validation
+  on purpose.
+- **Caps are per executing host** (4 running / 6 starts per minute by default): 4 or more
+  still-running jobs (including `stalled`) block the 5th start. Raise them via `hosts.json` `caps`, not by retrying.
+- **Host API live test** (Claunker, Tailscale up): `node host-api.mjs --new-token`, then
+  `node host-api.mjs`. It prints `listening on http://100.x.y.z:7850` or refuses with the reason.
+  Before merge, run it from a non-live checkout **only with
+  `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=breakaway`** (see the next point).
+
+**Test hazards discovered while building this (2026-09-25):**
+
+- **Any `startJob()` from a checkout other than the live one re-registers `ClaudeAsyncRunner`.**
+  `ensureLauncherTask()` treats a different `job-launcher.mjs` path as "drift" and repoints the
+  live task at that checkout. `test-card-hook.mjs` and `--selftest` go through that path by
+  default. From a worktree or scratch copy, run them with `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=breakaway`
+  (and a temp `USERPROFILE` so the launcher queue is a temp dir). `test/survival.mjs` exercises
+  the task path deliberately, so run it only from the live checkout. `test/multihost/*` never
+  reaches `launch()` (it injects a fake that writes the real ticket into a temp queue).
+- **Never export `GIT_DIR` around the test suites.** `test-card-hook.mjs` runs `git init` /
+  `git config user.*` / `git commit` in a temp dir. With `GIT_DIR` set, those hit the real repo:
+  `core.bare` flips to `true`, `[user]` is overwritten, and junk commits land on the checked-out branch.
+- **Smart App Control can block `test/dummy-*.exe`.** The build scripts recompile them on every
+  run, and some fresh unsigned compiles are blocked by hash ("An Application Control policy has
+  blocked this file", CodeIntegrity event 3077). Then `pathext-integrity` / `env-integrity` /
+  `pid-heal` fail with `spawn UNKNOWN`. That is the environment, not the code: re-run with a
+  known-allowed binary.
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /
