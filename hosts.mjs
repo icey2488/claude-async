@@ -27,6 +27,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeJsonAtomic } from "./atomic.mjs";
 
 export const HOSTS = ["claunker", "laptop"];
 // Hosts another machine may forward to. The laptop never exposes an API.
@@ -131,8 +132,6 @@ export function recordLastSeen(host, when = new Date(), file = lastSeenPath()) {
     const cur = readLastSeen(file);
     cur[host] = when.toISOString();
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(cur, null, 2));
-    fs.renameSync(tmp, file);
+    writeJsonAtomic(file, cur);
   } catch { /* cache only; never fatal */ }
 }

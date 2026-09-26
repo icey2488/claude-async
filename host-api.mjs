@@ -36,6 +36,7 @@ import { checkJob, listJobs } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
 import { HOSTS, REMOTE_DISPATCH_TARGETS, loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
 import { DEPTH_HEADER } from "./guard.mjs";
+import { writeJsonAtomic } from "./atomic.mjs";
 
 export const DEFAULT_PORT = 7850;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -225,7 +226,7 @@ function newToken(file = apiConfigPath()) {
   const token = crypto.randomBytes(32).toString("base64url");
   const next = { port: DEFAULT_PORT, ...cur, tokenSha256: hashToken(token) };
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(next, null, 2), { mode: 0o600 });
+  writeJsonAtomic(file, next, { mode: 0o600 });
   return { token, file };
 }
 

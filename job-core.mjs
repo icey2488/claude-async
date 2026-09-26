@@ -20,6 +20,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { mintCard, failCard } from "./card-hook.mjs";
 import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
+import { writeJsonAtomic } from "./atomic.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 
@@ -180,7 +181,7 @@ function healMetaPid(p, meta) {
     if (!pidAlive(runnerPid) || !isOurProcess(runnerPid)) return false;
     meta.pid = runnerPid;
     meta.pidSource = "runner-healed";
-    try { fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); } catch {}
+    try { writeJsonAtomic(p.meta, meta); } catch {}
     return true;
   } catch { return false; }
 }
@@ -381,7 +382,7 @@ export function writeLaunchTicket(p, extraEnv = {}) {
     envOverrides: { ...collectEnvOverrides(), ...extraEnv },
     createdAt: new Date().toISOString(),
   };
-  fs.writeFileSync(path.join(LAUNCHER_QUEUE_DIR, `${jobId}.json`), JSON.stringify(ticket, null, 2));
+  writeJsonAtomic(path.join(LAUNCHER_QUEUE_DIR, `${jobId}.json`), ticket);
 }
 
 // Primary win32 launch path as of the 2026-09-09 Task Scheduler launcher work: gives
@@ -450,7 +451,7 @@ function launchPosix(p, extraEnv = {}) {
 }
 
 async function launch(p, command, argv, cwd, extraEnv = {}) {
-  fs.writeFileSync(p.spec, JSON.stringify({ command, argv, cwd, out: p.out, err: p.err, exit: p.exit }));
+  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
   return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
@@ -591,7 +592,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null };
-  fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2));
+  writeJsonAtomic(p.meta, meta);
   const note = cardError
     ? `UNCARDED: ${cardError} — Job detached. Poll with claude_check(jobId). Safe across bridge restarts.`
     : "Job detached. Poll with claude_check(jobId). Safe across bridge restarts.";
@@ -661,7 +662,7 @@ export function checkJob(id, tailBytes = 8000) {
     const reap = failCard(meta.cardId);
     if (reap.ok) {
       meta.cardReaped = true;
-      try { fs.writeFileSync(p.meta, JSON.stringify(meta, null, 2)); } catch {}
+      try { writeJsonAtomic(p.meta, meta); } catch {}
     } else {
       extra.reapError = reap.error || "reap failed";
     }
@@ -695,7 +696,7 @@ export async function runSelfTest() {
   fs.mkdirSync(p.d, { recursive: true });
   const { pid, pidSource } = await launch(p, process.execPath,
     ["-e", "setTimeout(() => console.log('SELFTEST_OK'), 300)"], JOB_ROOT);
-  fs.writeFileSync(p.meta, JSON.stringify({ jobId: id, pid, pidSource, startedAt: new Date().toISOString() }));
+  writeJsonAtomic(p.meta, { jobId: id, pid, pidSource, startedAt: new Date().toISOString() }, { space: 0 });
 
   const deadline = Date.now() + 5000;
   let s;

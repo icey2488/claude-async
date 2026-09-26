@@ -24,6 +24,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "./atomic.mjs";
 
 export const DEFAULT_CAPS = Object.freeze({ maxConcurrent: 4, maxStartsPerMinute: 6 });
 export const MAX_DEPTH = 1;
@@ -99,7 +100,7 @@ export function recentStarts(jobRoot, nowMs) {
 
 export function recordStart(jobRoot, nowMs) {
   const kept = [...recentStarts(jobRoot, nowMs), nowMs];
-  fs.writeFileSync(ledgerPath(jobRoot), JSON.stringify(kept));
+  writeJsonAtomic(ledgerPath(jobRoot), kept, { space: 0 });
 }
 
 // Returns { error, errorCode } if a cap is hit, else null. Caller holds the start lock.
