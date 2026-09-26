@@ -220,9 +220,21 @@ export async function startApi({ interfaces = os.networkInterfaces(), cfg = load
   return { server, address: sel.address, port: apiCfg.port };
 }
 
-function newToken(file = apiConfigPath()) {
+// An api.json that exists but does not parse to a JSON object is REFUSED, not rewritten: the rewrite
+// would silently drop a custom port/bindAddress. A missing file is the only case that starts fresh.
+// Returns { token, file } or { file, error }.
+export function newToken(file = apiConfigPath()) {
   let cur = {};
-  try { cur = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+  try {
+    cur = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (cur === null || typeof cur !== "object" || Array.isArray(cur)) throw new Error("not a JSON object");
+  } catch (e) {
+    if (e.code !== "ENOENT") {
+      return { file, error: `refusing to overwrite ${file}: it exists but could not be read as a JSON object ` +
+        `(${e.message}); fix or delete it, then re-run --new-token` };
+    }
+    cur = {};
+  }
   const token = crypto.randomBytes(32).toString("base64url");
   const next = { port: DEFAULT_PORT, ...cur, tokenSha256: hashToken(token) };
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -232,7 +244,8 @@ function newToken(file = apiConfigPath()) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.includes("--new-token")) {
-    const { token, file } = newToken();
+    const { token, file, error } = newToken();
+    if (error) { console.error(`claude-async host API: ${error}`); process.exit(1); }
     console.log(`Stored sha256 of a new token in ${file} (the token itself is not stored).`);
     console.log(`Token (shown once; put it in the laptop's hosts.json under hosts.claunker.token):\n${token}`);
   } else {

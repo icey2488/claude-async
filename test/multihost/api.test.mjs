@@ -192,3 +192,42 @@ test("API rejections write nothing: wrong host, bad body, depth, caps (429), pre
   assert.match(capped.body.error, /cap exceeded on host claunker/);
   assert.equal(tickets().length, 1);
 });
+
+// --new-token must never clobber an api.json it cannot read: rewriting would drop a custom port /
+// bindAddress. Only a MISSING file starts fresh.
+test("newToken: a missing api.json is created (default port, hash only, token not stored)", () => {
+  const f = path.join(TMP, "nt-missing", "api.json");
+  const r = api.newToken(f);
+  assert.equal(r.error, undefined);
+  assert.equal(r.file, f);
+  const stored = JSON.parse(fs.readFileSync(f, "utf8"));
+  assert.deepEqual(stored, { port: api.DEFAULT_PORT, tokenSha256: api.hashToken(r.token) });
+  assert.ok(!fs.readFileSync(f, "utf8").includes(r.token));
+});
+
+test("newToken: a valid api.json keeps its custom port and bindAddress and gets a new hash", () => {
+  const f = path.join(TMP, "nt-valid.json");
+  const old = api.hashToken("old-token");
+  fs.writeFileSync(f, JSON.stringify({ port: 9001, bindAddress: "100.101.102.103", tokenSha256: old }));
+  const r = api.newToken(f);
+  assert.equal(r.error, undefined);
+  const stored = JSON.parse(fs.readFileSync(f, "utf8"));
+  assert.equal(stored.port, 9001);
+  assert.equal(stored.bindAddress, "100.101.102.103");
+  assert.equal(stored.tokenSha256, api.hashToken(r.token));
+  assert.notEqual(stored.tokenSha256, old);
+});
+
+for (const [label, content] of [["garbage", "{{ not json"], ["truncated", '{"port": 9001, "bindAddr'], ["empty", ""],
+                                ["JSON null", "null"], ["a JSON array", "[]"], ["a JSON string", '"x"']]) {
+  test(`newToken: an existing api.json that is ${label} is refused, named in the error, and left byte-for-byte untouched`, () => {
+    const f = path.join(TMP, `nt-corrupt-${label.replace(/\W+/g, "-")}.json`);
+    fs.writeFileSync(f, content);
+    const r = api.newToken(f);
+    assert.equal(r.token, undefined, "no token is minted");
+    assert.match(r.error, /^refusing to overwrite /);
+    assert.ok(r.error.includes(f), "the error names the file");
+    assert.equal(fs.readFileSync(f, "utf8"), content);
+    assert.deepEqual(fs.readdirSync(TMP).filter((n) => n.startsWith(path.basename(f)) && n.endsWith(".tmp")), []);
+  });
+}
