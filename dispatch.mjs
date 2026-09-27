@@ -195,7 +195,10 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                  "Object membership, but inJob:true alone is NOT proof of an escape failure -- Windows " +
                  "places most console-attached processes into a default per-console job with identical " +
                  "limitFlags (0x3C00) regardless of ancestry, confirmed via RUNBOOK.md's verification. " +
-                 "Trust the survival behavior (test/survival.mjs), not this flag, when in doubt.",
+                 "Trust the survival behavior (test/survival.mjs), not this flag, when in doubt. `exit`, " +
+                 "when present, is the runner's exit.json record (exitCode/exitSignal/exitReason, " +
+                 "spawnError, stderrTail/stdoutTail, endedAt) for attributing a dead or failed job without " +
+                 "opening its job dir; it is absent for jobs that predate exit.json and never null.",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
