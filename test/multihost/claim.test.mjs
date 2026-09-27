@@ -440,30 +440,35 @@ function runRound(workers, round, queueDir) {
   })));
 }
 
+const pct = (xs, p) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : 0; };
 const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s.length ? s[Math.floor(s.length / 2)] : 0; };
 
 // Alignment bookkeeping for the concurrency tests: a "race" whose workers were not released together
-// (loaded box, slow IPC) is not a race, so it must FAIL with its timing rather than pass vacuously.
-// Only aligned rounds count toward the target. A round with a worker released more than MAX_LATE_MS after
-// the shared instant is still checked for double claims (a double is a double) but does not count and is
-// redone, within a budget of 2% of the target: even on an idle 16-core box the OS occasionally deschedules
-// one spinning worker for a few ms (about 1 round in 300 here), so "zero late rounds" outright would fail
-// healthy runs, while a run that is misaligned as a whole blows the budget and fails with its timing.
-const lateBudget = (target) => Math.max(2, Math.ceil(target * 0.02));
-function newAlignment(target) { return { target, spreads: [], lateRounds: 0 }; }
+// (loaded box, slow IPC or process boot) is not a race, so it must FAIL with its timing rather than pass
+// vacuously. Only aligned rounds count toward the target. A round with a worker released more than
+// MAX_LATE_MS after the shared instant is still checked for double claims (a double is a double) but does
+// not count: it is redone, until `target` aligned rounds have been collected. Late rounds are not budgeted
+// as a fraction (a 2% budget held on an idle box but failed 5 of 5 runs of the real-launcher test on a
+// loaded one, where 12 booting node processes per batch make 4-7 late rounds in 20-76 normal). The
+// total attempts are capped at ATTEMPT_FACTOR * target instead, so a box that is misaligned as a whole
+// still fails with its timing.
+const ATTEMPT_FACTOR = 3;
+const attemptCap = (target) => ATTEMPT_FACTOR * target;
+function newAlignment(target) { return { target, spreads: [], lateRounds: 0, attempts: 0 }; }
 // Returns true if the round was aligned (and so counts).
 function noteAlignment(al, starts, lates) {
+  al.attempts++;
   if (lates.some((l) => l > MAX_LATE_MS)) { al.lateRounds++; return false; }
   al.spreads.push(Math.max(...starts) - Math.min(...starts));
   return true;
 }
-const alignmentOver = (al) => al.lateRounds > lateBudget(al.target);
+// Rounds still worth attempting: 0 once the target is met or the attempt cap is spent.
+const roundsWanted = (al) => Math.max(0, Math.min(al.target - al.spreads.length, attemptCap(al.target) - al.attempts));
 const alignmentText = (al) => `claim start spread median ${median(al.spreads).toFixed(3)} ms, max ${al.spreads.length ? Math.max(...al.spreads).toFixed(3) : "n/a"} ms over ` +
-  `${al.spreads.length}/${al.target} aligned rounds; ${al.lateRounds} rounds discarded for a worker >${MAX_LATE_MS} ms late (budget ${lateBudget(al.target)}; ` +
-  `limits: median spread < ${MAX_MEDIAN_SPREAD_MS} ms)`;
+  `${al.spreads.length}/${al.target} aligned rounds; ${al.lateRounds} late rounds (a worker >${MAX_LATE_MS} ms late) redone, ` +
+  `${al.attempts}/${attemptCap(al.target)} attempts used (limits: median spread < ${MAX_MEDIAN_SPREAD_MS} ms)`;
 function assertAligned(al, summary) {
   const why = `workers were not aligned, so the race proved nothing: ${summary}`;
-  assert.ok(al.lateRounds <= lateBudget(al.target), why);
   assert.equal(al.spreads.length, al.target, why);
   assert.ok(median(al.spreads) < MAX_MEDIAN_SPREAD_MS, why);
 }
@@ -474,7 +479,7 @@ test(`claim race: ${WORKERS} aligned launchers x ${ROUNDS} rounds x ${TICKETS} t
     const doubles = [], lost = [], leftovers = [];
     const align = newAlignment(ROUNDS);
     try {
-      for (let r = 0; align.spreads.length < ROUNDS && !alignmentOver(align); r++) {
+      for (let r = 0; roundsWanted(align) > 0; r++) {
         const dir = mkQueue(`race${r}`);
         const ids = Array.from({ length: TICKETS }, (_, i) => `r${r}-t${i}`);
         for (const id of ids) putTicket(dir, id);
@@ -492,7 +497,7 @@ test(`claim race: ${WORKERS} aligned launchers x ${ROUNDS} rounds x ${TICKETS} t
       }
     } finally { stopWorkers(workers); }
 
-    const summary = `${OLD ? "OLD rename-only claim" : "lock claim"}: ${align.spreads.length + align.lateRounds} rounds run, ${WORKERS} workers, ${TICKETS} tickets/round: ` +
+    const summary = `${OLD ? "OLD rename-only claim" : "lock claim"}: ${align.attempts} rounds run, ${WORKERS} workers, ${TICKETS} tickets/round: ` +
       `${doubles.length} double-claimed tickets, ${lost.length} lost, ${leftovers.length} rounds with leftovers; ${alignmentText(align)}`;
     t.diagnostic(summary);
     assertAligned(align, summary);
@@ -509,7 +514,7 @@ test(`stale-lock break race: ${WORKERS} aligned launchers find the same stale lo
     const problems = [];
     const align = newAlignment(rounds);
     try {
-      for (let r = 0; align.spreads.length < rounds && !alignmentOver(align); r++) {
+      for (let r = 0; roundsWanted(align) > 0; r++) {
         const dir = mkQueue(`stale${r}`);
         const id = `s${r}`;
         putTicket(dir, id);
@@ -525,7 +530,7 @@ test(`stale-lock break race: ${WORKERS} aligned launchers find the same stale lo
         fs.rmSync(dir, { recursive: true, force: true });
       }
     } finally { stopWorkers(workers); }
-    const summary = `stale-lock break: ${align.spreads.length + align.lateRounds} rounds run, ${WORKERS} workers, ${problems.length} problems; ${alignmentText(align)}`;
+    const summary = `stale-lock break: ${align.attempts} rounds run, ${WORKERS} workers, ${problems.length} problems; ${alignmentText(align)}`;
     t.diagnostic(summary);
     assertAligned(align, summary);
     assert.deepEqual(problems, [], summary);
@@ -540,6 +545,16 @@ const PRELOAD = pathToFileURL(path.join(HERE, "claim-preload.mjs")).href;
 const STUB_RUNNER = path.join(HERE, "claim-stub-runner.mjs");
 const LAUNCHER_ROUNDS = Number(process.env.CLAIM_LAUNCHER_ROUNDS) || 120;
 const LAUNCHERS = 3;
+// Head start between spawning a batch of BATCH x LAUNCHERS = 12 node processes and the shared release
+// instant. Each launcher must finish booting and pre-importing its modules before then, or it is late and
+// its round is redone. Measured once on Claunker with a 5000 ms lead (153 launchers, readyAt logged by
+// claim-preload; the summary line prints the same p50/p95/max on every run): boot + pre-import done after
+// p50 225 ms, p95 513 ms, max 854 ms. Lead = 2 x p95 (~1026 ms), i.e. the 1000 ms floor. Do not go much
+// higher: every early launcher busy-spins until the release, so a long lead burns CPU that slows the
+// launchers still booting. A longer lead does not remove late rounds either (11 of 51 even at 5000 ms:
+// a spinning launcher descheduled for >5 ms), which is why late rounds are redone, not budgeted.
+// (CLAIM_LAUNCHER_LEAD_MS overrides it, e.g. to prove the guard still guards.)
+const LAUNCHER_LEAD_MS = Number(process.env.CLAIM_LAUNCHER_LEAD_MS) || 1000;
 const BATCH = 4; // rounds run side by side (each in its own home + queue), sharing one go-instant
 // The launcher is the Windows Task Scheduler entry point. Under CLAIM_RACE_VARIANT=old the tests only make
 // sense against an old launcher copy the caller names; without one they would run the NEW launcher under
@@ -603,19 +618,22 @@ realIt(`real job-launcher.mjs: ${LAUNCHERS} copies x ${LAUNCHER_ROUNDS} rounds a
     const align = newAlignment(LAUNCHER_ROUNDS);
     const all = []; // { ids, jobDirs } per round, for the after-the-fact runner check
     // Rounds whose launchers were not released together are checked but redone (see noteAlignment).
-    for (let start = 0; align.spreads.length < LAUNCHER_ROUNDS && !alignmentOver(align);) {
-      const ks = Array.from({ length: Math.min(BATCH, LAUNCHER_ROUNDS - align.spreads.length) }, (_, i) => start + i);
+    const t0 = Date.now();
+    const ready = []; // ms from spawning a batch until each launcher finished booting + pre-importing
+    for (let start = 0; roundsWanted(align) > 0;) {
+      const ks = Array.from({ length: Math.min(BATCH, roundsWanted(align)) }, (_, i) => start + i);
       start += ks.length;
       const homes = ks.map((k) => makeHome(`lr${k}`, Array.from({ length: LAUNCHERS }, (_, i) => `lr${k}-job${i}`)));
-      const goAt = nowHr() + 600; // enough for every process to boot and pre-import before the spin ends
+      const goAt = nowHr() + LAUNCHER_LEAD_MS;
       const exits = await Promise.all(homes.flatMap((h) => Array.from({ length: LAUNCHERS }, () => runLauncher(h.home, goAt))));
       if (exits.some((c) => c !== 0)) problems.push(`batch at round ${ks[0]}: launcher exit codes ${JSON.stringify(exits)}`);
       homes.forEach((h, i) => {
         // The preload's release instants: how close together this round's launchers really were.
         const gos = fs.readdirSync(h.home).filter((f) => /^go-\d+\.json$/.test(f))
           .map((f) => JSON.parse(fs.readFileSync(path.join(h.home, f), "utf8")));
-        if (gos.length !== LAUNCHERS) problems.push(`round ${ks[i]}: ${gos.length} launchers recorded a release time, expected ${LAUNCHERS}`);
+        if (gos.length !== LAUNCHERS) { align.attempts++; problems.push(`round ${ks[i]}: ${gos.length} launchers recorded a release time, expected ${LAUNCHERS}`); }
         else noteAlignment(align, gos.map((g) => g.releasedAt), gos.map((g) => g.releasedAt - g.goAt));
+        for (const g of gos) ready.push(g.readyAt - (g.goAt - LAUNCHER_LEAD_MS));
         const ids = h.jobDirs.map((d) => path.basename(d));
         const counts = new Map();
         for (const id of claimedIds(h.queue)) counts.set(id, (counts.get(id) || 0) + 1);
@@ -641,9 +659,10 @@ realIt(`real job-launcher.mjs: ${LAUNCHERS} copies x ${LAUNCHER_ROUNDS} rounds a
       const n = runFiles(d).length;
       if (n !== 1) { runDoubles++; problems.push(`${path.basename(d)}: runner started ${n}x`); }
     }
-    const summary = `${OLD ? "OLD launcher" : "launcher"} (${path.basename(LAUNCHER)}): ${align.spreads.length + align.lateRounds} rounds x ${LAUNCHERS} copies: ` +
+    const summary = `${OLD ? "OLD launcher" : "launcher"} (${path.basename(LAUNCHER)}): ${align.attempts} rounds x ${LAUNCHERS} copies: ` +
       `${claimDoubles} double-claimed tickets, ${runDoubles} jobs not started exactly once, ${problems.length} problems; ` +
-      `launcher release ${alignmentText(align)}`;
+      `launcher release ${alignmentText(align)}; launcher ready after p50 ${pct(ready, 0.5).toFixed(0)} / p95 ${pct(ready, 0.95).toFixed(0)} / max ${pct(ready, 1).toFixed(0)} ms ` +
+      `of a ${LAUNCHER_LEAD_MS} ms lead; wall ${((Date.now() - t0) / 1000).toFixed(1)} s`;
     t.diagnostic(summary);
     assertAligned(align, summary);
     if (REPORT_ONLY) { console.log(summary); console.log(problems.slice(0, 20).join("\n")); return; }
