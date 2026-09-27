@@ -1,0 +1,33 @@
+# Sample systemd unit for a Linux receiver's host API (e.g. the "ha" Debian LXC).
+# Copy to /etc/systemd/system/claude-async-api.service, adjust the paths, then:
+#   systemctl daemon-reload && systemctl enable --now claude-async-api
+# NOT YET RUN on any machine: nothing in this repo has run on Linux. Run `npm run test:multihost`
+# as the service user first. See README "Linux receiver".
+#
+# Prerequisites: a NON-ROOT user (the claude CLI refuses --dangerously-skip-permissions as root),
+# that user's ~/.claude-async/hosts.json = { "localHost": "ha", "receiver": true }, and
+# `node host-api.mjs --new-token` run once as that user.
+[Unit]
+Description=claude-async host API (receiver)
+Wants=network-online.target
+After=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/home/claude/code/claude-async
+Environment=HOME=/home/claude
+Environment=PATH=/home/claude/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_CLI_PATH=/home/claude/.local/bin/claude
+Environment=CLAUDE_ASYNC_DEFAULT_CWD=/home/claude/work
+# Optional: a dispatch-card command (JSON array or space-split). Unset = the card step fails open.
+#Environment=CLAUNKER_JOBCARD_CMD=
+ExecStart=/usr/bin/node host-api.mjs
+Restart=on-failure
+RestartSec=5
+# Jobs are spawn(detached)+unref children that stay in this unit's cgroup. The default
+# KillMode=control-group would kill every running job whenever the API is restarted or stopped.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

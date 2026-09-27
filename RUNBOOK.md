@@ -75,6 +75,36 @@ Design and config are in README's "Multi-host" section. Operational notes:
   `pid-heal` fail with `spawn UNKNOWN`. That is the environment, not the code: re-run with a
   known-allowed binary.
 
+## Registry-driven hosts (`feat/receiver-registry`, 2026-09-26)
+
+The host list is no longer hard-coded: `hosts.json` is the registry (schema and examples in README's
+"Multi-host"). Operational notes:
+
+- **Upgrade steps for existing machines.** Claunker's `hosts.json` (`{"localHost": "claunker"}`) still validates, but
+  it now needs `"receiver": true` before `node host-api.mjs` will start (the API used to be gated on the name
+  `claunker`; it is gated on that field now). The laptop's file (`localHost: laptop`, `hosts.claunker`) needs no change.
+  A file that fails validation (uppercase or dotted name, a host equal to `localHost`, a bad `url`, an empty `token`, a
+  non-boolean `receiver`) makes every `claude_start` refuse with the file and field named; fix the file, no restart needed.
+- **A bridge restart IS required to change the `host` enum.** The enum is built from the registry when the bridge
+  starts, so a host added to `hosts.json` is rejected client-side until the bridge restarts (follow "Restarting the
+  bridge" above, including the warmup). Removing a host needs no restart to be *refused*: routing re-reads the file on
+  every call and returns `host "x" is not in <file> (known hosts: ...)`, but the stale enum keeps advertising it until the
+  restart. `job-core.mjs` is unchanged; `hosts.mjs`, `dispatch.mjs` and `host-api.mjs` are, so a running receiver also
+  needs restarting to pick up the receiver gate.
+- **The "laptop is not a remote dispatch target" message is gone.** The one-way topology is that the laptop is in nobody's
+  registry: on Claunker `host: laptop` is `host "laptop" is not in <file> (known hosts: claunker)`.
+- **Job ids with an unknown prefix.** `claude_check` on `<name>.…` where `<name>` is a valid host name but not in the registry is an
+  error naming the prefix and the known hosts, not a local lookup. Before this change only `claunker`/`laptop` counted as
+  prefixes, so a *legacy* id containing a dot whose first segment is lowercase alphanumerics (e.g. `v1.2-fix`, from when
+  startJob allowed `.`) now errors instead of resolving locally. Ids the multihost work minted are unaffected.
+- **Adding a receiver:** README "Multi-host" ("Adding a receiver (both sides)"). **Linux receiver:** README "Linux receiver";
+  `deploy/claude-async-api.service` is the sample unit (`KillMode=process` so an API restart does not take running jobs
+  with it). `--new-token` now prints the target key as `hosts.<this host's localHost>.token`.
+- **Tests:** `test/multihost/registry.test.mjs` (schema validation: each bad field is an error naming the file and field,
+  and `claude_start` refuses with nothing written), `routing.test.mjs` (three-host registry: `ha` forwards, `laptop` is
+  unknown), `mcp.test.mjs` (enum built from a three-name `hosts.json`; a host removed after startup is refused with no
+  ticket), `ids.test.mjs`, `api.test.mjs` (receiver gate, an `ha` receiver).
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /

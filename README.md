@@ -82,7 +82,7 @@ If you'd rather not use the prompt above, or you're not on Windows:
 
 | Tool | Input | Returns |
 |---|---|---|
-| `claude_start` | `host` (required: `claunker` \| `laptop`), `prompt` (required), `workFolder?`, `jobId?` (descriptor), `model?`, `effort?`, `intent?` | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
+| `claude_start` | `host` (required; one of the hosts in `hosts.json`, see Multi-host), `prompt` (required), `workFolder?`, `jobId?` (descriptor), `model?`, `effort?`, `intent?` | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
 | `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
@@ -106,43 +106,87 @@ Optional environment variables:
 | `CLAUDE_ASYNC_MAX_CONCURRENT` | `4` | Max running jobs on this host (`hosts.json` `caps.maxConcurrent` wins) |
 | `CLAUDE_ASYNC_MAX_STARTS_PER_MINUTE` | `6` | Max starts per rolling 60s on this host (`hosts.json` `caps.maxStartsPerMinute` wins) |
 
-## Multi-host (Claunker + laptop)
+## Multi-host (registry-driven)
 
-Two hosts, one-way: **`claunker` is the only remote dispatch target**; the laptop never
-exposes an API. `claude_start` requires `host` (no default):
+Which hosts exist is configuration, not code. Each machine's `hosts.json` is its **registry**:
+the known hosts are this machine (`localHost`) plus every key of `hosts`, and a host can be
+dispatched to when it has an entry with a `url` and a `token`. Adding a host is a config change
+on each machine, never a code change. `claude_start` requires `host` (no default):
 
-| This machine (`localHost`) | `host: claunker` | `host: laptop` |
-|---|---|---|
-| `laptop` | forwarded to Claunker's host API over Tailscale | runs locally (fallback when Claunker is offline) |
-| `claunker` | runs locally | error: `laptop is not a remote dispatch target` |
+| `host` names… | What happens |
+|---|---|
+| this machine (`localHost`) | runs locally, no network hop |
+| a key of `hosts` | forwarded to that host's host API over Tailscale |
+| anything else | error: `host "x" is not in <file> (known hosts: a, b, c)`, nothing written |
 
-Job ids are `<host>.<descriptor>-YYYYMMDD-<8 random [a-z0-9]>`, minted by the executing host.
-A prefix counts only if it exactly matches `claunker`/`laptop`, so older un-prefixed ids are
-still checked locally. The forwarder stores nothing: the job record lives only on the executing
-host, and `claude_check` / `claude_jobs` ask it live.
+The topology is one-way **by config**: a machine that appears in nobody's registry (the laptop)
+can never be dispatched to, and needs no special case in the code. A dispatcher lists the
+receivers it may send to; a receiver lists nobody unless it also dispatches.
+
+Job ids are `<host>.<descriptor>-YYYYMMDD-<8 random [a-z0-9]>`, minted by the executing host. The
+prefix is any valid host name (below). `claude_check` requires the prefix to be a **known** host and
+otherwise returns an error naming the prefix and the known hosts (it never falls back to a local
+lookup). Older un-prefixed ids have no dot and are still checked locally. The forwarder stores
+nothing: the job record lives only on the executing host, and `claude_check` / `claude_jobs` ask it
+live; `claude_jobs` asks every registry host that has a `url`.
 
 **Config (user profile, never the repo; `CLAUDE_ASYNC_CONFIG_DIR` overrides the directory):**
 
-- `~/.claude-async/hosts.json` (both machines). Local-host identity is explicit, never guessed:
+- `~/.claude-async/hosts.json` (every machine). Validated on every load; a file that fails
+  validation is an error naming the file and the field, and `claude_start` refuses until it is fixed.
+
+  | Field | Required | Rule |
+  |---|---|---|
+  | `localHost` | yes | this machine's name; matches `^[a-z0-9][a-z0-9-]{0,31}$` (no dots: `.` is the job-id separator; no uppercase; it becomes an id prefix and part of dir names) |
+  | `receiver` | no (default `false`) | boolean; `true` lets this machine run `host-api.mjs` |
+  | `hosts` | no | map name -> `{ "url", "token" }`; every name matches the pattern above and is not `localHost`; `url` is an http or https URL with a host; `token` is a non-empty string |
+  | `caps` | no | `{ "maxConcurrent", "maxStartsPerMinute" }`, unchanged |
+
+  A **dispatcher** (here the laptop, which sends to two receivers and is itself in nobody's registry):
 
   ```json
   { "localHost": "laptop",
-    "hosts": { "claunker": { "url": "http://100.x.y.z:7850", "token": "<token from --new-token>" } },
+    "hosts": {
+      "claunker": { "url": "http://100.x.y.z:7850", "token": "<token from claunker's --new-token>" },
+      "ha":       { "url": "http://100.a.b.c:7850", "token": "<token from ha's --new-token>" } },
     "caps": { "maxConcurrent": 4, "maxStartsPerMinute": 6 } }
   ```
 
-  On Claunker: `{ "localHost": "claunker" }` (a registry is not needed there). With no
-  `hosts.json`, `claude_start` refuses with an error naming the file; un-prefixed
+  A **receiver** (here `ha`; `hosts` is empty because it dispatches to nobody):
+
+  ```json
+  { "localHost": "ha", "receiver": true }
+  ```
+
+  With no `hosts.json`, `claude_start` refuses with an error naming the file; un-prefixed
   `claude_check` still works.
-- `~/.claude-async/api.json` (Claunker only): `{ "port": 7850, "tokenSha256": "<hex>",
+- `~/.claude-async/api.json` (receivers only): `{ "port": 7850, "tokenSha256": "<hex>",
   "bindAddress": "100.x.y.z" }`. Holds only the token's sha256; `bindAddress` is optional
   (required only if more than one Tailscale address is present).
 - `~/.claude-async/last-seen.json`: last successful contact per remote host, used only for the
   `unreachable (last seen …)` row.
 
-**Host API (`host-api.mjs`, Claunker only).** `POST /v1/start`, `GET /v1/check?jobId=`,
+**Tool schema and restarts.** `host` is a required enum built when the bridge starts from the
+registry (`localHost` plus the `hosts` keys), and its description lists the names. That list is
+advertised once, so **to add a host: edit `hosts.json` and restart the bridge**. Routing re-reads the
+file on every call and validates the requested host against the live registry too, so a stale enum
+can never route to a host that has since been removed (that call errors with the known hosts).
+
+**Adding a receiver (both sides):**
+
+1. On the receiver: install this repo and Node, create its `hosts.json` `{ "localHost": "<name>", "receiver": true }`,
+   run `node host-api.mjs --new-token` (prints the token once; stores only its hash in `api.json`),
+   then start `node host-api.mjs` (a service on Linux, see below). It binds only to a Tailscale address
+   and refuses to start if `receiver` is not `true`.
+2. On each machine that should dispatch to it: add `"<name>": { "url": "http://<tailscale ip>:7850", "token": "<token>" }`
+   under `hosts`, then restart the bridge (Claude Desktop) so the `host` enum includes it.
+3. Do not add the receiver to a machine's registry unless that machine should be able to send to it;
+   do not list a dispatcher-only machine (the laptop) anywhere.
+
+**Host API (`host-api.mjs`, receivers only).** `POST /v1/start`, `GET /v1/check?jobId=`,
 `GET /v1/jobs`, all behind `Authorization: Bearer <token>` (bare `401` on failure, checked before
-anything is read or written). It binds only to a Tailscale address (100.64.0.0/10) that is present
+anything is read or written). It rejects a start whose `host` is not this receiver's `localHost`. It
+binds only to a Tailscale address (100.64.0.0/10) that is present
 on an interface and refuses to start otherwise; it never binds `0.0.0.0` or loopback. Starts go
 through the same guarded `startJob()` and the same launcher queue as the MCP bridge.
 
@@ -150,6 +194,31 @@ through the same guarded `startJob()` and the same launcher queue as the MCP bri
 node host-api.mjs --new-token   # once: stores sha256 in api.json, prints the token once
 node host-api.mjs               # run (foreground)
 ```
+
+### Linux receiver (Debian LXC on Proxmox, e.g. `ha`)
+
+> **Nothing in this repo has ever run on Linux.** The POSIX launch path (`spawn` detached + `unref`) and
+> the receiver code are exercised by the test suite only on Windows so far. On a new receiver, run
+> `npm run test:multihost` first, before pointing anything at it, and read any failure as a real finding.
+
+- **Non-root service user.** The `claude` CLI refuses `--dangerously-skip-permissions` as root, and every job
+  is started with it. Create a user (the sample unit uses `claude`), install the CLI for that user and log it in.
+- **The `claude` binary.** Put it on the service's `PATH`, or set `CLAUDE_CLI_PATH` to its absolute path
+  (a systemd unit does not read your shell profile, so set one of the two explicitly).
+- **Node.** A current Node on the box (`/usr/bin/node` in the sample unit); `npm ci` in the checkout.
+- **Tailscale in the container.** `host-api.mjs` binds only to a Tailscale address that is on a local
+  interface. An LXC needs the TUN device passed through for `tailscaled` to create that interface
+  (userspace-networking mode has no interface, so the API would refuse to start). This is Proxmox-side setup,
+  not exercised here.
+- **Service.** `deploy/claude-async-api.service` is a sample unit: `User=claude`, `WorkingDirectory=/home/claude/code/claude-async`,
+  `Environment` for `HOME`, `PATH`, `CLAUDE_CLI_PATH`, `CLAUDE_ASYNC_DEFAULT_CWD`, `Restart=on-failure`, and
+  **`KillMode=process`**. The POSIX launch is `spawn(detached)` + `unref`, so running jobs stay in the unit's cgroup;
+  the default `KillMode=control-group` would kill them whenever the API restarts. Copy it to
+  `/etc/systemd/system/`, then `systemctl daemon-reload && systemctl enable --now claude-async-api`. The unit has not been run.
+- **Optional:** `CLAUNKER_JOBCARD_CMD` overrides the dispatch-card command. Without the claunker-hermes venv the card step
+  fails open (jobs still run; the start response carries an `UNCARDED` note), so set it only if the receiver has a card command.
+- **Config:** `~/.claude-async/hosts.json` `{ "localHost": "ha", "receiver": true }` for the service user, then
+  `node host-api.mjs --new-token` as that user, and add `ha` to the dispatchers' registries (steps above).
 
 **Guard (one, server-side).** Every start on the executing host, local or via the API, is
 checked for caps: max concurrent running jobs (default 4) and max starts per rolling minute
