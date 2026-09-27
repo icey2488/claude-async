@@ -387,8 +387,15 @@ itself fails, e.g. `register-launcher-task.ps1` missing).
   **The concurrency tests fail rather than pass when they were not actually concurrent:** every worker must be
   released together (median claim-start spread under 1 ms, printed in the failure message). A round with a worker
   released more than 5 ms after the shared instant is still checked for double claims but is redone instead of
-  counted, within a budget of 2% of the rounds (about 1 round in 300 hits it on an idle box); a run that
-  blows the budget, or whose median spread is over 1 ms, fails with its timing. `LEAD_MS` is 50.
+  counted, until the target number of *aligned* rounds is collected; total attempts are capped at 3× the
+  target, and a run that hits the cap short, or whose median spread is over 1 ms, fails with its timing
+  ("workers were not aligned", with aligned/late/attempt counts). `LEAD_MS` is 50 for the resident-worker
+  races. The real-launcher test boots 12 node processes per batch, so its lead is 1000 ms (2× the measured
+  p95: on Claunker, 153 launchers, boot+import ready after p50 225 ms, p95 513 ms, max 854 ms; the test's summary line
+  prints the same p50/p95/max every run, so re-check it after a hardware or Node change). A 600 ms lead lost 4-7 rounds
+  per 20-76 and failed 5 of 5 runs under the earlier 2%-late-round abort budget, which only held on a quiet box.
+  Even at a 5 s lead about 20% of launcher rounds are late (a spinning launcher descheduled for >5 ms; 11 of 51),
+  hence redo-until-aligned rather than a late-round budget. `CLAIM_LAUNCHER_LEAD_MS` overrides the lead.
   To re-measure the old behavior: `CLAIM_RACE_VARIANT=old node --test --test-name-pattern="claim race"
   test/multihost/claim.test.mjs` reports the double-claim count (and still asserts alignment); add
   `CLAIM_RACE_STRICT=1` to apply the normal assertions, which the old claim fails. For the real-launcher
