@@ -406,6 +406,33 @@ itself fails, e.g. `register-launcher-task.ps1` missing).
   tickets (600 rounds); old launcher copy 49 double-claimed tickets and 101 jobs not started exactly once
   (120 rounds); new claim and new launcher 0.
   `CLAIM_RACE_ROUNDS`, `CLAIM_RACE_WORKERS`, `CLAIM_RACE_TICKETS` and `CLAIM_LAUNCHER_ROUNDS` resize them.
+
+**Start lock protocol (`fix/guard-startlock`, 2026-09-27; `guard.mjs` `withStartLock`).** The same
+identity-checked lock protocol as the claim lock above, applied to `JOB_ROOT/.start.lock` (the
+cross-process lock around `startJob()`'s count-then-reserve step: cap checks, `mkdir` the job dir,
+`recordStart`). Before this fix the lock was broken on age alone (`mtime` older than 30 s, no check
+that the owner pid was actually dead) and released unconditionally in `finally` (no check that the
+file at `.start.lock` was still the one this process created) — a process stalled more than 30 s
+between acquiring and releasing (GC pause, antivirus, a loaded box) looked like a dead owner: a
+second process broke its lock and entered the critical section while the first was still inside it,
+and when the first process finally returned it deleted whoever's lock was there by then. Demonstrated
+with `test/multihost/startlock.test.mjs` (a backdated-lock "holder" vs. a concurrent "racer",
+overlap detected via an append-only trace file): 15/15 rounds showed two concurrent holders against
+the pre-fix code, 0/15 against the fix. Same knobs as `claimOneTicket` (`staleMs`, `pidAlive`, `now`,
+`log`), passed as an optional third argument to `withStartLock` — `job-core.mjs`'s call site is
+unchanged (2 args = production defaults: 30 s stale, `process.kill(pid,0)`, `Date.now`).
+`.start.lock` holds `{pid, at}`; broken only when it is both ≥30 s old and its owner pid is dead or
+unreadable, via the same exclusive `.start.lock.break` marker + re-check-while-holding-it protocol
+(so a lock a rival breaker already replaced is never unlinked); released only if the file still
+carries our pid. **Manual cleanup** is the same as the claim lock: a `.start.lock` older than a
+minute whose pid was reused by an unrelated live process is never auto-broken — check
+`Get-Process -Id <pid>`, delete by hand if it is not this bridge/API; a stranded
+`.start.lock.break` (its holder crashed inside the marker window) is deliberately not
+auto-cleared — delete it by hand if it is old. Neither loses a job: the caller just retries
+`claude_start`. Run: `node --test test/multihost/startlock.test.mjs` (race + unit tests, ~11 s) or
+the full `npm run test:multihost`. Also needs a bridge restart to take effect (same reason as the
+claim-lock deploy note right below: `guard.mjs` is loaded in the running bridge's memory via
+`job-core.mjs`).
 - **Deploying: a bridge restart IS required.** The fallback fix changes `job-core.mjs` (it now imports
   `launcher-claim.mjs` and withdraws the ticket), and the running bridge has the old `job-core.mjs` in memory,
   so it keeps leaving the ticket behind until Claude Desktop restarts it (follow "Restarting the bridge"

@@ -35,3 +35,6 @@ test/dummy-env-dumper.exe
 # --- Scratch snapshot test/detach-survival.mjs / test/env-integrity.mjs write/remove at run time ---
 .job-core-before.mjs
 .job-core-before-env-test.mjs
+
+# --- Per-worktree task progress trace (not shared, not part of source) ---
+PROGRESS.md
