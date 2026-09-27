@@ -37,10 +37,10 @@ test("HOST_NAME_RE agrees with validateHostName on a spread of names", () => {
 });
 
 test("loadHostsConfig: a valid registry loads; receiver defaults to false; caps pass through", () => {
-  const cfg = load({ localHost: "laptop", hosts: { claunker: ENTRY, ha: { url: "https://ha.example:7850/x", token: "t2" } },
+  const cfg = load({ localHost: "laptop", hosts: { claunker: ENTRY, ha: { url: "https://100.100.1.2:7850/x", token: "t2" } },
                      caps: { maxConcurrent: 2 } });
   assert.deepEqual(cfg, { file: F, localHost: "laptop", receiver: false, caps: { maxConcurrent: 2 },
-                          hosts: { claunker: ENTRY, ha: { url: "https://ha.example:7850/x", token: "t2" } } });
+                          hosts: { claunker: ENTRY, ha: { url: "https://100.100.1.2:7850/x", token: "t2" } } });
   assert.deepEqual(load({ localHost: "ha", receiver: true }),
                    { file: F, localHost: "ha", receiver: true, hosts: {}, caps: undefined });
   assert.equal(load({ localHost: "ha", receiver: false }).receiver, false);

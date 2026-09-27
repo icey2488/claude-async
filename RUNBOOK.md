@@ -91,6 +91,10 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   every call and returns `host "x" is not in <file> (known hosts: ...)`, but the stale enum keeps advertising it until the
   restart. `job-core.mjs` is unchanged; `hosts.mjs`, `dispatch.mjs` and `host-api.mjs` are, so a running receiver also
   needs restarting to pick up the receiver gate.
+- **Registry urls must be Tailscale addresses.** A `hosts.<name>.url` host must be an IPv4 literal in 100.64.0.0/10, since a
+  receiver only binds a Tailscale address; anything else (hostname, IPv6, loopback, RFC1918, public) fails validation.
+  `CLAUDE_ASYNC_ALLOW_ANY_URL=1` skips that range check (not the http/https check) for tests and local development. It is
+  not a security control; do not set it in a bridge's environment on a real machine.
 - **The "laptop is not a remote dispatch target" message is gone.** The one-way topology is that the laptop is in nobody's
   registry: on Claunker `host: laptop` is `host "laptop" is not in <file> (known hosts: claunker)`.
 - **Job ids with an unknown prefix.** `claude_check` on `<name>.…` where `<name>` is a valid host name but not in the registry is an

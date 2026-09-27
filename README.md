@@ -103,6 +103,7 @@ Optional environment variables:
 | `CLAUDE_ASYNC_DEFAULT_MODEL` | `claude-sonnet-5` | Model used when `claude_start`'s `model` param is omitted |
 | `CLAUDE_ASYNC_DEFAULT_EFFORT` | `medium` | Reasoning effort used when `claude_start`'s `effort` param is omitted |
 | `CLAUDE_ASYNC_CONFIG_DIR` | `~/.claude-async` | Where `hosts.json`, `api.json`, `last-seen.json` live (see Multi-host) |
+| `CLAUDE_ASYNC_ALLOW_ANY_URL` | unset | `1` skips the Tailscale-range check on `hosts.json` urls (never the http/https check). For tests and local development only; a config-sanity check, NOT a security control (the receiver's bind address and token are what protect it) |
 | `CLAUDE_ASYNC_MAX_CONCURRENT` | `4` | Max running jobs on this host (`hosts.json` `caps.maxConcurrent` wins) |
 | `CLAUDE_ASYNC_MAX_STARTS_PER_MINUTE` | `6` | Max starts per rolling 60s on this host (`hosts.json` `caps.maxStartsPerMinute` wins) |
 
@@ -139,7 +140,7 @@ live; `claude_jobs` asks every registry host that has a `url`.
   |---|---|---|
   | `localHost` | yes | this machine's name; matches `^[a-z0-9][a-z0-9-]{0,31}$` (no dots: `.` is the job-id separator; no uppercase; not a Windows device name: `con prn aux nul com1`-`com9` `lpt1`-`lpt9`; it becomes an id prefix and part of dir names) |
   | `receiver` | no (default `false`) | boolean; `true` lets this machine run `host-api.mjs` |
-  | `hosts` | no | map name -> `{ "url", "token" }`; every name matches the pattern above and is not `localHost`; `url` is an http or https URL with a host; `token` is a non-empty string |
+  | `hosts` | no | map name -> `{ "url", "token" }`; every name matches the pattern above and is not `localHost`; `url` is an http or https URL whose host is an IPv4 literal in the Tailscale range 100.64.0.0/10 (a receiver only binds a Tailscale address; hostnames, IPv6, loopback, RFC1918 and public addresses are rejected); `token` is a non-empty string |
   | `caps` | no | object; `maxConcurrent` and `maxStartsPerMinute`, each optional and an integer >= 1 (no strings, 0, negatives or floats); unknown keys are an error; `{}` means the defaults (4 and 6) |
 
   A **dispatcher** (here the laptop, which sends to two receivers and is itself in nobody's registry):

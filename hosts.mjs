@@ -59,6 +59,17 @@ export const hostsFilePath = () => path.join(configDir(), "hosts.json");
 export const apiConfigPath = () => path.join(configDir(), "api.json");
 export const lastSeenPath = () => path.join(configDir(), "last-seen.json");
 
+// True only for a dotted-quad IPv4 literal (four decimal octets 0-255, no leading zeros) in
+// 100.64.0.0/10, the Tailscale CGNAT range. (Delegated to qwen2.5-coder:7b; its output was
+// rejected -- it refused any octet starting with "0" and compared concatenated digits -- so this is hand-written.)
+export function isTailscaleIPv4(host) {
+  const m = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(String(host));
+  if (!m) return false;
+  const o = m.slice(1).map(Number);
+  if (o.some((n) => n > 255)) return false;
+  return o[0] === 100 && o[1] >= 64 && o[1] <= 127;
+}
+
 // Delegated to qwen2.5-coder:7b (local ollama) with the exact signature + one example; accepted
 // verbatim (markdown fences stripped). randomInt(36) per char is unbiased; 36^8 ~ 2^41.
 const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
@@ -144,6 +155,9 @@ export function loadHostsConfig(file = hostsFilePath()) {
     try { u = new URL(entry.url); } catch { u = null; }
     if (!u || (u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) {
       return bad(`"hosts.${name}.url"`, `must be an http or https URL with a host (got ${JSON.stringify(entry.url)})`);
+    }
+    if (process.env.CLAUDE_ASYNC_ALLOW_ANY_URL !== "1" && !isTailscaleIPv4(u.hostname)) {
+      return bad(`"hosts.${name}.url"`, `must have an IPv4 literal host in 100.64.0.0/10 (the receiver only binds a Tailscale address; got ${JSON.stringify(entry.url)})`);
     }
     if (typeof entry.token !== "string" || entry.token === "") return bad(`"hosts.${name}.token"`, "is required (a non-empty string)");
     hosts[name] = { url: entry.url, token: entry.token };
