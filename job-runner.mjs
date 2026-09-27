@@ -125,14 +125,44 @@ const errFd = fs.openSync(err, "a");
 // off out.log/err.log on disk at exit time (not a ring buffer kept in memory), since stdout/
 // stderr go to those files' fds directly and the runner never sees the bytes itself.
 const TAIL_LINES = 20;
+// Upper bound on how much of a log file readTail() will read off disk. A job's out.log/err.log
+// can grow to many MB; reading the whole file just to keep the last 20 lines would be wasteful
+// (and slow) for a long-running or chatty job. 64 KiB is comfortably more than 20 lines of any
+// realistic CLI output while staying cheap to read on every exit.
+const TAIL_BYTES = 64 * 1024;
 
+// Reads at most the last TAIL_BYTES of `file` and returns its last TAIL_LINES lines. When the
+// read window starts after byte 0 (file bigger than TAIL_BYTES), the first line of the read
+// chunk is discarded: it is very likely a partial line (and, for multibyte UTF-8 content,
+// possibly a partial/split character too), since the cut point lands mid-line rather than on a
+// line boundary. Any failure (missing file, read error, decode error, ...) yields [] -- this is
+// best-effort diagnostic data, never allowed to break exit recording.
 function readTail(file) {
-  let text;
-  try { text = fs.readFileSync(file, "utf8"); } catch { return []; }
-  if (!text) return [];
-  const lines = text.split("\n");
-  if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the last write
-  return lines.slice(-TAIL_LINES).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - TAIL_BYTES);
+    const length = size - start;
+    const buf = Buffer.alloc(length);
+    if (length > 0) fs.readSync(fd, buf, 0, length, start);
+    let text = buf.toString("utf8");
+    if (start > 0) {
+      // Started mid-file: drop everything up to and including the first newline in the chunk,
+      // since that first "line" is actually the tail end of a line (or character) that began
+      // before our read window.
+      const nl = text.indexOf("\n");
+      text = nl === -1 ? "" : text.slice(nl + 1);
+    }
+    if (!text) return [];
+    const lines = text.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the last write
+    return lines.slice(-TAIL_LINES).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
 }
 
 let exitInfo = { exitCode: null, exitSignal: null, exitReason: "exit" };
@@ -164,7 +194,13 @@ function finish(code) {
   done = true;
   if (hbInterval) clearInterval(hbInterval);
   writeHeartbeat(); // final heartbeat immediately before recording exit code
-  membershipQuerier.close();
+  // Wrapped so a throw here (e.g. the membership-query child process misbehaving on close)
+  // cannot skip the exit_code / exit.json / card-close writes below.
+  try { membershipQuerier.close(); } catch {}
+  // Write exit.json BEFORE exit_code (and therefore before closeCard() too): exit_code is the
+  // signal most external readers poll for "the job is done", so any reader that observes
+  // exit_code must be able to rely on exit.json already existing on disk.
+  try { recordExit(); } catch {}
   try { fs.writeFileSync(exit, String(code)); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
@@ -175,7 +211,6 @@ function finish(code) {
     startHead = m.startHead || null;
   } catch {}
   try { closeCard(cardId, code, cwd, startHead); } catch {}
-  try { recordExit(); } catch {}
   try { fs.closeSync(outFd); } catch {}
   try { fs.closeSync(errFd); } catch {}
   process.exit(0);
@@ -218,6 +253,13 @@ if (child) {
     finish(127);
   });
   child.on("exit", (code, signal) => {
+    // On Windows, an external kill (taskkill /F, Task Manager -> End Task/TerminateProcess, a
+    // job-object teardown, ...) arrives here as signal=null with an exit code -- typically 1,
+    // the same code Node reports for a plain unhandled-error exit. That makes an externally
+    // killed process indistinguishable from an ordinary nonzero exit on this platform, so it is
+    // recorded as exitReason "exit", not "signal". This is DELIBERATE: no heuristic is added to
+    // try to detect "was this really a kill" from code 1 alone, because 1 is also the CLI's
+    // ordinary error exit code -- any such heuristic would misclassify real CLI failures.
     exitInfo = { exitCode: code, exitSignal: signal, exitReason: signal ? "signal" : "exit" };
     finish(code == null ? (signal ? 1 : 0) : code);
   });
