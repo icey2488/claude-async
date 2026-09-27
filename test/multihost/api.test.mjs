@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { api, fakeLaunch, tickets, jobDirs, readTicket, resetState, cfgFor, BIG_CAPS, TOKEN, apiCfgFor,
+import { api, hosts, fakeLaunch, tickets, jobDirs, readTicket, resetState, cfgFor, BIG_CAPS, TOKEN, apiCfgFor,
          listenLoopback, cleanupTmp, TMP } from "./_setup.mjs";
 
 const HOSTNAME = os.hostname();
@@ -57,12 +57,12 @@ test("selectBindAddress: picks the single Tailscale address; ambiguity needs exp
 test("startApi: every refusal happens before any listen; success listens on the Tailscale address only", async () => {
   const calls = [];
   const listen = async (server, port, address) => { calls.push({ port, address }); };
-  const good = { cfg: cfgFor("claunker"), apiCfg: { ...apiCfgFor(), port: 7850 }, listen };
+  const good = { cfg: cfgFor("claunker", { receiver: true }), apiCfg: { ...apiCfgFor(), port: 7850 }, listen };
   assert.match((await api.startApi({ ...good, interfaces: NON_TAILSCALE })).error, /no Tailscale address/);
   assert.match((await api.startApi({ ...good, interfaces: WITH_TAILSCALE, apiCfg: { ...good.apiCfg, bindAddress: "0.0.0.0" } })).error,
     /not a Tailscale address/);
   assert.match((await api.startApi({ ...good, interfaces: WITH_TAILSCALE, cfg: cfgFor("laptop") })).error,
-    /runs on a remote dispatch target only/);
+    /not a receiver: set "receiver": true in \(test hosts\.json\)/);
   assert.match((await api.startApi({ ...good, interfaces: WITH_TAILSCALE, cfg: { file: "f", error: "local host identity not configured" } })).error,
     /local host identity not configured/);
   assert.match((await api.startApi({ ...good, interfaces: WITH_TAILSCALE, apiCfg: { error: "API config not found" } })).error,
@@ -71,6 +71,43 @@ test("startApi: every refusal happens before any listen; success listens on the 
   const ok = await api.startApi({ ...good, interfaces: WITH_TAILSCALE });
   assert.ok(!ok.error, ok.error);
   assert.deepEqual(calls, [{ port: 7850, address: "100.101.102.103" }]);
+});
+
+test("receiver gate: startApi requires receiver === true, whatever the host is called", async () => {
+  const calls = [];
+  const listen = async (server, port, address) => { calls.push({ port, address }); };
+  const base = { apiCfg: { ...apiCfgFor(), port: 7850 }, listen, interfaces: WITH_TAILSCALE };
+  // absent, false, and anything not the boolean true: refused, naming the field, before any listen
+  for (const receiver of [undefined, false, null, "true", 1, "yes"]) {
+    for (const localHost of ["claunker", "ha", "laptop"]) {
+      const r = await api.startApi({ ...base, cfg: cfgFor(localHost, receiver === undefined ? {} : { receiver }) });
+      assert.match(r.error, /"receiver": true/, `${localHost} receiver=${String(receiver)}`);
+      assert.match(r.error, new RegExp(`localHost=${localHost}`));
+      assert.equal(r.server, undefined);
+    }
+  }
+  assert.equal(calls.length, 0, "no refusal path may reach listen()");
+  // receiver: true starts, on any valid host name (the gate is the field, not a hard-coded name)
+  for (const localHost of ["claunker", "ha"]) {
+    const ok = await api.startApi({ ...base, cfg: cfgFor(localHost, { receiver: true }) });
+    assert.ok(!ok.error, ok.error);
+    assert.equal(ok.address, "100.101.102.103");
+  }
+  assert.equal(calls.length, 2);
+});
+
+test("receiver gate end to end: a real hosts.json without / with receiver: true", async () => {
+  const f = path.join(TMP, "receiver-hosts.json");
+  const listen = async () => {};
+  const start = async (obj) => {
+    fs.writeFileSync(f, JSON.stringify(obj));
+    return api.startApi({ cfg: hosts.loadHostsConfig(f), apiCfg: { ...apiCfgFor(), port: 7850 }, listen, interfaces: WITH_TAILSCALE });
+  };
+  assert.match((await start({ localHost: "ha" })).error, /not a receiver: set "receiver": true in .*receiver-hosts\.json/);
+  assert.match((await start({ localHost: "ha", receiver: false })).error, /not a receiver/);
+  assert.match((await start({ localHost: "ha", receiver: "true" })).error, /"receiver" must be true or false/);
+  const ok = await start({ localHost: "ha", receiver: true });
+  assert.ok(!ok.error, ok.error);
 });
 
 test("api.json holds only a sha256 hash; plaintext/garbage is refused", () => {

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * host-api.mjs — Claunker's remote dispatch API (design item 1). Runs on claunker ONLY.
+ * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
+ * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
  *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
@@ -21,7 +22,7 @@
  * Config (user profile, never the repo): ~/.claude-async/api.json
  *   { "port": 7850, "tokenSha256": "<64 hex>", "bindAddress": "100.x.y.z" (optional; required
  *     only if more than one Tailscale address is present) }
- * plus hosts.json's "localHost", which must be "claunker".
+ * plus hosts.json's "localHost" (this receiver's own name) and "receiver": true.
  *
  *   node host-api.mjs --new-token   mint a token, store its hash in api.json, print it ONCE
  *   node host-api.mjs               start the API
@@ -34,7 +35,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkJob, listJobs } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
-import { HOSTS, REMOTE_DISPATCH_TARGETS, loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
+import { HOSTS, loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
 import { DEPTH_HEADER } from "./guard.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 
@@ -139,7 +140,7 @@ function readBody(req) {
 
 const optStr = (v) => v === undefined || v === null || typeof v === "string";
 
-// cfg: loadHostsConfig() result (localHost must be claunker); apiCfg: loadApiConfig() result.
+// cfg: loadHostsConfig() result (this receiver's own registry); apiCfg: loadApiConfig() result.
 // startOptions: job-core startJob seams (tests only). Returns an http.Server that is NOT listening.
 export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
   const localHost = cfg.localHost;
@@ -205,9 +206,9 @@ const defaultListen = (server, port, address) => new Promise((resolve, reject) =
 export async function startApi({ interfaces = os.networkInterfaces(), cfg = loadHostsConfig(), apiCfg = loadApiConfig(),
                                  listen = defaultListen, startOptions } = {}) {
   if (cfg.error) return { error: cfg.error };
-  if (!REMOTE_DISPATCH_TARGETS.has(cfg.localHost)) {
-    return { error: `the host API runs on a remote dispatch target only (${[...REMOTE_DISPATCH_TARGETS].join(", ")}); ` +
-      `${cfg.file} says localHost=${cfg.localHost}` };
+  if (cfg.receiver !== true) {
+    return { error: `this machine is not a receiver: set "receiver": true in ${cfg.file} to run the host API here ` +
+      `(localHost=${cfg.localHost}, receiver=${JSON.stringify(cfg.receiver ?? null)})` };
   }
   if (apiCfg.error) return { error: apiCfg.error };
   const sel = selectBindAddress(interfaces, apiCfg.bindAddress);
@@ -247,7 +248,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const { token, file, error } = newToken();
     if (error) { console.error(`claude-async host API: ${error}`); process.exit(1); }
     console.log(`Stored sha256 of a new token in ${file} (the token itself is not stored).`);
-    console.log(`Token (shown once; put it in the laptop's hosts.json under hosts.claunker.token):\n${token}`);
+    const self = loadHostsConfig().localHost || "<this host's name>";
+    console.log(`Token (shown once; put it in each dispatching machine's hosts.json under hosts.${self}.token):\n${token}`);
   } else {
     const r = await startApi();
     if (r.error) { console.error(`claude-async host API: ${r.error}`); process.exit(1); }
