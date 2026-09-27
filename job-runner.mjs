@@ -41,6 +41,7 @@ import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
 import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
+import { writeJsonAtomic } from "./atomic.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -116,6 +117,45 @@ function writeHeartbeat() {
 const outFd = fs.openSync(out, "a");
 const errFd = fs.openSync(err, "a");
 
+// Exit record: written to its OWN file (exit.json, next to meta.json), never merged into
+// meta.json. meta.json already has a writer (job-core), and a second, independent
+// read-modify-write from this process racing that one would silently drop whichever side lost
+// the rename -- one writer per file. Fields: exitCode/exitSignal/exitReason (+ spawnError on a
+// spawn failure), endedAt, and stderrTail/stdoutTail -- the last TAIL_LINES lines read straight
+// off out.log/err.log on disk at exit time (not a ring buffer kept in memory), since stdout/
+// stderr go to those files' fds directly and the runner never sees the bytes itself.
+const TAIL_LINES = 20;
+
+function readTail(file) {
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch { return []; }
+  if (!text) return [];
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the last write
+  return lines.slice(-TAIL_LINES).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+}
+
+let exitInfo = { exitCode: null, exitSignal: null, exitReason: "exit" };
+
+// Best-effort: a runner that cannot record must still finish normally.
+function recordExit() {
+  const exitPath = path.join(path.dirname(specPath), "exit.json");
+  const record = {
+    exitCode: exitInfo.exitCode,
+    exitSignal: exitInfo.exitSignal,
+    exitReason: exitInfo.exitReason,
+    endedAt: new Date().toISOString(),
+    stderrTail: readTail(err),
+    stdoutTail: readTail(out),
+    // No reliable CLI usage-limit message pattern exists in this repo (no fixture or test carries
+    // one), so this is deliberately unknown rather than a guessed regex.
+    usageLimitSuspected: null,
+  };
+  if (exitInfo.spawnError !== undefined) record.spawnError = exitInfo.spawnError;
+  try { writeJsonAtomic(exitPath, record); }
+  catch (e) { try { fs.writeSync(errFd, `\n[job-runner] could not write exit.json: ${e.message}\n`); } catch {} }
+}
+
 let done = false;
 let hbInterval;
 
@@ -135,6 +175,7 @@ function finish(code) {
     startHead = m.startHead || null;
   } catch {}
   try { closeCard(cardId, code, cwd, startHead); } catch {}
+  try { recordExit(); } catch {}
   try { fs.closeSync(outFd); } catch {}
   try { fs.closeSync(errFd); } catch {}
   process.exit(0);
@@ -166,15 +207,18 @@ try {
   child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true, env: spawnEnv });
 } catch (e) {
   try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
+  exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
   finish(127);
 }
 
 if (child) {
   child.on("error", (e) => {
     try { fs.writeSync(errFd, `\n[job-runner] spawn error for ${command}: ${e.message}\n`); } catch {}
+    if (!done) exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
     finish(127);
   });
   child.on("exit", (code, signal) => {
+    exitInfo = { exitCode: code, exitSignal: signal, exitReason: signal ? "signal" : "exit" };
     finish(code == null ? (signal ? 1 : 0) : code);
   });
 }
