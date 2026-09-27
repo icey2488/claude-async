@@ -37,6 +37,10 @@ import { writeJsonAtomic } from "./atomic.mjs";
 // No dots (the job-id separator), no uppercase (host names become dir names / id prefixes).
 export const HOST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
+// Windows device names: a host name becomes a job-id prefix and a job directory name on whichever
+// host mints or checks it, and these cannot be created as files or directories there.
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
+
 // Returns null when `name` is a valid host name, else a one-line reason.
 export function validateHostName(name) {
   if (typeof name !== "string") return "must be a string";
@@ -45,6 +49,7 @@ export function validateHostName(name) {
   if (/[A-Z]/.test(name)) return "must be lowercase (no uppercase letters)";
   if (name.includes(".")) return 'must not contain "." (it separates the host from the rest of a job id)';
   if (!HOST_NAME_RE.test(name)) return "must contain only a-z, 0-9 and \"-\", and start with a letter or digit";
+  if (WINDOWS_RESERVED.test(name)) return "is a reserved device name on Windows";
   return null;
 }
 

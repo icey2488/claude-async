@@ -137,7 +137,7 @@ live; `claude_jobs` asks every registry host that has a `url`.
 
   | Field | Required | Rule |
   |---|---|---|
-  | `localHost` | yes | this machine's name; matches `^[a-z0-9][a-z0-9-]{0,31}$` (no dots: `.` is the job-id separator; no uppercase; it becomes an id prefix and part of dir names) |
+  | `localHost` | yes | this machine's name; matches `^[a-z0-9][a-z0-9-]{0,31}$` (no dots: `.` is the job-id separator; no uppercase; not a Windows device name: `con prn aux nul com1`-`com9` `lpt1`-`lpt9`; it becomes an id prefix and part of dir names) |
   | `receiver` | no (default `false`) | boolean; `true` lets this machine run `host-api.mjs` |
   | `hosts` | no | map name -> `{ "url", "token" }`; every name matches the pattern above and is not `localHost`; `url` is an http or https URL with a host; `token` is a non-empty string |
   | `caps` | no | object; `maxConcurrent` and `maxStartsPerMinute`, each optional and an integer >= 1 (no strings, 0, negatives or floats); unknown keys are an error; `{}` means the defaults (4 and 6) |
