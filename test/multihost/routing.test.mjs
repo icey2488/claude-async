@@ -1,5 +1,6 @@
-// Forward vs local routing, unknown hosts, laptop-is-not-a-target, claude_check by prefix (old ids
-// still local), claude_jobs' explicit unreachable row, and hostname on every response.
+// Forward vs local routing over a registry-driven host list, unknown hosts (which list the known
+// ones), the one-way topology as config (a host in nobody's registry is unknown), claude_check by
+// prefix (old ids still local), claude_jobs' explicit unreachable row, and hostname on every response.
 import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -36,16 +37,50 @@ test("resolveRoute: the routing table", () => {
   assert.deepEqual(hosts.resolveRoute("claunker", onLaptop),
     { kind: "forward", host: "claunker", url: "http://100.100.1.1:7850", token: "t" });
   assert.deepEqual(hosts.resolveRoute("claunker", onClaunker), { kind: "local" });
-  assert.equal(hosts.resolveRoute("laptop", onClaunker).error, "laptop is not a remote dispatch target");
-  // even a registry entry can't make the laptop a target
-  assert.equal(hosts.resolveRoute("laptop", { ...onClaunker, hosts: { laptop: { url: "http://x", token: "t" } } }).error,
-    "laptop is not a remote dispatch target");
-  assert.match(hosts.resolveRoute("claunker", { file: "f", localHost: "laptop", hosts: {} }).error,
-    /^host claunker has no registry entry/);
-  assert.match(hosts.resolveRoute("desktop", onLaptop).error, /^unknown host "desktop"/);
-  assert.match(hosts.resolveRoute(undefined, onLaptop).error, /^unknown host/);
+  // the one-way topology is config: the laptop is in nobody's registry, so it is simply unknown
+  assert.equal(hosts.resolveRoute("laptop", onClaunker).error,
+    'host "laptop" is not in f (known hosts: claunker)');
+  assert.equal(hosts.resolveRoute("claunker", { file: "f", localHost: "laptop", hosts: {} }).error,
+    'host "claunker" is not in f (known hosts: laptop)');
+  assert.equal(hosts.resolveRoute("desktop", onLaptop).error, 'host "desktop" is not in f (known hosts: laptop, claunker)');
+  assert.match(hosts.resolveRoute(undefined, onLaptop).error, /^host "undefined" is not in f \(known hosts: laptop, claunker\)$/);
+  assert.match(hosts.resolveRoute("__proto__", onLaptop).error, /^host "__proto__" is not in f/);
+  assert.match(hosts.resolveRoute("toString", onLaptop).error, /^host "toString" is not in f/, "inherited keys are not hosts");
+  // an entry without url or token is not a dispatch target (validated configs never contain one)
+  assert.match(hosts.resolveRoute("ha", { file: "f", localHost: "a", hosts: { ha: { url: "http://x" } } }).error, /is not in f/);
   assert.match(hosts.resolveRoute("claunker", { file: "f", error: "local host identity not configured: x" }).error,
     /local host identity not configured/);
+});
+
+test("three-host registry (claunker local, ha remote, laptop absent): ha forwards, laptop is unknown", async () => {
+  const cfg = { file: "hosts.json", localHost: "claunker",
+                hosts: { ha: { url: "http://100.100.2.2:7850", token: "tok-ha" } } };
+  assert.deepEqual(hosts.resolveRoute("claunker", cfg), { kind: "local" });
+  assert.deepEqual(hosts.resolveRoute("ha", cfg), { kind: "forward", host: "ha", url: "http://100.100.2.2:7850", token: "tok-ha" });
+  assert.equal(hosts.resolveRoute("laptop", cfg).error, 'host "laptop" is not in hosts.json (known hosts: claunker, ha)');
+
+  const seen = [];
+  const peer = fakePeer({ jobId: "ha.j-20260926-abcdefgh", status: "running" }, { seen });
+  const ctx = ctxFor(cfg, { fetch: peer });
+  const r = await dispatch.dispatchStart({ host: "ha", prompt: "p" }, ctx);
+  assert.equal(r.jobId, "ha.j-20260926-abcdefgh");
+  assert.equal(r.host, "ha");
+  assert.deepEqual(r.forwardedBy, { host: "claunker", hostname: HOSTNAME });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, "http://100.100.2.2:7850/v1/start");
+  assert.equal(seen[0].init.headers.authorization, "Bearer tok-ha");
+  assert.equal(JSON.parse(seen[0].init.body).host, "ha");
+  // claude_check routes an ha.* id to ha
+  const chk = await dispatch.dispatchCheck("ha.j-20260926-abcdefgh", 100, ctx);
+  assert.equal(chk.host, "ha");
+  assert.equal(seen.length, 2);
+  assert.match(seen[1].url, /^http:\/\/100\.100\.2\.2:7850\/v1\/check\?jobId=ha\.j-20260926-abcdefgh/);
+
+  const lap = await dispatch.dispatchStart({ host: "laptop", prompt: "p" }, ctx);
+  assert.equal(lap.error, 'host "laptop" is not in hosts.json (known hosts: claunker, ha)');
+  assert.equal(seen.length, 2, "an unknown host never touches the network");
+  assert.equal(tickets().length, 0);
+  assert.equal(jobDirs().length, 0);
 });
 
 test("local host = laptop, host: laptop -> runs locally, no network hop", async () => {
@@ -67,21 +102,21 @@ test("local host = claunker, host: claunker -> runs locally, no network hop", as
   assert.equal(tickets().length, 1);
 });
 
-test("local host = claunker, host: laptop -> error, nothing written", async () => {
+test("local host = claunker, host: laptop -> error listing the known hosts, nothing written", async () => {
   const r = await dispatch.dispatchStart({ host: "laptop", prompt: "p" },
                                          ctxFor({ file: "f", localHost: "claunker", hosts: {} }, { fetch: noFetch }));
-  assert.equal(r.error, "laptop is not a remote dispatch target");
+  assert.equal(r.error, 'host "laptop" is not in f (known hosts: claunker)');
   assert.equal(r.hostname, HOSTNAME);
   assert.equal(tickets().length, 0);
   assert.equal(jobDirs().length, 0);
 });
 
-test("unknown host / missing registry entry / unconfigured local host -> errors naming the host, nothing written", async () => {
+test("unknown host / host absent from the registry / unconfigured local host -> errors naming the host, nothing written", async () => {
   const onLaptop = ctxFor({ file: "hosts.json", localHost: "laptop", hosts: {} }, { fetch: noFetch });
   const a = await dispatch.dispatchStart({ host: "desktop", prompt: "p" }, onLaptop);
-  assert.match(a.error, /unknown host "desktop"/);
+  assert.equal(a.error, 'host "desktop" is not in hosts.json (known hosts: laptop)');
   const b = await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, onLaptop);
-  assert.match(b.error, /host claunker has no registry entry/);
+  assert.equal(b.error, 'host "claunker" is not in hosts.json (known hosts: laptop)');
   const c = await dispatch.dispatchStart({ host: "claunker", prompt: "p" },
                                          ctxFor(hosts.loadHostsConfig(path.join(TMP, "absent.json")), { fetch: noFetch }));
   assert.match(c.error, /local host identity not configured/);
@@ -141,11 +176,31 @@ test("claude_check: old un-prefixed ids still checkable locally (even with no ho
   const l = await dispatch.dispatchCheck(lookalike, 100, ctxFor({ file: "f", localHost: "laptop", hosts: {} }, { fetch: noFetch }));
   assert.equal(l.error, "no such job");
   assert.equal(l.hostname, HOSTNAME);
-  // a laptop.* id checked on claunker can't be reached (laptop is never a target)
+  // a laptop.* id checked on claunker: the laptop is in no registry, so its prefix is not a known host
   const lp = await dispatch.dispatchCheck("laptop.x-20260925-abcdefgh", 100,
                                           ctxFor({ file: "f", localHost: "claunker", hosts: {} }, { fetch: noFetch }));
-  assert.equal(lp.error, "laptop is not a remote dispatch target");
+  assert.equal(lp.error, 'job id "laptop.x-20260925-abcdefgh" has host prefix "laptop", which is not in f (known hosts: claunker)');
+  assert.equal(lp.status, "unknown");
+  assert.equal(lp.host, "laptop");
   assert.equal(lp.hostname, HOSTNAME);
+});
+
+test("claude_check: an id whose prefix is not a known host is a clear error, never a silent local lookup", async () => {
+  // a real job dir exists under exactly that id: a "silent local lookup" would find it
+  const id = "ha.x-20260926-abcdefgh";
+  fs.mkdirSync(path.join(JOBS, id));
+  fs.writeFileSync(path.join(JOBS, id, "meta.json"), JSON.stringify({ jobId: id, pid: 99999999, startedAt: new Date().toISOString() }));
+  fs.writeFileSync(path.join(JOBS, id, "exit_code"), "0");
+  const ctx = ctxFor({ file: "hosts.json", localHost: "claunker", hosts: { laptop: { url: "http://100.1.1.1:7850", token: "t" } } },
+                     { fetch: noFetch });
+  const r = await dispatch.dispatchCheck(id, 100, ctx);
+  assert.equal(r.error, `job id "${id}" has host prefix "ha", which is not in hosts.json (known hosts: claunker, laptop)`);
+  assert.equal(r.status, "unknown");
+  assert.equal(r.stdout, undefined, "the local job dir was not read");
+  assert.equal(r.hostname, HOSTNAME);
+  // a broken config keeps its own error rather than pretending to list hosts
+  const broken = await dispatch.dispatchCheck(id, 100, ctxFor(hosts.loadHostsConfig(path.join(TMP, "absent.json")), { fetch: noFetch }));
+  assert.match(broken.error, /local host identity not configured/);
 });
 
 test("claude_jobs: unreachable host is an explicit row, with last-seen time once known", async () => {

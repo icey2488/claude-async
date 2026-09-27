@@ -35,7 +35,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkJob, listJobs } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
-import { HOSTS, loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
+import { loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
 import { DEPTH_HEADER } from "./guard.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 
@@ -178,7 +178,7 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
       if (req.method === "GET" && url.pathname === "/v1/check") {
         const jobId = url.searchParams.get("jobId") || "";
         const tailBytes = Math.min(Math.max(Number(url.searchParams.get("tailBytes")) || 8000, 0), 1_000_000);
-        const { host } = parseHostPrefix(jobId, HOSTS);
+        const { host } = parseHostPrefix(jobId);
         if (host && host !== localHost) {
           return send(res, 404, { jobId, host, hostname, status: "unknown",
                                   error: `job ${jobId} belongs to host ${host}, not ${localHost}` });

@@ -3,10 +3,10 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { hosts, cleanupTmp } from "./_setup.mjs";
 
-const { genSuffix, parseHostPrefix, mintJobId, sanitizeDescriptor, HOSTS } = hosts;
+const { genSuffix, parseHostPrefix, mintJobId, sanitizeDescriptor } = hosts;
 after(cleanupTmp);
 
-const ID_RE = /^(claunker|laptop)\.[A-Za-z0-9_-]{1,64}-\d{8}-[a-z0-9]{8}$/;
+const ID_RE = /^(claunker|laptop|ha)\.[A-Za-z0-9_-]{1,64}-\d{8}-[a-z0-9]{8}$/;
 
 test("genSuffix: 8 chars from [a-z0-9], one randomInt(36) per char (delegated helper example)", () => {
   let i = 0;
@@ -49,9 +49,18 @@ test("mintJobId: <host>.<descriptor>-YYYYMMDD-<8>, exactly one dot, suffix alway
     const m = mintJobId({ host: "claunker", descriptor: d });
     assert.match(m, ID_RE, `descriptor ${d} -> ${m}`);
     assert.equal(m.split(".").length, 2, `exactly one dot in ${m}`);
-    assert.deepEqual(parseHostPrefix(m, HOSTS).host, "claunker");
+    assert.deepEqual(parseHostPrefix(m).host, "claunker");
   }
-  assert.throws(() => mintJobId({ host: "desktop" }), /unknown host/);
+  // any valid host name mints (the list is the registry's, not the code's) ...
+  const ha = mintJobId({ host: "ha", descriptor: "on-ha", now, suffix: "k3v9x0qa" });
+  assert.equal(ha, "ha.on-ha-20260925-k3v9x0qa");
+  assert.match(mintJobId({ host: "desktop", now }), /^desktop\.job-20260925-[a-z0-9]{8}$/);
+  assert.deepEqual(parseHostPrefix(ha), { host: "ha", rest: "on-ha-20260925-k3v9x0qa" });
+  // ... and an invalid one throws, naming the reason (a dot would corrupt the id's separator)
+  for (const bad of ["a.b", "Ha", "", " ", "x".repeat(33), undefined, null, "-a"]) {
+    assert.throws(() => mintJobId({ host: bad }), /cannot mint a job id for host/, String(bad));
+  }
+  assert.throws(() => mintJobId({ host: "a.b" }), /must not contain "\."/);
 });
 
 test("sanitizeDescriptor: bounded, never empty", () => {
@@ -61,20 +70,25 @@ test("sanitizeDescriptor: bounded, never empty", () => {
   assert.equal(sanitizeDescriptor("x".repeat(100)).length, 64);
 });
 
-test("parseHostPrefix: exact enum match only (delegated helper example)", () => {
-  assert.deepEqual(parseHostPrefix("claunker.fix-bug-20260925-a1b2c3d4", HOSTS),
+test("parseHostPrefix: any valid host name before the first dot, and nothing else", () => {
+  assert.deepEqual(parseHostPrefix("claunker.fix-bug-20260925-a1b2c3d4"),
     { host: "claunker", rest: "fix-bug-20260925-a1b2c3d4" });
-  assert.deepEqual(parseHostPrefix("laptop.x", HOSTS), { host: "laptop", rest: "x" });
+  assert.deepEqual(parseHostPrefix("laptop.x"), { host: "laptop", rest: "x" });
+  assert.deepEqual(parseHostPrefix("ha.fix-bug-20260926-a1b2c3d4"), { host: "ha", rest: "fix-bug-20260926-a1b2c3d4" });
+  assert.deepEqual(parseHostPrefix("desktop.x"), { host: "desktop", rest: "x" }, "known-ness is the caller's question");
+  assert.deepEqual(parseHostPrefix("ha.a.b.c"), { host: "ha", rest: "a.b.c" }, "only the first dot separates");
   // old, un-prefixed ids resolve as un-prefixed (=> local)
   for (const old of ["1727300000000-a1b2c3", "gallagioloot-multi-url-rows-20260925",
                      "claude-async-multihost-20260925-r3", "selftest-123"]) {
-    assert.deepEqual(parseHostPrefix(old, HOSTS), { host: null, rest: old });
+    assert.deepEqual(parseHostPrefix(old), { host: null, rest: old });
   }
-  // merely STARTS with a host name, no dot directly after it: not a prefix
-  for (const id of ["claunkerfoo-20260925-abcdefgh", "claunker-fix-20260925", "claunker_x.y", "laptops.x",
-                    "Claunker.x", "CLAUNKER.x", "desktop.x", ".claunker", "claunker"]) {
-    assert.equal(parseHostPrefix(id, HOSTS).host, null, id);
-    assert.equal(parseHostPrefix(id, HOSTS).rest, id, id);
+  // merely STARTS with a host name, no dot directly after it, or a prefix that is not a valid name: not a prefix
+  for (const id of ["claunkerfoo-20260925-abcdefgh", "claunker-fix-20260925", "claunker_x.y",
+                    "Claunker.x", "CLAUNKER.x", ".claunker", "claunker", "my job.x", "a_b.x", "-a.x",
+                    `${"x".repeat(33)}.y`]) {
+    assert.equal(parseHostPrefix(id).host, null, id);
+    assert.equal(parseHostPrefix(id).rest, id, id);
   }
-  assert.deepEqual(parseHostPrefix(undefined, HOSTS), { host: null, rest: undefined });
+  assert.deepEqual(parseHostPrefix(undefined), { host: null, rest: undefined });
+  assert.deepEqual(parseHostPrefix(42), { host: null, rest: 42 });
 });

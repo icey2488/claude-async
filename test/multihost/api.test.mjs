@@ -268,3 +268,30 @@ for (const [label, content] of [["garbage", "{{ not json"], ["truncated", '{"por
     assert.deepEqual(fs.readdirSync(TMP).filter((n) => n.startsWith(path.basename(f)) && n.endsWith(".tmp")), []);
   });
 }
+
+test("a receiver named ha: mints ha.* ids, accepts host ha only, and 404s another host's ids on check", async () => {
+  const server = api.createApiServer({ cfg: cfgFor("ha", { caps: BIG_CAPS, receiver: true }), apiCfg: apiCfgFor(),
+                                       startOptions: { launch: fakeLaunch } });
+  servers.push(server);
+  const url = await listenLoopback(server);
+  const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const post = async (body) => {
+    const res = await fetch(url + "/v1/start", { method: "POST", headers: auth, body: JSON.stringify(body) });
+    return { status: res.status, body: await res.json() };
+  };
+  const wrong = await post({ host: "claunker", prompt: "p" });
+  assert.equal(wrong.status, 400);
+  assert.match(wrong.body.error, /this API executes on ha only \(got host "claunker"\)/);
+  assert.equal(tickets().length, 0);
+  const good = await post({ host: "ha", prompt: "p", jobId: "on-ha" });
+  assert.equal(good.status, 200, JSON.stringify(good.body));
+  assert.match(good.body.jobId, /^ha\.on-ha-\d{8}-[a-z0-9]{8}$/);
+  assert.equal(good.body.host, "ha");
+  assert.equal(tickets().length, 1);
+  const own = await (await fetch(`${url}/v1/check?jobId=${encodeURIComponent(good.body.jobId)}`, { headers: auth })).json();
+  assert.equal(own.status, "running");
+  assert.equal(own.host, "ha");
+  const foreign = await fetch(`${url}/v1/check?jobId=claunker.x-20260926-abcdefgh`, { headers: auth });
+  assert.equal(foreign.status, 404);
+  assert.match((await foreign.json()).error, /belongs to host claunker, not ha/);
+});

@@ -2,8 +2,11 @@
  * dispatch.mjs — MCP tool surface + stateless multi-host router for claude-async.
  *
  * claude_start takes a REQUIRED `host`. If it names this machine (hosts.json "localHost") the
- * existing local path runs with no network hop; otherwise the request is forwarded to that host's
- * host-api.mjs (see hosts.mjs for the routing rules and registry). The forwarder stores nothing:
+ * existing local path runs with no network hop; if it names a hosts.json registry entry the request
+ * is forwarded to that host's host-api.mjs; anything else is an error listing the known hosts (see
+ * hosts.mjs for the routing rules and registry). The `host` enum the client sees is built from the
+ * registry when the bridge starts; routing validates against the live file on every call. The
+ * forwarder stores nothing:
  * the job record lives only on the executing host, claude_check routes by the job id's host
  * prefix, and claude_jobs asks every registry host live. The one piece of forwarder-side state is
  * last-seen.json, used only to render an unreachable host's row.
@@ -14,7 +17,7 @@
 import { z } from "zod";
 import os from "node:os";
 import { startJob, checkJob, listJobs } from "./job-core.mjs";
-import { HOSTS, loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, readLastSeen, recordLastSeen,
+import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
 import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
 
@@ -81,9 +84,15 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
 }
 
 export async function dispatchCheck(jobId, tailBytes = 8000, ctx = defaultCtx()) {
-  const { host } = parseHostPrefix(jobId, HOSTS);
+  const { host } = parseHostPrefix(jobId);
   // Un-prefixed ids predate multihost and are always local; this path needs no config at all.
   if (!host) return { host: ctx.cfg.localHost ?? null, ...checkJob(jobId, tailBytes) };
+  // A prefix that is a valid host name but not in the registry is an error, never a local lookup.
+  if (!ctx.cfg.error && !knownHosts(ctx.cfg).includes(host)) {
+    return { jobId, host, hostname: os.hostname(), status: "unknown",
+             error: `job id ${JSON.stringify(jobId)} has host prefix "${host}", which is not in ${ctx.cfg.file} ` +
+                    `(known hosts: ${knownHosts(ctx.cfg).join(", ")})` };
+  }
   const route = resolveRoute(host, ctx.cfg);
   if (route.error) return { jobId, host, hostname: os.hostname(), status: "unknown", error: route.error };
   if (route.kind === "local") return { host, ...checkJob(jobId, tailBytes) };
@@ -125,19 +134,36 @@ export async function dispatchJobs(ctx = defaultCtx()) {
            count: all.length, hosts, jobs: all };
 }
 
-// getCtx: test seam; production builds a fresh ctx (and so re-reads hosts.json) per call.
+// The `host` parameter: a REQUIRED enum of the registry's known hosts, fixed for this bridge's
+// lifetime (a tool schema is advertised once). If hosts.json is unusable at startup there is no
+// registry to enumerate, so it degrades to a plain string and the per-call routing error (which
+// names the file and field) is what the caller sees.
+function hostParam(cfg) {
+  if (cfg.error) {
+    return z.string().describe(`REQUIRED. Executing host. hosts.json is unusable, so every claude_start ` +
+                               `will be refused until it is fixed: ${cfg.error}`);
+  }
+  const names = knownHosts(cfg);
+  return z.enum(names).describe(`REQUIRED. Executing host, one of: ${names.join(", ")} (this machine is ` +
+    `${cfg.localHost}). No default. To add a host, edit hosts.json and restart the bridge.`);
+}
+
+// getCtx: test seam; production builds a fresh ctx (and so re-reads hosts.json) per call. The
+// host enum is built once here from the registry as it is at startup; each call still validates
+// the requested host against the live file, so a host removed since startup is refused.
 export function registerTools(server, { getCtx = defaultCtx } = {}) {
   const ok = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 2) }] });
+  const hostSchema = hostParam(getCtx().cfg);
 
   server.registerTool("claude_start", {
     description: "Start a Claude Code task as a detached background job and return a jobId immediately. " +
                  "Use for any work that might run longer than ~30s. Poll with claude_check. `host` is " +
-                 "REQUIRED and names the machine the job executes on (claunker = the build machine, " +
-                 "reached over Tailscale when this isn't it; laptop = this laptop only). The response " +
-                 "includes the executing hostname and, on success, \"preflight passed, execution " +
-                 "unverified\" (binary + workFolder exist; the job itself may still fail).",
+                 "REQUIRED and names the machine the job executes on: this machine runs it locally, any " +
+                 "other host in hosts.json is reached over Tailscale (the `host` parameter lists them). " +
+                 "The response includes the executing hostname and, on success, \"preflight passed, " +
+                 "execution unverified\" (binary + workFolder exist; the job itself may still fail).",
     inputSchema: {
-      host: z.enum(HOSTS).describe("REQUIRED. Executing host: \"claunker\" or \"laptop\". No default."),
+      host: hostSchema,
       prompt: z.string().describe("The task for Claude Code. Include CWD context if it does file/git work."),
       intent: z.string().optional().describe("Optional one-line intent that becomes the dispatch card's " +
                   "TITLE (the board face most users actually see — the jobId never appears there). " +

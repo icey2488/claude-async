@@ -37,10 +37,6 @@ import { writeJsonAtomic } from "./atomic.mjs";
 // No dots (the job-id separator), no uppercase (host names become dir names / id prefixes).
 export const HOST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
-export const HOSTS = ["claunker", "laptop"];
-// Hosts another machine may forward to. The laptop never exposes an API.
-export const REMOTE_DISPATCH_TARGETS = new Set(["claunker"]);
-
 // Returns null when `name` is a valid host name, else a one-line reason.
 export function validateHostName(name) {
   if (typeof name !== "string") return "must be a string";
@@ -70,14 +66,15 @@ export function genSuffix(randomInt = crypto.randomInt) {
   return suffix;
 }
 
-// Delegated to qwen2.5-coder:7b (local ollama) with the exact signature + one example; accepted
-// verbatim (markdown fences stripped).
-export function parseHostPrefix(jobId, hosts) {
+// Originally delegated to qwen2.5-coder:7b (local ollama); reworked by hand when the host list
+// became registry-driven. A prefix is any valid host name before the first dot; whether it is a
+// KNOWN host is the caller's question (claude_check answers it against the live registry).
+export function parseHostPrefix(jobId) {
   if (typeof jobId !== 'string') return { host: null, rest: jobId };
   const dotIndex = jobId.indexOf('.');
   if (dotIndex <= 0) return { host: null, rest: jobId };
   const prefix = jobId.substring(0, dotIndex);
-  if (hosts.includes(prefix)) return { host: prefix, rest: jobId.substring(dotIndex + 1) };
+  if (validateHostName(prefix) === null) return { host: prefix, rest: jobId.substring(dotIndex + 1) };
   return { host: null, rest: jobId };
 }
 
@@ -96,7 +93,8 @@ function yyyymmdd(now) {
 // The EXECUTING host mints the id (it knows its own identity); a forwarder only passes the
 // descriptor through. The 8-char suffix is always appended, custom descriptor or not.
 export function mintJobId({ host, descriptor, now = new Date(), suffix = genSuffix() }) {
-  if (!HOSTS.includes(host)) throw new Error(`cannot mint a job id for unknown host ${JSON.stringify(host)}`);
+  const bad = validateHostName(host);
+  if (bad) throw new Error(`cannot mint a job id for host ${JSON.stringify(host)}: ${bad}`);
   return `${host}.${sanitizeDescriptor(descriptor)}-${yyyymmdd(now)}-${suffix}`;
 }
 
@@ -151,20 +149,18 @@ export function loadHostsConfig(file = hostsFilePath()) {
 // Every host this registry knows: this machine, then each remote entry.
 export const knownHosts = (cfg) => [cfg.localHost, ...Object.keys(cfg.hosts || {})];
 
-// Routing rules (design item 9):
-//   local = laptop:   host claunker -> forward over Tailscale; host laptop -> local
-//   local = claunker: host claunker -> local;                  host laptop  -> error
+// Routing rules:
+//   host === localHost                      -> local (no network hop)
+//   registry entry with url + token         -> forward to that host's host-api
+//   anything else                           -> error naming the file and the known hosts
+// One-way topology is config: a machine no registry lists (the laptop) is simply unknown.
 // Returns { kind: "local" } | { kind: "forward", host, url, token } | { error }.
 export function resolveRoute(host, cfg) {
   if (cfg.error) return { error: cfg.error };
-  if (!HOSTS.includes(host)) return { error: `unknown host ${JSON.stringify(host)} (expected one of ${HOSTS.join(", ")})` };
   if (host === cfg.localHost) return { kind: "local" };
-  if (!REMOTE_DISPATCH_TARGETS.has(host)) return { error: `${host} is not a remote dispatch target` };
-  const entry = cfg.hosts?.[host];
-  if (!entry || !entry.url || !entry.token) {
-    return { error: `host ${host} has no registry entry (url + token) in ${cfg.file}` };
-  }
-  return { kind: "forward", host, url: entry.url, token: entry.token };
+  const entry = typeof host === "string" && Object.hasOwn(cfg.hosts || {}, host) ? cfg.hosts[host] : undefined;
+  if (entry && entry.url && entry.token) return { kind: "forward", host, url: entry.url, token: entry.token };
+  return { error: `host ${JSON.stringify(String(host))} is not in ${cfg.file} (known hosts: ${knownHosts(cfg).join(", ")})` };
 }
 
 export function readLastSeen(file = lastSeenPath()) {
