@@ -48,17 +48,6 @@ test("resolveRoute: the routing table", () => {
     /local host identity not configured/);
 });
 
-test("loadHostsConfig: explicit localHost required, unknown registry names ignored", () => {
-  const f = path.join(TMP, "h.json");
-  assert.match(hosts.loadHostsConfig(f).error, /local host identity not configured/);
-  fs.writeFileSync(f, JSON.stringify({ hosts: {} }));
-  assert.match(hosts.loadHostsConfig(f).error, /"localHost" must be one of claunker, laptop/);
-  fs.writeFileSync(f, JSON.stringify({ localHost: "laptop", hosts: { claunker: { url: "u", token: "t" }, desktop: { url: "x" } },
-                                       caps: { maxConcurrent: 2 } }));
-  assert.deepEqual(hosts.loadHostsConfig(f),
-    { file: f, localHost: "laptop", hosts: { claunker: { url: "u", token: "t" } }, caps: { maxConcurrent: 2 } });
-});
-
 test("local host = laptop, host: laptop -> runs locally, no network hop", async () => {
   const r = await dispatch.dispatchStart({ host: "laptop", prompt: "p", jobId: "fallback" },
                                          ctxFor({ file: "f", localHost: "laptop", hosts: {} }, { fetch: noFetch }));

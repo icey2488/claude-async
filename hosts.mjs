@@ -1,24 +1,29 @@
 /**
  * hosts.mjs — multi-host identity, registry, job-id format, and routing for claude-async.
  *
- * Topology is deliberately one-way: `claunker` is the only remote dispatch target (it runs
- * host-api.mjs on its Tailscale address); `laptop` never exposes an API. Every claude_start names
- * its executing host explicitly (no default), and every job id carries that host as a prefix so
- * claude_check can route without any forwarder-side state:
+ * The registry (hosts.json) is the source of truth for which hosts exist: the known hosts are
+ * `localHost` plus every key of `hosts`, and a remote dispatch target is any registry entry with a
+ * url and a token. Topology is one-way by config, not by code: a machine that no registry lists
+ * (the laptop) can never be dispatched to. A receiver is a machine that runs host-api.mjs on its
+ * Tailscale address and says so with "receiver": true. Every claude_start names its executing host
+ * explicitly (no default), and every job id carries that host as a prefix so claude_check can
+ * route without any forwarder-side state:
  *
  *   <host>.<descriptor>-YYYYMMDD-<8 random [a-z0-9]>      e.g. claunker.fix-bug-20260925-k3v9x0qa
  *
  * A dot is the separator because ":" is illegal in Windows directory names (and startJob's own
- * sanitizer already rewrites it). A prefix counts as a host ONLY if it exactly matches the host
- * enum, so pre-multihost ids ("1727300000000-a1b2c3", "gallagioloot-foo-20260925") still resolve
- * as local, and a descriptor that merely starts with "claunker" is not mistaken for a prefix.
+ * sanitizer already rewrites it), so host names may not contain one. A prefix counts as a host
+ * when it is a valid host name (HOST_NAME_RE); claude_check then requires it to be a KNOWN host.
+ * Pre-multihost ids ("1727300000000-a1b2c3", "gallagioloot-foo-20260925") have no dot and still
+ * resolve as local, and a descriptor that merely starts with a host name is not mistaken for a prefix.
  *
  * Config lives in the user profile, never in the repo (CLAUDE_ASYNC_CONFIG_DIR overrides the
  * directory, for tests):
- *   ~/.claude-async/hosts.json   { "localHost": "claunker"|"laptop",
- *                                  "hosts": { "claunker": { "url": "http://100.x.y.z:7850", "token": "..." } },
+ *   ~/.claude-async/hosts.json   { "localHost": "claunker",
+ *                                  "receiver": true,                   (optional; this machine runs host-api.mjs)
+ *                                  "hosts": { "ha": { "url": "http://100.x.y.z:7850", "token": "..." } },
  *                                  "caps": { "maxConcurrent": 4, "maxStartsPerMinute": 6 } }   (caps optional)
- *   ~/.claude-async/api.json     host-api.mjs's own config (Claunker only; token HASH only)
+ *   ~/.claude-async/api.json     host-api.mjs's own config (receivers only; token HASH only)
  *   ~/.claude-async/last-seen.json   last successful contact per remote host (claude_jobs'
  *                                    "unreachable (last seen <time>)" row -- the forwarder's only state)
  * Local-host identity is explicit config (hosts.json "localHost"), never guessed from os.hostname().
@@ -29,9 +34,23 @@ import os from "node:os";
 import path from "node:path";
 import { writeJsonAtomic } from "./atomic.mjs";
 
+// No dots (the job-id separator), no uppercase (host names become dir names / id prefixes).
+export const HOST_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+
 export const HOSTS = ["claunker", "laptop"];
 // Hosts another machine may forward to. The laptop never exposes an API.
 export const REMOTE_DISPATCH_TARGETS = new Set(["claunker"]);
+
+// Returns null when `name` is a valid host name, else a one-line reason.
+export function validateHostName(name) {
+  if (typeof name !== "string") return "must be a string";
+  if (name === "") return "must not be empty";
+  if (name.length > 32) return "must be at most 32 characters";
+  if (/[A-Z]/.test(name)) return "must be lowercase (no uppercase letters)";
+  if (name.includes(".")) return 'must not contain "." (it separates the host from the rest of a job id)';
+  if (!HOST_NAME_RE.test(name)) return "must contain only a-z, 0-9 and \"-\", and start with a letter or digit";
+  return null;
+}
 
 export const configDir = () =>
   process.env.CLAUDE_ASYNC_CONFIG_DIR || path.join(os.homedir(), ".claude-async");
@@ -85,35 +104,60 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-// Returns { localHost, hosts, caps, file } or { error, file }. Never throws. Re-read on every call
-// so editing hosts.json never needs a bridge restart.
+// Returns { localHost, receiver, hosts, caps, file } or { error, file }. Never throws. Re-read on
+// every call so editing hosts.json never needs a bridge restart (only the advertised host enum,
+// built once at startup, does). A file that fails validation is an error naming the file and the
+// field: nothing is silently ignored, and claude_start refuses until it is fixed.
 export function loadHostsConfig(file = hostsFilePath()) {
   let raw;
   try { raw = readJson(file); }
   catch (e) {
     return { file, error: e.code === "ENOENT"
-      ? `local host identity not configured: create ${file} with {"localHost": "claunker"|"laptop"}`
+      ? `local host identity not configured: create ${file} with {"localHost": "<this machine's name>"}`
       : `could not read ${file}: ${e.message}` };
   }
-  if (!HOSTS.includes(raw?.localHost)) {
-    return { file, error: `${file}: "localHost" must be one of ${HOSTS.join(", ")} ` +
-      `(got ${JSON.stringify(raw?.localHost)})` };
+  const bad = (field, why) => ({ file, error: `${file}: ${field} ${why}` });
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return bad("the file", "must be a JSON object");
+  const localBad = validateHostName(raw.localHost);
+  if (localBad) return bad('"localHost"', `${localBad} (got ${JSON.stringify(raw.localHost)})`);
+  if (raw.receiver !== undefined && typeof raw.receiver !== "boolean") {
+    return bad('"receiver"', `must be true or false (got ${JSON.stringify(raw.receiver)})`);
+  }
+  const rawHosts = raw.hosts === undefined ? {} : raw.hosts;
+  if (rawHosts === null || typeof rawHosts !== "object" || Array.isArray(rawHosts)) {
+    return bad('"hosts"', "must be an object mapping host name -> { url, token }");
   }
   const hosts = {};
-  for (const [name, entry] of Object.entries(raw.hosts || {})) {
-    if (!HOSTS.includes(name)) continue; // unknown names are ignored, never routed to
-    hosts[name] = { url: entry?.url, token: entry?.token };
+  for (const [name, entry] of Object.entries(rawHosts)) {
+    const field = `"hosts.${name}"`;
+    const nameBad = validateHostName(name);
+    if (nameBad) return bad(field, `is not a valid host name: ${nameBad}`);
+    if (name === raw.localHost) return bad(field, "must not name this machine (it equals \"localHost\")");
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return bad(field, "must be an object { url, token }");
+    }
+    if (typeof entry.url !== "string" || entry.url === "") return bad(`"hosts.${name}.url"`, "is required (an http or https URL)");
+    let u;
+    try { u = new URL(entry.url); } catch { u = null; }
+    if (!u || (u.protocol !== "http:" && u.protocol !== "https:") || !u.hostname) {
+      return bad(`"hosts.${name}.url"`, `must be an http or https URL with a host (got ${JSON.stringify(entry.url)})`);
+    }
+    if (typeof entry.token !== "string" || entry.token === "") return bad(`"hosts.${name}.token"`, "is required (a non-empty string)");
+    hosts[name] = { url: entry.url, token: entry.token };
   }
-  return { file, localHost: raw.localHost, hosts, caps: raw.caps || undefined };
+  return { file, localHost: raw.localHost, receiver: raw.receiver === true, hosts, caps: raw.caps || undefined };
 }
+
+// Every host this registry knows: this machine, then each remote entry.
+export const knownHosts = (cfg) => [cfg.localHost, ...Object.keys(cfg.hosts || {})];
 
 // Routing rules (design item 9):
 //   local = laptop:   host claunker -> forward over Tailscale; host laptop -> local
 //   local = claunker: host claunker -> local;                  host laptop  -> error
 // Returns { kind: "local" } | { kind: "forward", host, url, token } | { error }.
 export function resolveRoute(host, cfg) {
-  if (!HOSTS.includes(host)) return { error: `unknown host ${JSON.stringify(host)} (expected one of ${HOSTS.join(", ")})` };
   if (cfg.error) return { error: cfg.error };
+  if (!HOSTS.includes(host)) return { error: `unknown host ${JSON.stringify(host)} (expected one of ${HOSTS.join(", ")})` };
   if (host === cfg.localHost) return { kind: "local" };
   if (!REMOTE_DISPATCH_TARGETS.has(host)) return { error: `${host} is not a remote dispatch target` };
   const entry = cfg.hosts?.[host];
