@@ -143,7 +143,20 @@ export function loadHostsConfig(file = hostsFilePath()) {
     if (typeof entry.token !== "string" || entry.token === "") return bad(`"hosts.${name}.token"`, "is required (a non-empty string)");
     hosts[name] = { url: entry.url, token: entry.token };
   }
-  return { file, localHost: raw.localHost, receiver: raw.receiver === true, hosts, caps: raw.caps || undefined };
+  let caps;
+  if (raw.caps !== undefined) {
+    if (raw.caps === null || typeof raw.caps !== "object" || Array.isArray(raw.caps)) {
+      return bad('"caps"', "must be an object { maxConcurrent, maxStartsPerMinute }");
+    }
+    for (const [k, v] of Object.entries(raw.caps)) {
+      if (k !== "maxConcurrent" && k !== "maxStartsPerMinute") {
+        return bad(`"caps.${k}"`, "is not a known cap (known: maxConcurrent, maxStartsPerMinute)");
+      }
+      if (!Number.isInteger(v) || v < 1) return bad(`"caps.${k}"`, `must be an integer >= 1 (got ${JSON.stringify(v)})`);
+    }
+    caps = raw.caps;
+  }
+  return { file, localHost: raw.localHost, receiver: raw.receiver === true, hosts, caps };
 }
 
 // Every host this registry knows: this machine, then each remote entry.
