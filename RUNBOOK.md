@@ -95,6 +95,8 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   receiver only binds a Tailscale address; anything else (hostname, IPv6, loopback, RFC1918, public) fails validation.
   `CLAUDE_ASYNC_ALLOW_ANY_URL=1` skips that range check (not the http/https check) for tests and local development. It is
   not a security control; do not set it in a bridge's environment on a real machine.
+- **Renaming a receiver needs its API restarted.** `host-api.mjs` captures `localHost` at startup, so after changing a
+  receiver's `localHost`, restart that receiver's API (the bridge's enum note above covers the bridge).
 - **The "laptop is not a remote dispatch target" message is gone.** The one-way topology is that the laptop is in nobody's
   registry: on Claunker `host: laptop` is `host "laptop" is not in <file> (known hosts: claunker)`.
 - **Job ids with an unknown prefix.** `claude_check` on `<name>.…` where `<name>` is a valid host name but not in the registry is an
