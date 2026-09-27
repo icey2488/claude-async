@@ -26,14 +26,34 @@
  * would otherwise look like a dead owner, get its lock broken and replaced by a second holder, then
  * wake up and unlink-by-name that second holder's live lock -- letting a third holder in while the
  * second is still inside fn(). The read-back after writing closes that window (a mismatch means we
- * lost the lock: nothing is unlinked, and withStartLock reports failure to acquire), and both the
- * release in `finally` and the write-failure cleanup call `ownsLock` first. A lock is broken only when
- * it is BOTH at least staleMs old AND its owner pid is dead or unreadable (never merely old: an old
- * lock whose owner is alive is left pending, unlike the pre-fix version which broke on age alone).
+ * lost the lock: nothing is unlinked, and withStartLock reports failure to acquire), and the normal
+ * release in `finally` calls `ownsLock` (content) first.
+ *
+ * A lock is broken when it is at least staleMs old AND (its owner pid is dead or unreadable, OR that
+ * pid is our own, OR the lock is at least LOCK_MAX_HOLD_MS old regardless of whether the owner pid
+ * looks alive): never merely old with a live, foreign, sub-ceiling owner, which is left pending.
+ *   - Own-pid: the lock is held only synchronously inside fn(), so this process can never
+ *     legitimately still (or again) hold an old lock bearing its own pid -- it is always an
+ *     abandoned leftover, most likely a crashed earlier holder whose pid got reused as ours.
+ *   - Ceiling (LOCK_MAX_HOLD_MS, default 5 minutes, opts.maxHoldMs in tests): a real hold lasts
+ *     milliseconds, so a lock this old is realistically pid reuse by an unrelated process after the
+ *     real holder crashed, not a genuine long hold -- it is broken and logged loudly and distinctly
+ *     even though pidAlive(owner) says alive. Between staleMs and the ceiling, a live owner is still
+ *     never broken. Consequence: a process genuinely frozen inside the critical section for more
+ *     than the ceiling can let one extra concurrent/rate-limited start past the caps.
  * Breaking itself is race-safe via a second exclusive-create marker (`.start.lock.break`): only the
  * marker holder unlinks the stale lock, and it re-checks staleness while holding the marker so a lock
  * a rival breaker already replaced is never unlinked. A marker whose holder crashed is not
  * auto-broken (RUNBOOK has the manual cleanup). A clock stepped backwards reads as fresh, never stale.
+ *
+ * File-identity cleanup: the lock's write-failure path and the break marker's cleanup (always, not
+ * just on write failure) unlink by dev+ino captured via `fstatSync(fd, {bigint:true})` right after
+ * the exclusive create, not by content. A write failure leaves the file empty, which the content
+ * check (`ownsLock`) reads as unowned and would leave behind forever -- an empty `.start.lock` then
+ * blocks every start for staleMs, and an empty `.start.lock.break` permanently disables breaking
+ * until a human deletes it. Identity survives an empty file; it correctly still refuses to touch the
+ * file if some rival has since unlinked-and-recreated the same path. The normal (successful) release
+ * of the lock itself keeps the content check, unchanged.
  *
  * Depth (CLAUDE_ASYNC_DEPTH env / X-Claude-Async-Depth header) is an ACCIDENT guard only, NOT a
  * security control: any caller can simply lie about it. Jobs are launched with depth+1; a start
@@ -50,6 +70,11 @@ export const DEPTH_HEADER = "x-claude-async-depth";
 const WINDOW_MS = 60_000;
 export const LOCK_TIMEOUT_MS = 5_000;
 export const LOCK_STALE_MS = 30_000;
+// A real hold lasts milliseconds (the lock is only ever held synchronously inside fn()). A lock this
+// old with an owner pid that still looks alive is realistically pid reuse by an unrelated process
+// after the real holder crashed, not a genuine long hold -- so it is broken too. See "Start lock
+// protocol" above.
+export const LOCK_MAX_HOLD_MS = 5 * 60_000;
 
 function positiveInt(v) {
   const n = Number(v);
@@ -108,6 +133,35 @@ function releaseIfOwned(lockPath, log, what) {
   catch (e) { if (e.code !== "ENOENT") log(`could not remove ${what} ${path.basename(lockPath)}: ${e.code}: ${e.message}`); }
 }
 
+// dev+ino of the file behind fd, captured right after an exclusive create. Used to recognize "the
+// exact file we just created" even when its content check (ownsLock) cannot: a write failure leaves
+// it empty, which ownsLock reads as unowned.
+function fileId(fd) {
+  const st = fs.fstatSync(fd, { bigint: true });
+  return { dev: st.dev, ino: st.ino };
+}
+
+function sameFile(filePath, id) {
+  try {
+    const st = fs.statSync(filePath, { bigint: true });
+    return st.dev === id.dev && st.ino === id.ino;
+  } catch { return false; }
+}
+
+// Removes lockPath only if it is still literally the file we created (same dev+ino), regardless of
+// its content. For use right after we failed to write to a file we just exclusively created: an
+// empty file is not "ours" by content (ownsLock/releaseIfOwned would leave it, permanently blocking
+// or disabling the lock/marker), but it is still identifiably ours by identity as long as no one has
+// unlinked-and-recreated the path in between.
+function releaseIfSameFile(lockPath, id, log, what) {
+  if (!sameFile(lockPath, id)) {
+    log(`${what} ${path.basename(lockPath)} is no longer the file we created (replaced or gone); leaving it alone`);
+    return;
+  }
+  try { fs.unlinkSync(lockPath); }
+  catch (e) { if (e.code !== "ENOENT") log(`could not remove ${what} ${path.basename(lockPath)}: ${e.code}: ${e.message}`); }
+}
+
 function readLockOwner(lockPath) {
   let raw = null, pid = null;
   try { raw = fs.readFileSync(lockPath, "utf8"); } catch { return { raw, pid }; }
@@ -118,34 +172,44 @@ function readLockOwner(lockPath) {
   return { raw, pid };
 }
 
-// gone | unreadable | fresh | live-owner | stale. An mtime in the future (clock stepped back) makes
-// ageMs negative, so it reads as fresh -- never as stale.
-function assessLock(lockPath, { staleMs, pidAlive, now }) {
+// gone | unreadable | fresh | live-owner | ceiling | stale. An mtime in the future (clock stepped
+// back) makes ageMs negative, so it reads as fresh -- never as stale.
+function assessLock(lockPath, { staleMs, maxHoldMs, pidAlive, now }) {
   let st;
   try { st = fs.statSync(lockPath); }
   catch (e) { return { state: e.code === "ENOENT" ? "gone" : "unreadable", error: e }; }
   const ageMs = now() - st.mtimeMs;
   if (!(ageMs >= staleMs)) return { state: "fresh", ageMs };
   const { raw, pid } = readLockOwner(lockPath);
-  if (pid !== null && pidAlive(pid)) return { state: "live-owner", ageMs, pid };
+  // The lock is held only synchronously inside fn(); this process can never legitimately still hold
+  // (or hold again) a lock this old bearing its own pid. It is always an abandoned leftover -- from a
+  // crashed earlier holder that happened to get our pid back via reuse, or a bug -- never a live hold.
+  if (pid !== null && pid === process.pid) return { state: "stale", ageMs, pid, raw };
+  if (pid !== null && pidAlive(pid)) {
+    // A live owner is normally left alone indefinitely, but a real hold lasts milliseconds; past
+    // maxHoldMs the far more likely explanation is pid reuse by an unrelated process after the real
+    // holder crashed, so the ceiling overrides the live-owner check and the lock is still broken.
+    if (ageMs >= maxHoldMs) return { state: "ceiling", ageMs, pid, raw };
+    return { state: "live-owner", ageMs, pid };
+  }
   return { state: "stale", ageMs, pid, raw };
 }
 
 // Returns "retry" if the lock is gone (broken by us or vanished) so the caller may try to create it
 // again, "held" if it must be left alone.
 function breakStaleStartLock(lockPath, ctx) {
-  const { log } = ctx;
+  const { log, maxHoldMs } = ctx;
   const first = assessLock(lockPath, ctx);
   if (first.state === "gone") return "retry";
   if (first.state === "live-owner") {
     log(`start lock is ${Math.round(first.ageMs / 1000)}s old but its owner pid=${first.pid} is alive; waiting`);
     return "held";
   }
-  if (first.state !== "stale") return "held";
+  if (first.state !== "stale" && first.state !== "ceiling") return "held";
 
   const marker = lockPath + ".break";
-  let fd;
-  try { fd = fs.openSync(marker, "wx"); }
+  let fd, markerId;
+  try { fd = fs.openSync(marker, "wx"); markerId = fileId(fd); }
   catch (e) {
     log(e.code === "EEXIST"
       ? `stale start lock, but ${path.basename(marker)} exists (another process is breaking it, or its breaker died -- delete the marker by hand if it is old); waiting`
@@ -159,17 +223,26 @@ function breakStaleStartLock(lockPath, ctx) {
     // Re-check while holding the marker: a rival breaker may already have replaced the stale lock.
     const second = assessLock(lockPath, ctx);
     if (second.state === "gone") return "retry";
-    if (second.state !== "stale") return "held";
+    if (second.state !== "stale" && second.state !== "ceiling") return "held";
     fs.unlinkSync(lockPath);
-    log(`BROKE stale start lock (age=${Math.round(second.ageMs / 1000)}s, ` +
-        `owner pid=${second.pid === null ? "unreadable" : `${second.pid} dead`}, content=${JSON.stringify(second.raw)})`);
+    if (second.state === "ceiling") {
+      log(`BROKE start lock past the ${maxHoldMs}ms ceiling although owner pid=${second.pid} looks alive (likely pid reuse)`);
+    } else if (second.pid === process.pid) {
+      log(`BROKE stale start lock (age=${Math.round(second.ageMs / 1000)}s, owner pid=${second.pid} is this ` +
+          `process itself -- abandoned by an earlier lineage, content=${JSON.stringify(second.raw)})`);
+    } else {
+      log(`BROKE stale start lock (age=${Math.round(second.ageMs / 1000)}s, ` +
+          `owner pid=${second.pid === null ? "unreadable" : `${second.pid} dead`}, content=${JSON.stringify(second.raw)})`);
+    }
     return "retry";
   } catch (e) {
     if (e.code === "ENOENT") return "retry";
     log(`failed to break stale start lock: ${e.code}: ${e.message}; waiting`);
     return "held";
   } finally {
-    releaseIfOwned(marker, log, "break marker");
+    // File-id, not content: a write failure above leaves the marker empty, which the content check
+    // (ownsLock) would read as unowned and leave behind forever, permanently disabling breaking.
+    releaseIfSameFile(marker, markerId, log, "break marker");
   }
 }
 
@@ -178,8 +251,8 @@ async function acquireStartLock(lockPath, ctx) {
   const { log, now } = ctx;
   const deadline = now() + LOCK_TIMEOUT_MS;
   for (;;) {
-    let fd;
-    try { fd = fs.openSync(lockPath, "wx"); }
+    let fd, id;
+    try { fd = fs.openSync(lockPath, "wx"); id = fileId(fd); }
     catch (e) {
       if (e.code !== "EEXIST") { log(`could not create start lock: ${e.code}: ${e.message}`); return false; }
       const outcome = breakStaleStartLock(lockPath, ctx);
@@ -192,12 +265,13 @@ async function acquireStartLock(lockPath, ctx) {
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }));
       fs.closeSync(fd);
     } catch (e) {
-      // Only remove what is ours by content: if we stalled and the lock was broken and replaced, the
-      // file at lockPath is someone else's. An unwritten (empty) lock is not ours by content, so it
-      // stays and the stale path breaks it after staleMs.
+      // File-id, not content: the lock we just created is empty after this failure, which the
+      // content check (ownsLock/releaseIfOwned) reads as unowned and would leave behind, blocking
+      // every start for staleMs. Identity still proves it is the exact file we created (unless a
+      // breaker has since unlinked-and-recreated it, in which case it correctly stays untouched).
       try { fs.closeSync(fd); } catch {}
       log(`could not write start lock: ${e.code}: ${e.message}`);
-      releaseIfOwned(lockPath, log, "start lock");
+      releaseIfSameFile(lockPath, id, log, "start lock");
       if (now() > deadline) return false;
       await sleep(25);
       continue;
@@ -214,12 +288,15 @@ async function acquireStartLock(lockPath, ctx) {
 }
 
 // Runs fn() while holding jobRoot/.start.lock. fn must be synchronous (it only stats/counts and
-// creates the job dir). opts (all optional, tests only): staleMs, pidAlive, now, log -- see
-// "Start lock protocol" above and launcher-claim.mjs's claimOneTicket for the same knobs.
+// creates the job dir). opts (all optional, tests only): staleMs, maxHoldMs, pidAlive, now, log --
+// see "Start lock protocol" above and launcher-claim.mjs's claimOneTicket for the same knobs.
 export async function withStartLock(jobRoot, fn, opts = {}) {
-  const { staleMs = LOCK_STALE_MS, pidAlive = defaultPidAlive, now = Date.now, log = () => {} } = opts;
+  const {
+    staleMs = LOCK_STALE_MS, maxHoldMs = LOCK_MAX_HOLD_MS,
+    pidAlive = defaultPidAlive, now = Date.now, log = () => {},
+  } = opts;
   const lock = path.join(jobRoot, ".start.lock");
-  const ctx = { staleMs, pidAlive, now, log };
+  const ctx = { staleMs, maxHoldMs, pidAlive, now, log };
   const ok = await acquireStartLock(lock, ctx);
   if (!ok) return { error: `could not acquire ${lock} within ${LOCK_TIMEOUT_MS}ms; no job started` };
   try { return fn(); }

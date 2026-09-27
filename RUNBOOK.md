@@ -419,20 +419,42 @@ and when the first process finally returned it deleted whoever's lock was there 
 with `test/multihost/startlock.test.mjs` (a backdated-lock "holder" vs. a concurrent "racer",
 overlap detected via an append-only trace file): 15/15 rounds showed two concurrent holders against
 the pre-fix code, 0/15 against the fix. Same knobs as `claimOneTicket` (`staleMs`, `pidAlive`, `now`,
-`log`), passed as an optional third argument to `withStartLock` — `job-core.mjs`'s call site is
-unchanged (2 args = production defaults: 30 s stale, `process.kill(pid,0)`, `Date.now`).
-`.start.lock` holds `{pid, at}`; broken only when it is both ≥30 s old and its owner pid is dead or
-unreadable, via the same exclusive `.start.lock.break` marker + re-check-while-holding-it protocol
-(so a lock a rival breaker already replaced is never unlinked); released only if the file still
-carries our pid. **Manual cleanup** is the same as the claim lock: a `.start.lock` older than a
-minute whose pid was reused by an unrelated live process is never auto-broken — check
-`Get-Process -Id <pid>`, delete by hand if it is not this bridge/API; a stranded
-`.start.lock.break` (its holder crashed inside the marker window) is deliberately not
-auto-cleared — delete it by hand if it is old. Neither loses a job: the caller just retries
-`claude_start`. Run: `node --test test/multihost/startlock.test.mjs` (race + unit tests, ~11 s) or
-the full `npm run test:multihost`. Also needs a bridge restart to take effect (same reason as the
-claim-lock deploy note right below: `guard.mjs` is loaded in the running bridge's memory via
-`job-core.mjs`).
+`log`), plus `maxHoldMs` (see ceiling below), passed as an optional third argument to
+`withStartLock` — `job-core.mjs`'s call site is unchanged (2 args = production defaults: 30 s
+stale, 5 min ceiling, `process.kill(pid,0)`, `Date.now`).
+`.start.lock` holds `{pid, at}`; broken when it is ≥30 s old AND (its owner pid is dead or
+unreadable, OR that pid is our own, OR the lock is ≥`LOCK_MAX_HOLD_MS` old regardless of whether
+the owner pid looks alive) — never merely old with a live, foreign, sub-ceiling owner, which is left
+pending. Breaking uses the same exclusive `.start.lock.break` marker + re-check-while-holding-it
+protocol (so a lock a rival breaker already replaced is never unlinked).
+  - **Own-pid rule.** The lock is held only synchronously inside `withStartLock`'s `fn`, so this
+    process can never legitimately still (or again) hold an old lock bearing its own pid — it is
+    always an abandoned leftover, most likely a crashed earlier holder whose pid got reused as ours.
+    Such a lock is classified stale immediately, without waiting for the ceiling.
+  - **Live-owner ceiling (`LOCK_MAX_HOLD_MS`, default 5 min, `opts.maxHoldMs` in tests).** A real
+    hold lasts milliseconds; a lock this old is realistically pid reuse by an unrelated process
+    after the real holder crashed, not a genuine long hold, so it is broken and logged loudly and
+    distinctly (`BROKE start lock past the <n>ms ceiling although owner pid=<pid> looks alive
+    (likely pid reuse)`) even though `pidAlive(owner)` says alive. Between 30 s and the ceiling, a
+    live owner is still never broken. **Consequence:** a process genuinely frozen inside the
+    critical section for more than 5 minutes can let one extra start past the concurrency/rate caps.
+  - **File-identity cleanup.** The lock's write-failure path and the break marker's cleanup (always,
+    not just on write failure) unlink by dev+ino captured via `fstatSync(fd, {bigint:true})` right
+    after the exclusive create, not by content. A write failure leaves the file empty, which the
+    content check (`ownsLock`) reads as unowned and would leave behind forever — an empty
+    `.start.lock` then blocks every start for 30 s, and an empty `.start.lock.break` permanently
+    disables breaking until a human deletes it. Identity survives an empty file, and still correctly
+    refuses to touch the file if a rival has since unlinked-and-recreated the same path. The normal
+    (successful) release of the lock itself keeps the content (pid) check, unchanged.
+**Manual cleanup** is the same as the claim lock: a `.start.lock` whose pid was reused by an
+unrelated live process is auto-broken past the 5-minute ceiling, so manual intervention is only
+needed for a live foreign owner younger than that (rare) — check `Get-Process -Id <pid>`, delete by
+hand if it is not this bridge/API; a stranded `.start.lock.break` (its holder crashed inside the
+marker window) is deliberately not auto-cleared — delete it by hand if it is old. Neither loses a
+job: the caller just retries `claude_start`. Run: `node --test test/multihost/startlock.test.mjs`
+(race + unit tests, ~29 s) or the full `npm run test:multihost`. Also needs a bridge restart to take
+effect (same reason as the claim-lock deploy note right below: `guard.mjs` is loaded in the running
+bridge's memory via `job-core.mjs`).
 - **Deploying: a bridge restart IS required.** The fallback fix changes `job-core.mjs` (it now imports
   `launcher-claim.mjs` and withdraws the ticket), and the running bridge has the old `job-core.mjs` in memory,
   so it keeps leaving the ticket behind until Claude Desktop restarts it (follow "Restarting the bridge"

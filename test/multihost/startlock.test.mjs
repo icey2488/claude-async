@@ -13,8 +13,22 @@
 // the lock at once -- exactly the bug. Run against the pre-fix code this reproduces on nearly every
 // round (see RUNBOOK for the recorded counts); against the fixed code it must never happen.
 //
+// Part 1b (process race): two aligned processes find the SAME already-stale, dead-owner lock and race
+// to break it (guard.mjs's own two-sided version of the bug the marker exists to prevent).
+//
 // Part 2 (deterministic unit tests): staleMs/pidAlive/now injection (same technique as
 // launcher-claim.mjs / claim.test.mjs) covering each interleaving without any real waiting.
+//
+// Part 3 (identity via fs patching): a rival replaces the lock or marker file at the exact moment a
+// write/unlink is about to happen, same technique claim.test.mjs uses against launcher-claim.mjs.
+//
+// Part 4 (write-failure file-identity cleanup): a write to a file we just exclusively created can
+// fail, leaving it empty; content-based ownership (ownsLock) reads that as unowned and would leave it
+// behind forever. The fix recognizes the file by dev+ino captured at create time instead.
+//
+// Part 5 (own-pid stale, live-owner ceiling): a lock bearing our own pid can never be a live self-hold
+// (the lock is only ever held synchronously), and a lock whose owner pid still looks alive past
+// LOCK_MAX_HOLD_MS is realistically pid reuse, not a genuine multi-minute hold -- both are broken.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
@@ -116,6 +130,74 @@ test(`start lock race: ${ROUNDS} rounds, a stalled holder vs a concurrent racer 
     if (overlaps.length) t.diagnostic(overlaps.slice(0, 5).join("\n"));
     assert.deepEqual(inconclusive, [], `every round must produce a complete trace: ${summary}`);
     assert.deepEqual(overlaps, [], summary);
+  });
+
+// ---------------------------------------------------------------------------------------------
+// Part 1b: two-breaker race -- two aligned processes find the SAME stale, dead-owner lock and race
+// to break it. Mirrors claim.test.mjs's "stale-lock break race" (same redo-late-rounds alignment
+// discipline: a round whose workers were not released together proves nothing and is redone, not
+// budgeted, up to an attempt cap, rather than passing vacuously on a loaded box).
+// ---------------------------------------------------------------------------------------------
+
+const BREAK_ROUNDS = Number(process.env.STARTLOCK_BREAK_ROUNDS) || 15;
+const BREAK_LEAD_MS = 50;
+const BREAK_MAX_LATE_MS = 5; // a worker released this long after the shared instant did not race anyone
+const BREAK_HOLD_MS = 50;
+const BREAK_STALE_MS = 100;
+const BREAK_ATTEMPT_FACTOR = 3;
+const breakAttemptCap = (target) => BREAK_ATTEMPT_FACTOR * target;
+function newBreakAlignment(target) { return { target, lateRounds: 0, attempts: 0, aligned: 0 }; }
+// Returns true if the round was aligned (and so counts toward the target).
+function noteBreakAlignment(al, lates) {
+  al.attempts++;
+  if (lates.some((l) => l > BREAK_MAX_LATE_MS)) { al.lateRounds++; return false; }
+  al.aligned++;
+  return true;
+}
+const breakRoundsWanted = (al) => Math.max(0, Math.min(al.target - al.aligned, breakAttemptCap(al.target) - al.attempts));
+const breakAlignmentText = (al) => `${al.aligned}/${al.target} aligned rounds; ${al.lateRounds} late rounds ` +
+  `(a worker >${BREAK_MAX_LATE_MS} ms late) redone, ${al.attempts}/${breakAttemptCap(al.target)} attempts used`;
+
+function runBreakRound(w1, w2, round, jobRoot, staleMs, holdMs) {
+  const goAt = nowHr() + BREAK_LEAD_MS;
+  const ask = (w) => new Promise((resolve, reject) => {
+    const onExit = (code) => reject(new Error(`worker ${w.pid} exited (${code}) mid-round ${round}`));
+    w.once("exit", onExit);
+    w.once("message", (m) => { w.off("exit", onExit); resolve(m); });
+    w.send({ round, jobRoot, goAt, role: "breaker", staleMs, holdMs });
+  });
+  return Promise.all([ask(w1), ask(w2)]);
+}
+
+test(`two-breaker race: ${BREAK_ROUNDS} rounds, two aligned processes break the same stale lock -> ` +
+  "never two holders at once, lock broken at most once per round",
+  { timeout: 60_000 }, async (t) => {
+    const [b1, b2] = await Promise.all([startWorker(), startWorker()]);
+    const overlaps = [], multiBreaks = [];
+    const align = newBreakAlignment(BREAK_ROUNDS);
+    try {
+      for (let r = 0; breakRoundsWanted(align) > 0; r++) {
+        const jobRoot = mkRoot(`break${r}`);
+        putLock(jobRoot, { pid: DEAD_PID, ageMs: BREAK_STALE_MS + 200 });
+
+        const [r1, r2] = await runBreakRound(b1, b2, r, jobRoot, BREAK_STALE_MS, BREAK_HOLD_MS);
+        if (!noteBreakAlignment(align, [r1.late, r2.late])) continue;
+
+        if (r1.enter !== null && r2.enter !== null && r1.enter < r2.exit && r2.enter < r1.exit) {
+          overlaps.push(`round ${r}: [${r1.enter.toFixed(3)},${r1.exit.toFixed(3)}] vs ` +
+            `[${r2.enter.toFixed(3)},${r2.exit.toFixed(3)}]`);
+        }
+        const breaks = [...r1.logs, ...r2.logs].filter((l) => /BROKE stale start lock/.test(l)).length;
+        if (breaks > 1) multiBreaks.push(`round ${r}: lock broken ${breaks} times`);
+      }
+    } finally { stopWorkers([b1, b2]); }
+
+    const summary = `two-breaker race: ${align.attempts} rounds run, ${overlaps.length} overlaps, ` +
+      `${multiBreaks.length} rounds broken >1x; ${breakAlignmentText(align)}`;
+    t.diagnostic(summary);
+    assert.equal(align.aligned, align.target, `workers were not aligned, so the race proved nothing: ${summary}`);
+    assert.deepEqual(overlaps, [], summary);
+    assert.deepEqual(multiBreaks, [], summary);
   });
 
 // ---------------------------------------------------------------------------------------------
@@ -251,7 +333,7 @@ test("identity: a break marker replaced while we hold it is left alone; the brea
   }, () => withStartLock(jobRoot, () => "ran", { staleMs: 1_000, now: () => mtime + 1_000, pidAlive: () => false, log: (l) => log.push(l) }));
   assert.equal(c, "ran");
   assert.equal(lockPid(marker), OTHER_PID, "someone else's marker is not ours to remove");
-  assert.ok(log.some((l) => /break marker \.start\.lock\.break is no longer ours/.test(l)), log.join("\n"));
+  assert.ok(log.some((l) => /break marker \.start\.lock\.break is no longer the file we created/.test(l)), log.join("\n"));
 });
 
 test("re-check under the marker: a lock replaced by a fresh one WHILE we hold the marker is never unlinked",
@@ -283,4 +365,104 @@ test("identity: our own lock and marker are still removed on the normal paths (n
   const r = await withStartLock(jobRoot, () => "ran", { staleMs: 1_000, now: () => mtime + 1_000, pidAlive: () => false });
   assert.equal(r, "ran");
   assert.deepEqual(fs.readdirSync(jobRoot).filter((f) => f.startsWith(".start.lock")), []);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Part 4: file-identity cleanup on write failure -- a write that fails right after an exclusive
+// create must not leave an empty file behind just because its content looks unowned.
+// ---------------------------------------------------------------------------------------------
+
+test("lock write failure: the empty lock we created is removed, not left as a 30s block", async () => {
+  const jobRoot = mkRoot("lock-write-fail");
+  const lock = path.join(jobRoot, ".start.lock");
+  const log = [];
+  const started = Date.now();
+  const r = await withPatchedFs("writeSync", (n) => { if (n === 0) return "throw-eio"; },
+    () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l) }));
+  assert.equal(r, "ran", "the retry after the write failure must succeed immediately, not wait out staleMs");
+  assert.ok(Date.now() - started < 2_000, "must not have waited toward the 5s acquire timeout");
+  assert.ok(!fs.existsSync(lock), "lock released normally after fn ran");
+});
+
+test("marker write failure: break still completes, fn runs, and the marker does not remain", async () => {
+  const jobRoot = mkRoot("marker-write-fail");
+  const lock = putLock(jobRoot, { pid: DEAD_PID, ageMs: 0 });
+  const mtime = fs.statSync(lock).mtimeMs;
+  const marker = lock + ".break";
+  const log = [];
+  const r = await withPatchedFs("writeSync", (n) => { if (n === 0) return "throw-eio"; }, // n=0: the marker's own content write
+    () => withStartLock(jobRoot, () => "ran", {
+      staleMs: 1_000, now: () => mtime + 1_000, pidAlive: () => false, log: (l) => log.push(l),
+    }));
+  assert.equal(r, "ran");
+  assert.ok(!fs.existsSync(lock), "lock released after break+run");
+  assert.ok(!fs.existsSync(marker), "an empty (write-failed) marker must not remain after the break completes");
+  assert.ok(log.some((l) => /BROKE stale start lock/.test(l)), log.join("\n"));
+});
+
+test("file-id guard: a lock replaced by a rival right before our write failure is not removed", async () => {
+  const jobRoot = mkRoot("id-write-fail");
+  const lock = path.join(jobRoot, ".start.lock");
+  const log = [];
+  const r = await withPatchedFs("writeSync", (n) => {
+    if (n === 0) { replaceLockWithOthers(lock); return "throw-eio"; }
+  }, () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l), now: () => Date.now() + 6_000 }));
+  assert.match(r.error, /could not acquire/);
+  assert.equal(lockPid(lock), OTHER_PID, "the rival's replacement lock must survive our write-failure cleanup");
+  assert.ok(log.some((l) => /start lock \.start\.lock is no longer the file we created/.test(l)), log.join("\n"));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Part 5: own-pid stale and the live-owner ceiling
+// ---------------------------------------------------------------------------------------------
+
+test("own-pid stale: a lock bearing our OWN pid, aged past staleMs, is broken (never a live self-hold)", async () => {
+  const jobRoot = mkRoot("own-pid");
+  const lock = putLock(jobRoot, { pid: process.pid, ageMs: 0 });
+  const mtime = fs.statSync(lock).mtimeMs;
+  const log = [];
+  // pidAlive deliberately says "alive" (trivially true for our own pid) to prove the own-pid rule is
+  // checked before, and overrides, the live-owner check. Two-phase now(), like the other tests here:
+  // if the own-pid rule were ever dropped this must still time out and give up, not spin forever.
+  let calls = 0;
+  const now = () => (calls++ === 0 ? mtime : mtime + LOCK_TIMEOUT_MS + 500);
+  const r = await withStartLock(jobRoot, () => "ran", {
+    staleMs: 1_000, now, pidAlive: () => true, log: (l) => log.push(l),
+  });
+  assert.equal(r, "ran");
+  assert.ok(!fs.existsSync(lock));
+  assert.ok(log.some((l) => /is this process itself/.test(l)), log.join("\n"));
+});
+
+test("ceiling: a live-looking owner past maxHoldMs is broken anyway (pid reuse), logged distinctly", async () => {
+  const jobRoot = mkRoot("ceiling-broken");
+  const lock = putLock(jobRoot, { pid: OTHER_PID, ageMs: 0 });
+  const mtime = fs.statSync(lock).mtimeMs;
+  const log = [];
+  // Two-phase now(), like the other tests here: if the ceiling were ever dropped this must still
+  // time out and give up, not spin forever waiting for a deadline a fixed now() could never reach.
+  let calls = 0;
+  const now = () => (calls++ === 0 ? mtime + 600 : mtime + 600 + LOCK_TIMEOUT_MS + 500);
+  const r = await withStartLock(jobRoot, () => "ran", {
+    staleMs: 100, maxHoldMs: 500, now, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l),
+  });
+  assert.equal(r, "ran");
+  assert.ok(!fs.existsSync(lock));
+  assert.ok(log.some((l) => /BROKE start lock past the 500ms ceiling/.test(l) && /pid=4242 looks alive/.test(l)), log.join("\n"));
+});
+
+test("ceiling: a live-looking owner between staleMs and maxHoldMs is NEVER broken; caller times out", async () => {
+  const jobRoot = mkRoot("ceiling-pending");
+  // Real clock, on purpose: a mocked now() that is fixed across the whole poll would never trip the
+  // deadline (infinite loop), and one that grows unboundedly would eventually cross maxHoldMs itself.
+  // maxHoldMs is set well above the real ~5s LOCK_TIMEOUT_MS wait so age (starting at 200ms and only
+  // growing by the real elapsed polling time) can never reach the ceiling before the caller gives up.
+  const lock = putLock(jobRoot, { pid: OTHER_PID, ageMs: 200 });
+  const log = [];
+  const r = await withStartLock(jobRoot, () => "ran", {
+    staleMs: 100, maxHoldMs: 10_000, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l),
+  });
+  assert.match(r.error, /could not acquire/);
+  assert.equal(lockPid(lock), OTHER_PID, "a live owner below the ceiling must never be unlinked");
+  assert.ok(log.some((l) => /owner pid=4242 is alive/.test(l)), log.join("\n"));
 });
