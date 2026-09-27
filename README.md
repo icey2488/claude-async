@@ -89,6 +89,14 @@ If you'd rather not use the prompt above, or you're not on Windows:
 `status` is one of `running | completed | failed | orphaned | unknown`. `completed` is
 reported only when the job exited with code 0; a non-zero exit is `failed`.
 
+`claude_check` also includes an `exit` field when the runner's `exit.json` record (see
+`job-runner.mjs`) exists in the job's dir: the parsed `{ exitCode, exitSignal, exitReason,
+spawnError?, endedAt, stderrTail, stdoutTail, usageLimitSuspected }` object, letting a dead or
+failed job be attributed without opening the job dir. It is omitted (never `null`) for jobs that
+predate `exit.json`, and degrades to `{ error: "unparseable exit.json" }` if the file is missing,
+partial, oversized (>256 KiB), or otherwise unparseable. This is purely additive: it never affects
+the `status` classification above.
+
 > Field names are camelCase throughout — it's `jobId`, not `job_id`.
 
 ## Configuration

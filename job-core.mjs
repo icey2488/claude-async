@@ -135,7 +135,8 @@ const jobPaths = (id) => {
   const d = jobDir(id);
   return { d, out: path.join(d, "out.log"), err: path.join(d, "err.log"),
            exit: path.join(d, "exit_code"), meta: path.join(d, "meta.json"),
-           spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat") };
+           spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat"),
+           exitJson: path.join(d, "exit.json") };
 };
 
 export function pidAlive(pid) {
@@ -213,6 +214,25 @@ function formatElapsed(ms) {
   const s = Math.round(ms / 1000);
   const m = Math.floor(s / 60);
   return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+}
+
+// exit.json (written by job-runner.mjs, next to meta.json) is reporting-only here: it never
+// influences the running/completed/failed/died/timed_out classification above, only adds detail
+// to it. Absent (jobs predating the file) means no `exit` key at all, not null -- callers can use
+// `"exit" in result` to tell "no record" from "record says nothing". A partial, unparseable, or
+// oversized file degrades to a fixed error shape rather than throwing: a bad exit.json must never
+// take down claude_check for a job that is otherwise fine.
+const EXIT_JSON_MAX_BYTES = 256 * 1024; // exit.json is a handful of short fields; this is generous headroom
+const UNPARSEABLE_EXIT = { error: "unparseable exit.json" };
+
+function readExitJson(p) {
+  if (!fs.existsSync(p.exitJson)) return undefined;
+  try {
+    if (fs.statSync(p.exitJson).size > EXIT_JSON_MAX_BYTES) return UNPARSEABLE_EXIT;
+    return JSON.parse(fs.readFileSync(p.exitJson, "utf8"));
+  } catch {
+    return UNPARSEABLE_EXIT;
+  }
 }
 
 function readTail(file, maxBytes) {
@@ -765,9 +785,11 @@ export function checkJob(id, tailBytes = 8000) {
   }
 
   const runnerJobMembership = readRunnerJobMembership(p);
+  const exitRecord = readExitJson(p);
 
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
+           ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
