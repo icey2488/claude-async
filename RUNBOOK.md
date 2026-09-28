@@ -419,9 +419,28 @@ and when the first process finally returned it deleted whoever's lock was there 
 with `test/multihost/startlock.test.mjs` (a backdated-lock "holder" vs. a concurrent "racer",
 overlap detected via an append-only trace file): 15/15 rounds showed two concurrent holders against
 the pre-fix code, 0/15 against the fix. Same knobs as `claimOneTicket` (`staleMs`, `pidAlive`, `now`,
-`log`), plus `maxHoldMs` (see ceiling below), passed as an optional third argument to
-`withStartLock` — `job-core.mjs`'s call site is unchanged (2 args = production defaults: 30 s
-stale, 5 min ceiling, `process.kill(pid,0)`, `Date.now`).
+`log`), plus `maxHoldMs` (see ceiling below) and `timeoutMs` (see below), passed as an optional third
+argument to `withStartLock` — `job-core.mjs`'s call site is unchanged (2 args = production defaults:
+30 s stale, 5 min ceiling, 5 s acquire timeout, `process.kill(pid,0)`, `Date.now`).
+  - **`timeoutMs` (`fix/guard-fileid-test-timeout`, 2026-09-27; default `LOCK_TIMEOUT_MS` = 5 s).**
+    How long `withStartLock` polls before giving up and returning `{ error }`. Injectable purely so
+    tests that must genuinely poll to a real deadline (the ones that prove a live/foreign lock is
+    *never* broken, so there is nothing to mock away) don't each cost a real 5 s — it is not read from
+    an env var and has no production caller overriding it. Shrinking `staleMs`/`timeoutMs` together in
+    a test to a few hundred ms preserves the same interleaving the test proves, just faster to observe.
+  - **`fileId()` failure right after a successful exclusive create (`fix/guard-fileid-test-timeout`,
+    2026-09-27).** `fileId()` (`fstatSync(fd, {bigint:true})`) can itself throw (EIO/ENOSYS/etc,
+    vanishingly rare). Unlike an `openSync` failure, the exclusive create already succeeded, so this
+    leaves a real, empty file on disk with no dev+ino captured to prove it's ours later. Reintroducing
+    an unconditional path-based unlink here was rejected (again) for the same reason as before: it
+    would reopen the stall race the dev+ino scheme exists to close, by deleting a lock or marker some
+    other process has since legitimately created at that path. The fix instead: always close the fd
+    (no leak), and leave the empty file where a write failure already leaves one — for `.start.lock`,
+    the ordinary staleMs/dead-owner breaker reclaims it (empty content reads as an unreadable/dead
+    owner, same as any other empty lock); for `.start.lock.break`, it joins the already-documented
+    stranded-marker bucket below (manual cleanup), same as a marker whose holder crashed mid-write.
+    Covered by `test/multihost/startlock.test.mjs`'s "lock fileId failure" and "marker fileId failure"
+    tests (patch `fs.fstatSync` to throw once, right after the real `openSync` succeeds).
 `.start.lock` holds `{pid, at}`; broken when it is ≥30 s old AND (its owner pid is dead or
 unreadable, OR that pid is our own, OR the lock is ≥`LOCK_MAX_HOLD_MS` old regardless of whether
 the owner pid looks alive) — never merely old with a live, foreign, sub-ceiling owner, which is left
@@ -452,7 +471,9 @@ needed for a live foreign owner younger than that (rare) — check `Get-Process 
 hand if it is not this bridge/API; a stranded `.start.lock.break` (its holder crashed inside the
 marker window) is deliberately not auto-cleared — delete it by hand if it is old. Neither loses a
 job: the caller just retries `claude_start`. Run: `node --test test/multihost/startlock.test.mjs`
-(race + unit tests, ~29 s) or the full `npm run test:multihost`. Also needs a bridge restart to take
+(race + unit tests, ~10 s — the two real-process race tests still cost ~8.5 s of that; the four unit
+tests that used to each wait the real 5 s acquire timeout now inject a short `timeoutMs` instead) or
+the full `npm run test:multihost`. Also needs a bridge restart to take
 effect (same reason as the claim-lock deploy note right below: `guard.mjs` is loaded in the running
 bridge's memory via `job-core.mjs`).
 - **Deploying: a bridge restart IS required.** The fallback fix changes `job-core.mjs` (it now imports

@@ -302,7 +302,7 @@ test("identity: our lock replaced between create and write -> we lose it; the re
   const lock = path.join(jobRoot, ".start.lock");
   const log = [];
   const r = await withPatchedFs("writeSync", (n) => { if (n === 0) replaceLockWithOthers(lock); },
-    () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l), now: () => Date.now() + 6_000 }));
+    () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l), now: () => Date.now() + 6_000, timeoutMs: 200 }));
   assert.match(r.error, /could not acquire/);
   assert.equal(lockPid(lock), OTHER_PID, "the other holder's live lock must survive untouched");
   assert.ok(log.some((l) => /lost the start lock/.test(l)), log.join("\n"));
@@ -337,13 +337,14 @@ test("identity: a break marker replaced while we hold it is left alone; the brea
 });
 
 test("re-check under the marker: a lock replaced by a fresh one WHILE we hold the marker is never unlinked",
-  { timeout: 15_000 }, async () => {
+  { timeout: 5_000 }, async () => {
   // Models: our first assessment sees a stale lock; we win the marker race; but before our SECOND
   // (under-the-marker) assessment, some other breaker+new-holder pair already ran to completion and
   // left a brand-new, live lock at the same path. Without the re-check, we would unlink that live
   // lock using our stale first snapshot -- exactly the bug this mutation targets. Uses the real clock
   // (small staleMs, a lock backdated just past it) so the "stale now, fresh moments later" transition
-  // is genuine rather than mocked.
+  // is genuine rather than mocked. timeoutMs is shrunk from the 5s production default so the caller's
+  // eventual give-up (the live replacement lock blocks it forever otherwise) doesn't cost real seconds.
   const jobRoot = mkRoot("recheck");
   const lock = putLock(jobRoot, { pid: DEAD_PID, ageMs: 200 });
   const log = [];
@@ -352,7 +353,7 @@ test("re-check under the marker: a lock replaced by a fresh one WHILE we hold th
       fs.unlinkSync(lock);
       fs.writeFileSync(lock, JSON.stringify({ pid: OTHER_PID, at: new Date().toISOString() }));
     }
-  }, () => withStartLock(jobRoot, () => "ran", { staleMs: 100, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l) }));
+  }, () => withStartLock(jobRoot, () => "ran", { staleMs: 100, timeoutMs: 300, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l) }));
   assert.match(r.error, /could not acquire/, "the fresh live lock must block us, not get unlinked");
   assert.equal(lockPid(lock), OTHER_PID, "the other holder's brand-new lock must survive our break attempt");
   assert.ok(!log.some((l) => /BROKE stale start lock/.test(l)), log.join("\n"));
@@ -406,10 +407,50 @@ test("file-id guard: a lock replaced by a rival right before our write failure i
   const log = [];
   const r = await withPatchedFs("writeSync", (n) => {
     if (n === 0) { replaceLockWithOthers(lock); return "throw-eio"; }
-  }, () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l), now: () => Date.now() + 6_000 }));
+  }, () => withStartLock(jobRoot, () => "ran", { log: (l) => log.push(l), now: () => Date.now() + 6_000, timeoutMs: 200 }));
   assert.match(r.error, /could not acquire/);
   assert.equal(lockPid(lock), OTHER_PID, "the rival's replacement lock must survive our write-failure cleanup");
   assert.ok(log.some((l) => /start lock \.start\.lock is no longer the file we created/.test(l)), log.join("\n"));
+});
+
+// fileId() (fstatSync on the fd, right after a successful exclusive create) can itself fail. Unlike
+// the writeSync-failure tests above, the file at that point isn't just empty -- we never even got a
+// dev+ino to identify it by, so releaseIfSameFile is not an option and an unconditional path-based
+// unlink is off the table (that's the exact stall race this whole file identity scheme exists to
+// close). The fd must still never leak, and the empty file must not be a permanent orphan: it's left
+// for the same recovery path an empty write-failed file already uses (see guard.mjs's acquireStartLock
+// and breakStaleStartLock comments).
+
+test("lock fileId failure: a successful create whose fstat then fails does not leak the fd or strand " +
+  "the lock past the ordinary stale-lock breaker", async () => {
+  const jobRoot = mkRoot("lock-fileid-fail");
+  const lock = path.join(jobRoot, ".start.lock");
+  const log = [];
+  const started = Date.now();
+  const r = await withPatchedFs("fstatSync", (n) => { if (n === 0) return "throw-eio"; },
+    () => withStartLock(jobRoot, () => "ran", { staleMs: 10, timeoutMs: 2_000, pidAlive: () => false, log: (l) => log.push(l) }));
+  assert.equal(r, "ran", "the empty stranded lock must be reclaimed by the ordinary stale-lock breaker, not block forever");
+  assert.ok(Date.now() - started < 2_000, "recovery must be bounded by staleMs polling, not the full acquire timeout");
+  assert.ok(!fs.existsSync(lock), "lock released normally after fn ran");
+  assert.ok(log.some((l) => /could not stat start lock right after creating it/.test(l)), log.join("\n"));
+  assert.ok(log.some((l) => /BROKE stale start lock/.test(l)), "the stranded empty lock must be picked up by the normal breaker: " + log.join("\n"));
+});
+
+test("marker fileId failure: a successful create whose fstat then fails does not leak the fd; the " +
+  "empty marker is left for manual cleanup, never path-unlinked", async () => {
+  const jobRoot = mkRoot("marker-fileid-fail");
+  const lock = putLock(jobRoot, { pid: DEAD_PID, ageMs: 500 });
+  const marker = lock + ".break";
+  const log = [];
+  const started = Date.now();
+  const r = await withPatchedFs("fstatSync", (n) => { if (n === 0) return "throw-eio"; },
+    () => withStartLock(jobRoot, () => "ran", { staleMs: 100, timeoutMs: 200, pidAlive: () => false, log: (l) => log.push(l) }));
+  assert.match(r.error, /could not acquire/, "cannot safely identify the marker, so this attempt fails closed rather than risking someone else's file");
+  assert.ok(Date.now() - started < 2_000, "the give-up must be bounded by timeoutMs, not a real 30s+ wait");
+  assert.ok(fs.existsSync(marker), "the stranded (empty) marker is left in place -- not path-unlinked -- for manual cleanup");
+  assert.equal(fs.readFileSync(marker, "utf8"), "", "marker must still be empty (write was never attempted after fstat failed)");
+  assert.ok(log.some((l) => /could not stat .*\.start\.lock\.break right after creating it/.test(l)), log.join("\n"));
+  assert.ok(fs.existsSync(lock), "the underlying start lock itself is untouched by the marker's fileId failure");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -455,12 +496,14 @@ test("ceiling: a live-looking owner between staleMs and maxHoldMs is NEVER broke
   const jobRoot = mkRoot("ceiling-pending");
   // Real clock, on purpose: a mocked now() that is fixed across the whole poll would never trip the
   // deadline (infinite loop), and one that grows unboundedly would eventually cross maxHoldMs itself.
-  // maxHoldMs is set well above the real ~5s LOCK_TIMEOUT_MS wait so age (starting at 200ms and only
-  // growing by the real elapsed polling time) can never reach the ceiling before the caller gives up.
+  // timeoutMs is shrunk well below production (LOCK_TIMEOUT_MS) so the real wait this test needs (it
+  // must actually poll and give up) costs milliseconds, not seconds; maxHoldMs stays comfortably above
+  // it so age (starting at 200ms and only growing by real elapsed polling time) can never reach the
+  // ceiling before the caller gives up.
   const lock = putLock(jobRoot, { pid: OTHER_PID, ageMs: 200 });
   const log = [];
   const r = await withStartLock(jobRoot, () => "ran", {
-    staleMs: 100, maxHoldMs: 10_000, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l),
+    staleMs: 100, maxHoldMs: 10_000, timeoutMs: 250, pidAlive: (pid) => pid === OTHER_PID, log: (l) => log.push(l),
   });
   assert.match(r.error, /could not acquire/);
   assert.equal(lockPid(lock), OTHER_PID, "a live owner below the ceiling must never be unlinked");

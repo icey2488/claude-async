@@ -55,6 +55,17 @@
  * file if some rival has since unlinked-and-recreated the same path. The normal (successful) release
  * of the lock itself keeps the content check, unchanged.
  *
+ * fileId() itself can fail (fstatSync on a just-opened fd throwing EIO/ENOSYS/etc, vanishingly rare
+ * but not impossible): the exclusive create already succeeded, so unlike an openSync failure this
+ * leaves a real, empty file on disk with no dev+ino in hand to prove it is still ours. Reintroducing
+ * an unconditional path-based unlink here would reopen exactly the stall race the dev+ino check exists
+ * to close (it could delete a lock or marker some other process has since legitimately created at the
+ * same path). Instead: the fd is always closed (never leaked), and the empty file is left exactly
+ * where a write failure would leave one -- for the lock, the existing staleMs/dead-owner breaker
+ * reclaims it like any other empty, owner-less lock; for the marker, it joins the already-documented
+ * "stranded marker" bucket (RUNBOOK "Manual cleanup") the same as one whose holder crashed mid-write.
+ * Bounded, never a silent leak; see acquireStartLock and breakStaleStartLock below.
+ *
  * Depth (CLAUDE_ASYNC_DEPTH env / X-Claude-Async-Depth header) is an ACCIDENT guard only, NOT a
  * security control: any caller can simply lie about it. Jobs are launched with depth+1; a start
  * presenting depth > 1 is rejected, which stops a runaway job-dispatches-job chain at two levels.
@@ -208,12 +219,25 @@ function breakStaleStartLock(lockPath, ctx) {
   if (first.state !== "stale" && first.state !== "ceiling") return "held";
 
   const marker = lockPath + ".break";
-  let fd, markerId;
-  try { fd = fs.openSync(marker, "wx"); markerId = fileId(fd); }
+  let fd;
+  try { fd = fs.openSync(marker, "wx"); }
   catch (e) {
     log(e.code === "EEXIST"
       ? `stale start lock, but ${path.basename(marker)} exists (another process is breaking it, or its breaker died -- delete the marker by hand if it is old); waiting`
       : `stale start lock, could not create ${path.basename(marker)}: ${e.code}: ${e.message}; waiting`);
+    return "held";
+  }
+  let markerId;
+  try { markerId = fileId(fd); }
+  catch (e) {
+    // The create above already succeeded, so unlike the openSync failure just above this leaves a
+    // real (empty) marker on disk with no dev+ino to prove it's ours. Never path-unlink it (that
+    // reopens the stall race dev+ino exists to close); close the fd and leave the empty marker for
+    // manual cleanup, same bucket as a marker whose holder crashed mid-write (see file header and
+    // RUNBOOK "Manual cleanup"). Any later attempt sees it via the ordinary EEXIST branch above.
+    try { fs.closeSync(fd); } catch {}
+    log(`could not stat ${path.basename(marker)} right after creating it: ${e.code}: ${e.message}; ` +
+        `leaving the empty marker for manual cleanup; waiting`);
     return "held";
   }
   try {
@@ -248,15 +272,29 @@ function breakStaleStartLock(lockPath, ctx) {
 
 // true = we now hold lockPath exclusively.
 async function acquireStartLock(lockPath, ctx) {
-  const { log, now } = ctx;
-  const deadline = now() + LOCK_TIMEOUT_MS;
+  const { log, now, timeoutMs } = ctx;
+  const deadline = now() + timeoutMs;
   for (;;) {
-    let fd, id;
-    try { fd = fs.openSync(lockPath, "wx"); id = fileId(fd); }
+    let fd;
+    try { fd = fs.openSync(lockPath, "wx"); }
     catch (e) {
       if (e.code !== "EEXIST") { log(`could not create start lock: ${e.code}: ${e.message}`); return false; }
       const outcome = breakStaleStartLock(lockPath, ctx);
       if (outcome === "retry") continue;
+      if (now() > deadline) return false;
+      await sleep(25);
+      continue;
+    }
+    let id;
+    try { id = fileId(fd); }
+    catch (e) {
+      // Same reasoning as the marker case in breakStaleStartLock: the create already succeeded, so
+      // this leaves a real (empty) lock file with no dev+ino to prove it's ours. Close the fd (never
+      // leak it) and leave the empty lock exactly where a write failure would leave one, for the
+      // ordinary staleMs/dead-owner breaker to reclaim -- never an unconditional path-based unlink.
+      try { fs.closeSync(fd); } catch {}
+      log(`could not stat start lock right after creating it: ${e.code}: ${e.message}; ` +
+          `leaving the empty lock for the stale-lock breaker`);
       if (now() > deadline) return false;
       await sleep(25);
       continue;
@@ -288,17 +326,19 @@ async function acquireStartLock(lockPath, ctx) {
 }
 
 // Runs fn() while holding jobRoot/.start.lock. fn must be synchronous (it only stats/counts and
-// creates the job dir). opts (all optional, tests only): staleMs, maxHoldMs, pidAlive, now, log --
-// see "Start lock protocol" above and launcher-claim.mjs's claimOneTicket for the same knobs.
+// creates the job dir). opts (all optional, tests only): staleMs, maxHoldMs, pidAlive, now, log,
+// timeoutMs -- see "Start lock protocol" above and launcher-claim.mjs's claimOneTicket for the same
+// knobs. timeoutMs defaults to LOCK_TIMEOUT_MS (5s); production call sites never override it -- it
+// exists so tests can shrink the acquire-timeout wait without touching the production default.
 export async function withStartLock(jobRoot, fn, opts = {}) {
   const {
-    staleMs = LOCK_STALE_MS, maxHoldMs = LOCK_MAX_HOLD_MS,
+    staleMs = LOCK_STALE_MS, maxHoldMs = LOCK_MAX_HOLD_MS, timeoutMs = LOCK_TIMEOUT_MS,
     pidAlive = defaultPidAlive, now = Date.now, log = () => {},
   } = opts;
   const lock = path.join(jobRoot, ".start.lock");
-  const ctx = { staleMs, maxHoldMs, pidAlive, now, log };
+  const ctx = { staleMs, maxHoldMs, timeoutMs, pidAlive, now, log };
   const ok = await acquireStartLock(lock, ctx);
-  if (!ok) return { error: `could not acquire ${lock} within ${LOCK_TIMEOUT_MS}ms; no job started` };
+  if (!ok) return { error: `could not acquire ${lock} within ${timeoutMs}ms; no job started` };
   try { return fn(); }
   finally { releaseIfOwned(lock, log, "start lock"); }
 }
