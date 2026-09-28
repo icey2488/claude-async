@@ -47,10 +47,44 @@ export function loadNotifyConfig() {
   return { webhookUrl, includeHeadline: cfg.discord.includeHeadline !== false };
 }
 
-// First non-empty line of `stdoutLines` that isn't a markdown heading ("#...") or a code-fence
-// marker ("```..."). Those two are skipped because they read as noise/broken formatting as a
-// one-line phone notification, not because they're unsafe -- unlike escapeDiscordText(), which
-// handles safety.
+const LABEL_MAX_CHARS = 80;
+// Leading list/number markers: "-", "*", "+", ">", "1.", "1)", repeated ("> - 1.").
+const LIST_PREFIX = /^(?:(?:[-*+>]|\d+[.)])(?:\s+|$))+/;
+// A line wholly wrapped in one emphasis pair: **x**, __x__, *x*, _x_.
+const EMPHASIS_WRAPPED = /^(\*\*|__|\*|_)(.+)\1$/;
+
+// True for a line that is only markdown markers around a short label: "1.", "- **Report**",
+// "**Report**", "**1. Git -- `...`**", "**Summary:**", or a rule like "---". A wrapped line that
+// reads like content (ends like a sentence, "**All checks passed.**", or carries a value after a
+// colon, "**Verdict: PASS**") or runs past LABEL_MAX_CHARS is not a label.
+export function isLabelLine(line) {
+  if (/^[-*_=~+>\s]+$/.test(line)) return true;
+  const rest = line.replace(LIST_PREFIX, "").trim();
+  if (!rest) return true;
+  const m = rest.match(EMPHASIS_WRAPPED);
+  if (!m) return false;
+  const inner = m[2].replace(LIST_PREFIX, "").trim();
+  return inner.length <= LABEL_MAX_CHARS && !/[.!?]$/.test(inner) && !/:\s+\S/.test(inner);
+}
+
+// Windows drive paths (C:\, D:/), UNC (\\server), and absolute POSIX paths (/home/, /c/Users/,
+// /usr/...). The drive letter and the POSIX leading slash must not follow a word character, so
+// URLs ("https://..."), "and/or", and "1/2" do not count.
+const PATH_PATTERNS = [
+  /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/,
+  /(?:^|[^\\\w])\\\\[\w.$-]+/,
+  /(?:^|[^\w/.~-])\/[\w.$-]+\//,
+];
+
+export function containsPath(line) {
+  return PATH_PATTERNS.some((re) => re.test(line));
+}
+
+// First non-empty line of `stdoutLines` that isn't a markdown heading ("#..."), a code-fence
+// marker ("```..."), a bare markdown label (isLabelLine), or a line containing a filesystem path
+// (containsPath). Headings, fences and labels are skipped because they read as noise/broken
+// formatting as a one-line phone notification; path lines because a local path says nothing
+// about the outcome and should not leave the host. Escaping (escapeDiscordText) handles safety.
 export function extractHeadline(stdoutLines) {
   if (!Array.isArray(stdoutLines)) return null;
   for (const raw of stdoutLines) {
@@ -58,6 +92,8 @@ export function extractHeadline(stdoutLines) {
     if (!line) continue;
     if (line.startsWith("#")) continue;
     if (line.startsWith("```")) continue;
+    if (isLabelLine(line)) continue;
+    if (containsPath(line)) continue;
     return line;
   }
   return null;

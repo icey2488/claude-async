@@ -16,6 +16,7 @@ import { cleanupTmp, TMP, hosts } from "./_setup.mjs";
 import {
   NOTIFY_TIMEOUT_MS, loadNotifyConfig, extractHeadline, escapeDiscordText, boundHeadline,
   formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
+  isLabelLine, containsPath,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -46,6 +47,51 @@ test("boundHeadline: truncates to 200 chars BEFORE escaping, then escapes", () =
 
 test("boundHeadline: returns null when no usable line exists", () => {
   assert.equal(boundHeadline(["# heading only"]), null);
+});
+
+// Regression: a report opening "## Report" / "**1. Git -- `C:\...`**" used to put the bold,
+// path-bearing section label on the phone as the headline.
+test("extractHeadline: skips a bold numbered section label carrying a Windows path (real regression)", () => {
+  const stdout = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`";
+  const headline = extractHeadline(stdout.split("\n"));
+  assert.equal(headline, "- Branch: `main`");
+  assert.ok(!containsPath(headline), "headline must not carry a path");
+  assert.equal(boundHeadline(stdout.split("\n")), "- Branch: \\`main\\`");
+});
+
+test("extractHeadline: a plain verdict line before a heading wins", () => {
+  assert.equal(extractHeadline("Verdict: all good.\n## Details".split("\n")), "Verdict: all good.");
+});
+
+test("extractHeadline: skips marker-only and short emphasis-label lines", () => {
+  for (const label of ["1.", "- **Report**", "**Report**", "**Summary:**", "1. **Findings**", "---", "* * *"]) {
+    assert.equal(extractHeadline([label, "real headline"]), "real headline", `should skip ${JSON.stringify(label)}`);
+    assert.ok(isLabelLine(label), `isLabelLine(${JSON.stringify(label)})`);
+  }
+});
+
+test("extractHeadline: emphasis around content (sentence or key: value) is still a headline", () => {
+  assert.equal(extractHeadline(["**All checks passed.**", "x"]), "**All checks passed.**");
+  assert.equal(extractHeadline(["**Verdict: PASS**", "x"]), "**Verdict: PASS**");
+  assert.equal(extractHeadline(["- Branch pushed to origin", "x"]), "- Branch pushed to origin");
+});
+
+test("containsPath: Windows drive, UNC, and absolute POSIX paths; not URLs or ordinary slashes", () => {
+  for (const p of ["see C:\\Users\\x", "wrote D:/code/repo", "at \\\\server\\share", "cwd /home/raide/x",
+                   "in `/c/Users/Raide`", "bin /usr/local/bin", "(/tmp/job/out.log)"]) {
+    assert.ok(containsPath(p), `should detect a path in ${JSON.stringify(p)}`);
+  }
+  for (const s of ["https://example.com/a/b", "and/or", "3/4 tests passed", "ratio 1:2", "Verdict: all good.",
+                   "~ is home", "http://x/y/z"]) {
+    assert.ok(!containsPath(s), `should not flag ${JSON.stringify(s)}`);
+  }
+});
+
+test("extractHeadline: path-bearing lines are skipped in the tail too; none qualifying means no headline", () => {
+  const tail = ["Wrote C:\\Users\\Raide\\out.txt", "done in /home/raide/work/", "**Report**"];
+  assert.equal(extractHeadline(tail), null);
+  assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], tail)), null);
+  assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], [...tail, "Tail verdict ok"])), "Tail verdict ok");
 });
 
 test("formatDuration: seconds, minutes, hours, and the unknown fallback", () => {
@@ -299,6 +345,19 @@ test("headline source: a markdown heading as the first line of out.log is skippe
   await spawnRunner(dir);
   server.close();
   assert.equal(requests[0].body.content.split("\n")[1], "Everything checks out.");
+});
+
+test("headline source: a report opening with a bold path-bearing section label never puts the path on the ping", async () => {
+  const stdoutText = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`\n";
+  const dir = prepareJob({ exitCode: 0, stdoutText });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  const content = requests[0].body.content;
+  assert.ok(!content.includes("Users"), `no path may reach the ping, got: ${content}`);
+  assert.equal(content.split("\n")[1], "- Branch: \\`main\\`");
 });
 
 test("headline source: out.log over 8 KiB whose only qualifying line is past the 8 KiB mark falls back to the stdoutTail rule", async () => {
