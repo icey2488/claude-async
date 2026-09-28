@@ -134,6 +134,52 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   unknown), `mcp.test.mjs` (enum built from a three-name `hosts.json`; a host removed after startup is refused with no
   ticket), `ids.test.mjs`, `api.test.mjs` (receiver gate, an `ha` receiver).
 
+## Dispatch cards (`CLAUNKER_JOBCARD_CMD`, 2026-09-28)
+
+- **Where the card is minted.** A forwarded job's card is minted by the receiver's `host-api.mjs` (it runs
+  `startJob`), and closed by that job's `job-runner.mjs`. Neither reads the Claude Desktop config: the bridge's
+  `claude_desktop_config.json` `env` block only reaches the bridge's own process tree. That is why jobs forwarded
+  through host-api came back `cardId: null` with `UNCARDED: spawnSync ... ENOENT` (through 2026-09-28): host-api
+  fell back to the default `~/code/claunker-hermes`, which does not exist on Claunker (the code is at
+  `D:\code\claunker-hermes`).
+- **Set it at USER scope on a receiver**, so both `ClaudeAsyncHostApi` (mint) and `ClaudeAsyncRunner` (close)
+  inherit it. `CLAUNKER_*` is not in the env the bridge forwards to the runner (only `CLAUDE_*`/`ANTHROPIC_*`), so
+  the runner has to get it from the user environment too. Use the JSON-array form and set it from PowerShell, not
+  `setx` (which truncates and mangles the quotes):
+
+  ```powershell
+  [Environment]::SetEnvironmentVariable('CLAUNKER_JOBCARD_CMD', '["D:\\code\\claunker-hermes\\.venv\\Scripts\\python.exe","D:\\code\\claunker-hermes\\jobcard.py"]', 'User')
+  ```
+
+  **Restart `ClaudeAsyncHostApi` after changing it** (procedure in the Windows receiver note below): host-api is
+  long-lived and only sees the environment it started with. `ClaudeAsyncRunner` needs no restart (each launch is a fresh task instance). Keep the bridge's
+  `claude_desktop_config.json` entry too, for jobs started locally through the bridge.
+- **Quiet mode.** With `CLAUNKER_JOBCARD_CMD` unset and the default command missing (ENOENT), the host has no card
+  command: no card, no `UNCARDED` note, one `card-hook: ... skipping card` line on stderr (host-api's is in
+  `%USERPROFILE%\.claude-async\host-api.log`). So a receiver that should mint cards but prints that line has lost
+  the variable. An explicit `CLAUNKER_JOBCARD_CMD` that fails (missing exe, non-zero exit, timeout) still yields
+  `UNCARDED: <reason>` in the start response.
+- **Windows receiver restart: `Stop-ScheduledTask` does not stop host-api.** The `ClaudeAsyncHostApi` action is
+  `cmd.exe /c "node D:\code\claude-async\host-api.mjs >> %USERPROFILE%\.claude-async\host-api.log 2>&1"`.
+  `Stop-ScheduledTask` ends that `cmd.exe` but NOT its `node` child, so the old host-api keeps serving 7850 with its
+  old environment, and a following `Start-ScheduledTask` fails (`LastTaskResult` 1, port busy). Seen 2026-09-28: the
+  old node outlived a stop/start and kept serving without `CLAUNKER_JOBCARD_CMD`. To restart:
+
+  ```powershell
+  Stop-ScheduledTask -TaskName ClaudeAsyncHostApi
+  # stop only the node whose CommandLine is host-api.mjs from this checkout
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+    Where-Object { $_.CommandLine -match 'D:\\code\\claude-async\\host-api\.mjs' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+  Get-NetTCPConnection -LocalPort 7850 -State Listen -ErrorAction SilentlyContinue   # must print nothing
+  Start-ScheduledTask -TaskName ClaudeAsyncHostApi
+  curl.exe -s -o NUL -w "%{http_code}" http://<tailscale-ip>:7850/v1/jobs          # 401 = up (unauthenticated)
+  ```
+
+  Then confirm the port 7850 listener is a fresh `node` running `host-api.mjs` (`Get-NetTCPConnection -LocalPort
+  7850 -State Listen`, then its `CommandLine` via `Get-CimInstance Win32_Process`) and that `host-api.log` got a new
+  `listening on` line.
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /
