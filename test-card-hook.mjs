@@ -8,6 +8,8 @@
  *   3. no artifact when HEAD unchanged
  *   4. fail on nonzero exit
  *   5. UNCARDED path when jobcard errors — mintCard returns {error, cardId:null}; startJob still dispatches
+ *   6. quiet mode: default command absent and CLAUNKER_JOBCARD_CMD unset: no UNCARDED note;
+ *      an explicit command that is missing or exits non-zero still gets the note
  *
  * Run: node test-card-hook.mjs   (exit 0 = all pass)
  */
@@ -64,7 +66,7 @@ process.env.CLAUDE_CLI_PATH = process.execPath; // node as "claude" — exits fa
 
 // ─── Imports (dynamic so env vars are set first) ──────────────────────────────
 
-const { mintCard, closeCard, getGitHead, intentSummary, boundIntent, INTENT_SUMMARY_MAX } = await import("./card-hook.mjs");
+const { mintCard, closeCard, getGitHead, intentSummary, boundIntent, INTENT_SUMMARY_MAX, resolveJobcard } = await import("./card-hook.mjs");
 const { startJob } = await import("./job-core.mjs");
 
 // ─── Git test repo ────────────────────────────────────────────────────────────
@@ -322,6 +324,67 @@ await test("UNCARDED: startJob still dispatches when jobcard errors (note prefix
     `note should start with UNCARDED:, got: ${result.note}`);
   // Cleanup
   try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, "job-t5b"), { recursive: true, force: true }); } catch {}
+});
+
+// ─── Test 6: quiet mode, default command absent vs. explicit misconfiguration ─
+// The default command lives under os.homedir(), so point USERPROFILE/HOME at an empty temp
+// home to guarantee it is missing regardless of the machine running the tests.
+
+// This file starts more jobs than the default 6-per-minute cap allows; lift it for these.
+const TEST_CAPS = { maxConcurrent: 100, maxStartsPerMinute: 100 };
+const EMPTY_HOME = path.join(TMP, "empty-home");
+fs.mkdirSync(EMPTY_HOME, { recursive: true });
+
+async function withJobcardEnv(cmd, fn) {
+  const saved = { cmd: process.env.CLAUNKER_JOBCARD_CMD, up: process.env.USERPROFILE, home: process.env.HOME };
+  if (cmd === undefined) delete process.env.CLAUNKER_JOBCARD_CMD; else process.env.CLAUNKER_JOBCARD_CMD = cmd;
+  process.env.USERPROFILE = EMPTY_HOME;
+  process.env.HOME = EMPTY_HOME;
+  try { return await fn(); }
+  finally {
+    process.env.CLAUNKER_JOBCARD_CMD = saved.cmd;
+    if (saved.up === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.up;
+    if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+  }
+}
+
+function cleanupJob(id) {
+  try { fs.rmSync(path.join(process.env.CLAUDE_ASYNC_JOB_DIR, id), { recursive: true, force: true }); } catch {}
+}
+
+await test("quiet mode: default path missing and CLAUNKER_JOBCARD_CMD unset -> no error, no UNCARDED note", async () => {
+  const result = await withJobcardEnv(undefined, async () => {
+    const [exe, , explicit] = resolveJobcard();
+    assert(explicit === false, "expected the default command to be used");
+    assert(exe.startsWith(EMPTY_HOME), `default exe should resolve under the temp home, got ${exe}`);
+    const minted = mintCard("job-t6a", REPO);
+    assert(minted.cardId === null && minted.error === null,
+      `expected {cardId:null, error:null}, got ${JSON.stringify(minted)}`);
+    return startJob({ prompt: "test", workFolder: REPO, jobId: "job-t6b" }, { caps: TEST_CAPS });
+  });
+  assert(result && result.pid, "startJob should return a job record with a pid");
+  assert(result.cardId === null, `expected null cardId, got ${JSON.stringify(result.cardId)}`);
+  assert(!result.note.includes("UNCARDED"), `note should not mention UNCARDED, got: ${result.note}`);
+  cleanupJob("job-t6b");
+});
+
+await test("explicit CLAUNKER_JOBCARD_CMD whose exe is missing -> UNCARDED note", async () => {
+  const missing = JSON.stringify([path.join(TMP, "no-such-dir", "python.exe"), "jobcard.py"]);
+  const result = await withJobcardEnv(missing,
+    () => startJob({ prompt: "test", workFolder: REPO, jobId: "job-t6c" }, { caps: TEST_CAPS }));
+  assert(result && result.pid, "startJob should return a job record with a pid");
+  assert(result.note.startsWith("UNCARDED:") && result.note.includes("ENOENT"),
+    `note should start with UNCARDED: and name ENOENT, got: ${result.note}`);
+  cleanupJob("job-t6c");
+});
+
+await test("explicit CLAUNKER_JOBCARD_CMD that exits non-zero -> UNCARDED note (even with default absent)", async () => {
+  const result = await withJobcardEnv(ERROR_CMD,
+    () => startJob({ prompt: "test", workFolder: REPO, jobId: "job-t6d" }, { caps: TEST_CAPS }));
+  assert(result && result.pid, "startJob should return a job record with a pid");
+  assert(result.note.startsWith("UNCARDED:") && result.note.includes("exit 42"),
+    `note should start with UNCARDED: and name exit 42, got: ${result.note}`);
+  cleanupJob("job-t6d");
 });
 
 // ─── Cleanup + summary ────────────────────────────────────────────────────────

@@ -5,44 +5,62 @@
  *
  * Env: CLAUNKER_JOBCARD_CMD — space-split command override; default resolves
  * to the known claunker-hermes venv at ~/code/claunker-hermes.
+ *
+ * Quiet mode: when CLAUNKER_JOBCARD_CMD is NOT set and the default executable does not
+ * exist (spawn ENOENT), this host simply has no card command. Minting is skipped with one
+ * debug line on stderr and no error, so the start response carries no UNCARDED note.
+ * Every other failure (an explicit CLAUNKER_JOBCARD_CMD that fails, ENOENT included;
+ * non-zero exit; timeout) is a real misconfiguration and still surfaces as an error.
  */
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 
-const HERMES = path.join(os.homedir(), "code", "claunker-hermes");
-const PYTHON = process.platform === "win32"
-  ? path.join(HERMES, ".venv", "Scripts", "python.exe")
-  : path.join(HERMES, ".venv", "bin", "python");
-const SCRIPT = path.join(HERMES, "jobcard.py");
+// Resolved at call time (os.homedir() honours USERPROFILE/HOME) so tests can point it at a
+// temp home.
+function defaultJobcard() {
+  const hermes = path.join(os.homedir(), "code", "claunker-hermes");
+  const python = process.platform === "win32"
+    ? path.join(hermes, ".venv", "Scripts", "python.exe")
+    : path.join(hermes, ".venv", "bin", "python");
+  return [python, [path.join(hermes, "jobcard.py")]];
+}
 
 // Read at call time so tests can override CLAUNKER_JOBCARD_CMD between calls.
 // Accepts two formats:
 //   JSON array  — '["C:\\Program Files\\node.exe","script.mjs"]'  (handles spaces in paths)
 //   Space-split — 'node script.mjs'  (simple, no spaces in exe path)
-function resolveJobcard() {
+// Returns [exe, args, explicit]; explicit is true when CLAUNKER_JOBCARD_CMD supplied the command.
+export function resolveJobcard() {
   const raw = process.env.CLAUNKER_JOBCARD_CMD;
   if (raw) {
     try {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return [parsed[0], parsed.slice(1)];
+      if (Array.isArray(parsed) && parsed.length > 0) return [parsed[0], parsed.slice(1), true];
     } catch {}
     const parts = raw.trim().split(/\s+/);
-    return [parts[0], parts.slice(1)];
+    return [parts[0], parts.slice(1), true];
   }
-  return [PYTHON, [SCRIPT]];
+  return [...defaultJobcard(), false];
 }
 
-// Returns { ok: true, stdout } or { ok: false, error }. Never throws.
+// Returns { ok: true, stdout }, { ok: false, error }, or { ok: false, skipped: true } (quiet
+// mode, see header). Never throws.
 function runJobcard(args) {
-  const [exe, baseArgs] = resolveJobcard();
+  const [exe, baseArgs, explicit] = resolveJobcard();
   let result;
   try {
     result = spawnSync(exe, [...baseArgs, ...args], { encoding: "utf8", timeout: 10_000 });
   } catch (e) {
     return { ok: false, error: e.message };
   }
-  if (result.error) return { ok: false, error: result.error.message };
+  if (result.error) {
+    if (!explicit && result.error.code === "ENOENT") {
+      try { process.stderr.write(`card-hook: default jobcard command not found and CLAUNKER_JOBCARD_CMD unset; skipping card\n`); } catch {}
+      return { ok: false, skipped: true };
+    }
+    return { ok: false, error: result.error.message };
+  }
   if (result.status !== 0) {
     const msg = (result.stderr || "").trim() || `exit ${result.status}`;
     return { ok: false, error: msg };
@@ -118,7 +136,8 @@ export function getGitHead(dir) {
 
 /**
  * Mint a dispatch card for jobId. Returns { cardId, startHead, error }.
- * cardId is null and error is set when the jobcard command fails (fail-open).
+ * cardId is null and error is set when the jobcard command fails (fail-open). Both are
+ * null in quiet mode (CLAUNKER_JOBCARD_CMD unset and the default command absent).
  * startHead is the git HEAD sha at dispatch time (null for non-repos).
  *
  * model/effort/jobId are the job's dispatch provenance (caller-supplied value or
@@ -150,6 +169,7 @@ export function mintCard(jobId, workFolder, model, effort, prompt, intent) {
   if (body) args.push("--description", body);
   args.push("--job-id", jobId, body || jobId);
   const r = runJobcard(args);
+  if (r.skipped) return { cardId: null, startHead, error: null }; // quiet mode: no card, no note
   if (!r.ok) return { cardId: null, startHead, error: r.error };
   return { cardId: r.stdout || null, startHead, error: null };
 }
