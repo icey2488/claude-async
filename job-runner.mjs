@@ -9,6 +9,11 @@
  * even if the MCP server (the bridge) is restarted. No shell is involved — argv is passed
  * straight to the OS, so prompts/paths need no escaping and Windows works the same as POSIX.
  *
+ * Discord notification: after exit.json and exit_code are both written in finish(), best-effort
+ * pings a Discord webhook (see discord-notify.mjs) if ~/.claude-async/notify.json configures one.
+ * Silently does nothing otherwise. Bounded and try/caught so it can never affect exit_code, the
+ * runner's own exit code, or write ordering.
+ *
  * Heartbeat: writes runner_heartbeat (ISO timestamp) to the job dir once at spawn, every
  * 60s while the child runs, and once in finish(). checkJob reads this to classify
  * running vs timed_out vs died without relying solely on pid re-stat.
@@ -37,11 +42,13 @@
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
 import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
+import { notifyJobFinished } from "./discord-notify.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -184,12 +191,13 @@ function recordExit() {
   if (exitInfo.spawnError !== undefined) record.spawnError = exitInfo.spawnError;
   try { writeJsonAtomic(exitPath, record); }
   catch (e) { try { fs.writeSync(errFd, `\n[job-runner] could not write exit.json: ${e.message}\n`); } catch {} }
+  return record;
 }
 
 let done = false;
 let hbInterval;
 
-function finish(code) {
+async function finish(code) {
   if (done) return;
   done = true;
   if (hbInterval) clearInterval(hbInterval);
@@ -200,17 +208,36 @@ function finish(code) {
   // Write exit.json BEFORE exit_code (and therefore before closeCard() too): exit_code is the
   // signal most external readers poll for "the job is done", so any reader that observes
   // exit_code must be able to rely on exit.json already existing on disk.
-  try { recordExit(); } catch {}
+  let exitRecord = null;
+  try { exitRecord = recordExit(); } catch {}
   try { fs.writeFileSync(exit, String(code)); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
-  let cardId = null, startHead = null;
+  let cardId = null, startHead = null, jobId = null, startedAt = null;
   try {
     const m = JSON.parse(fs.readFileSync(path.join(path.dirname(specPath), "meta.json"), "utf8"));
     cardId = m.cardId || null;
     startHead = m.startHead || null;
+    jobId = m.jobId || null;
+    startedAt = m.startedAt || null;
   } catch {}
   try { closeCard(cardId, code, cwd, startHead); } catch {}
+  // Discord ping: strictly best-effort and bounded (see discord-notify.mjs). Runs AFTER exit.json
+  // and exit_code are both on disk, and is awaited (its own timeout bounds the wait) so the
+  // process does not exit mid-request -- but nothing here can change `code` or any file already
+  // written above.
+  try {
+    await notifyJobFinished({
+      jobId: jobId || path.basename(path.dirname(specPath)),
+      host: os.hostname(),
+      exitCode: exitInfo.exitCode,
+      exitReason: exitInfo.exitReason,
+      startedAt,
+      endedAt: new Date(exitRecord && exitRecord.endedAt ? exitRecord.endedAt : Date.now()),
+      stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
+      logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
+    });
+  } catch {}
   try { fs.closeSync(outFd); } catch {}
   try { fs.closeSync(errFd); } catch {}
   process.exit(0);

@@ -39,6 +39,18 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   read `"exit"` in that case, not `"unknown"` — check `exit.exitCode` too when triaging a `died`
   job, don't assume `diedCause: "exit"` means the CLI actually failed.
 
+## Discord notifications — limitation
+
+The webhook ping (see README's "Discord notifications") fires from `job-runner.mjs`'s own
+`finish()`, so it only ever runs for a job whose runner got to actually finish. A runner that is
+killed outright, or that dies (crashes, loses its process), never reaches `finish()` and so never
+notifies — `died` and `timed_out` are states `claude_check` infers later, at check time, from a
+missing heartbeat/pid, not something the runner itself reports as it happens. There is currently no
+notification for those cases. A later host-side sweep (a small periodic script walking `JOB_ROOT`
+for jobs whose `runner_heartbeat` has gone stale with no `exit_code`, i.e. exactly what
+`claude_check`'s `died`/`timed_out` classification already detects) could fire the same webhook
+for those, but that is future work, not implemented here.
+
 ## Multi-host dispatch (`feat/multihost`)
 
 Design and config are in README's "Multi-host" section. Operational notes:

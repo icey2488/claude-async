@@ -26,6 +26,9 @@
  *   ~/.claude-async/api.json     host-api.mjs's own config (receivers only; token HASH only)
  *   ~/.claude-async/last-seen.json   last successful contact per remote host (claude_jobs'
  *                                    "unreachable (last seen <time>)" row -- the forwarder's only state)
+ *   ~/.claude-async/notify.json   discord-notify.mjs's own config (best-effort job-finish
+ *                                 webhook ping; see that file's header). Read at finish time,
+ *                                 never at startup, and never created by this codebase.
  * Local-host identity is explicit config (hosts.json "localHost"), never guessed from os.hostname().
  */
 import crypto from "node:crypto";
@@ -58,6 +61,7 @@ export const configDir = () =>
 export const hostsFilePath = () => path.join(configDir(), "hosts.json");
 export const apiConfigPath = () => path.join(configDir(), "api.json");
 export const lastSeenPath = () => path.join(configDir(), "last-seen.json");
+export const notifyConfigPath = () => path.join(configDir(), "notify.json");
 
 // True only for a dotted-quad IPv4 literal (four decimal octets 0-255, no leading zeros) in
 // 100.64.0.0/10, the Tailscale CGNAT range. (Delegated to qwen2.5-coder:7b; its output was

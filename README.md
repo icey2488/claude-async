@@ -123,6 +123,55 @@ Optional environment variables:
 | `CLAUDE_ASYNC_MAX_CONCURRENT` | `4` | Max running jobs on this host (`hosts.json` `caps.maxConcurrent` wins) |
 | `CLAUDE_ASYNC_MAX_STARTS_PER_MINUTE` | `6` | Max starts per rolling 60s on this host (`hosts.json` `caps.maxStartsPerMinute` wins) |
 
+## Discord notifications
+
+Optional, best-effort: when a job's `finish()` writes `exit.json`/`exit_code`, the runner tries a
+single bounded (5s) POST to a Discord webhook so you see a phone notification when a job ends.
+Nothing about this can delay, change, or fail the job's recorded result — it runs *after* those
+two files are already on disk, is wrapped in its own try/catch, has no retries, and is awaited
+with a hard timeout so the runner process can't hang waiting on it. If it's not configured, or the
+webhook is unreachable, the job finishes exactly as it would without this feature.
+
+**1. Create a webhook in Discord.** Pick (or make) a channel — a **private** one is recommended,
+since the notification's optional headline line is pulled verbatim from job stdout. Channel
+settings → Integrations → Webhooks → New Webhook → copy its URL.
+
+**2. Write `~/.claude-async/notify.json`** on each host that should notify (`CLAUDE_ASYNC_CONFIG_DIR`
+overrides the directory, same as `hosts.json`) — **this repo never creates this file**:
+
+```json
+{ "discord": { "webhookUrl": "https://discord.com/api/webhooks/<id>/<token>", "includeHeadline": true } }
+```
+
+- Missing file, missing/blank `discord.webhookUrl`, or unparseable JSON all mean the feature is
+  off — no error. Config is read fresh at the end of every job, never cached, so editing it takes
+  effect on the next job with no restart needed.
+- `includeHeadline` (default `true`): when true, the message's second line is the first line of
+  the job's final stdout that isn't a markdown heading (`#…`) or a code-fence marker (```` ``` ````),
+  truncated to 200 characters, with `@`, `` ` ``, `<`, `>` backslash-escaped so it can't render as a
+  mention or break message formatting. Set it `false` for a status-only ping.
+- The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
+  output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
+  a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, jobId, exit code, and
+  duration. It never includes the prompt, stderr, environment, tokens, or file paths.
+
+**3. Lock the file down** — it holds a webhook URL, which is a credential (posting to it needs no
+auth beyond the URL itself):
+
+```powershell
+icacls "$env:USERPROFILE\.claude-async\notify.json" /inheritance:r /grant:r "$env:USERNAME:F"
+```
+```bash
+chmod 600 ~/.claude-async/notify.json   # Linux receiver
+```
+
+**Per-host.** Notifications are per executing host, not global: each machine that runs jobs needs
+its own `notify.json` (they can point at the same webhook, or different channels/webhooks).
+
+**Send a test ping** once configured, by dispatching any trivial job and watching the channel —
+e.g. `claude_start` with prompt `"echo ok"` (or from a shell on the host, a job that just prints a
+line and exits 0) — then `claude_check` to confirm the job also completed normally.
+
 ## Multi-host (registry-driven)
 
 Which hosts exist is configuration, not code. Each machine's `hosts.json` is its **registry**:
