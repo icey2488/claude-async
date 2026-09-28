@@ -148,10 +148,14 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
   effect on the next job with no restart needed.
 - `includeHeadline` (default `true`): when true, the message's second line is the first non-empty
   line of the job's own stdout log (`out.log`, read from the top — job reports conventionally put
-  their verdict there) that isn't a markdown heading (`#…`) or a code-fence marker (```` ``` ````),
-  truncated to 200 characters, with `@`, `` ` ``, `<`, `>` backslash-escaped so it can't render as a
-  mention or break message formatting. Falls back to the tail of stdout when `out.log` is missing/
-  unreadable or has no qualifying line near the top. Set it `false` for a status-only ping.
+  their verdict there) that isn't a markdown heading (`#…`), a code-fence marker (```` ``` ````), a
+  bare markdown label (only list/number/emphasis markers around a short label, such as `1.`,
+  `- **Report**`, `**Summary:**`, or a `---` rule), or a line containing a filesystem path (Windows
+  drive paths like `C:\` or `D:/`, UNC `\\server`, absolute POSIX paths like `/home/` or `/c/Users/`).
+  It is truncated to 200 characters, with `@`, `` ` ``, `<`, `>` backslash-escaped so it can't render
+  as a mention or break message formatting. Falls back to the tail of stdout, under the same rules,
+  when `out.log` is missing/unreadable or has no qualifying line near the top; if the tail has no
+  qualifying line either, the headline is omitted. Set it `false` for a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
   output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
   a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a title, exit code, and
@@ -297,8 +301,12 @@ node host-api.mjs               # run (foreground)
   set). The POSIX launch is `spawn(detached)` + `unref`, so running jobs stay in the unit's cgroup;
   the default `KillMode=control-group` would kill them whenever the API restarts. Copy it to
   `/etc/systemd/system/`, then `systemctl daemon-reload && systemctl enable --now claude-async-api`. The unit has not been run.
-- **Optional:** `CLAUNKER_JOBCARD_CMD` overrides the dispatch-card command. Without the claunker-hermes venv the card step
-  fails open (jobs still run; the start response carries an `UNCARDED` note), so set it only if the receiver has a card command.
+- **Optional:** `CLAUNKER_JOBCARD_CMD` overrides the dispatch-card command. When it is unset and the default
+  command (the claunker-hermes venv under `~/code/claunker-hermes`) does not exist, the host has no card command:
+  card minting and closing are skipped quietly (one debug line on stderr, no `UNCARDED` note, jobs still run).
+  Any other failure still fails open with an `UNCARDED` note in the start response, because it is a real
+  misconfiguration: an explicit `CLAUNKER_JOBCARD_CMD` that cannot be run (including a missing exe), a non-zero
+  exit, or a timeout. Set it only if the receiver has a card command.
 - **Config:** `~/.claude-async/hosts.json` `{ "localHost": "ha", "receiver": true }` for the service user, then
   `node host-api.mjs --new-token` as that user, and add `ha` to the dispatchers' registries (steps above).
 - **Token storage.** `--new-token` prints the plaintext token once and stores only its sha256 in `api.json`;
