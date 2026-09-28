@@ -28,6 +28,16 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
 - **Keep job prompts modest.** Very large prompts (roughly >8–32 KB) passed as a CLI arg can
   cause `spawn ENAMETOOLONG` (exit 127). Pass large content via files instead of inline in
   the prompt.
+- **`died` means "process exited without recording a result"** — pid gone (or recycled to a
+  foreign process) with no `exit_code` file. `claude_check` narrows it with `diedCause`, derived
+  from the runner's `exit.json` (see README's `exit` field): `"spawn-error"`, `"signal"`, `"exit"`
+  (a code was recorded but `exit_code` never was), or `"unknown"` (no `exit.json`, or an
+  unparseable one). This is reporting only — it never changes `status`. Known gap: `job-runner.mjs`
+  writes `exit.json` *before* `exit_code` (see its `finish()`), so a runner killed in that narrow
+  window leaves a clean `exit.json` (`exitCode: 0`, `exitReason: "exit"`) behind a job that still
+  classifies as `died` (or `timed_out`) because `exit_code` was never written. `diedCause` will
+  read `"exit"` in that case, not `"unknown"` — check `exit.exitCode` too when triaging a `died`
+  job, don't assume `diedCause: "exit"` means the CLI actually failed.
 
 ## Multi-host dispatch (`feat/multihost`)
 

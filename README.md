@@ -86,8 +86,9 @@ If you'd rather not use the prompt above, or you're not on Windows:
 | `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
-`status` is one of `running | completed | failed | orphaned | unknown`. `completed` is
-reported only when the job exited with code 0; a non-zero exit is `failed`.
+`status` is one of `running | completed | failed | died | timed_out`. `completed` is
+reported only when the job exited with code 0; a non-zero exit is `failed`. `died` means the
+process exited without recording a result (crash, SIGKILL, pid recycled to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
 
 `claude_check` also includes an `exit` field when the runner's `exit.json` record (see
 `job-runner.mjs`) exists in the job's dir: the parsed `{ exitCode, exitSignal, exitReason,
@@ -96,6 +97,13 @@ failed job be attributed without opening the job dir. It is omitted (never `null
 predate `exit.json`, and degrades to `{ error: "unparseable exit.json" }` if the file is missing,
 partial, oversized (>256 KiB), or otherwise unparseable. This is purely additive: it never affects
 the `status` classification above.
+
+`died` jobs additionally get a `diedCause` field, derived from `exit`: `"spawn-error"` (the CLI
+never started), `"signal"` (killed by a signal), `"exit"` (the CLI exited with a code, but the
+runner never recorded `exit_code` — e.g. killed in the narrow window between writing `exit.json`
+and writing `exit_code`), or `"unknown"` (no `exit.json` at all — a job that predates it, or a
+runner that died before writing one — or an unparseable one). `diedCause` never changes `status`;
+it only explains a `died` job that `exit` couldn't otherwise attribute.
 
 > Field names are camelCase throughout — it's `jobId`, not `job_id`.
 

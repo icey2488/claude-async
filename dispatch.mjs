@@ -198,7 +198,10 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                  "Trust the survival behavior (test/survival.mjs), not this flag, when in doubt. `exit`, " +
                  "when present, is the runner's exit.json record (exitCode/exitSignal/exitReason, " +
                  "spawnError, stderrTail/stdoutTail, endedAt) for attributing a dead or failed job without " +
-                 "opening its job dir; it is absent for jobs that predate exit.json and never null.",
+                 "opening its job dir; it is absent for jobs that predate exit.json and never null. " +
+                 "died jobs also get `diedCause`, derived from `exit`: \"spawn-error\" (the CLI never " +
+                 "started), \"signal\" (killed by a signal), \"exit\" (the CLI exited with a code but the " +
+                 "runner never recorded exit_code), or \"unknown\" (no exit.json, or an unparseable one).",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),

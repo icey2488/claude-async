@@ -3,6 +3,10 @@
 // additive reporting: it must never change the running/completed/failed/died/timed_out
 // classification, must never throw on a missing/partial/unparseable/oversized exit.json, and must
 // omit the key entirely (never null) for jobs that predate exit.json.
+//
+// died jobs additionally get `diedCause` (also purely additive, never changes `status`), derived
+// from `exit`: exitReason spawn-error/signal/exit map 1:1, and "unknown" covers both no exit.json
+// and an unparseable one.
 import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -87,4 +91,80 @@ test("status classification for a completed job is unchanged when exit.json is u
   const r = core.checkJob("done-bad-json");
   assert.equal(r.status, "completed");
   assert.deepEqual(r.exit, { error: "unparseable exit.json" });
+});
+
+// diedCause narrows the `died` bucket using exit.json's exitReason. makeJob's default meta.pid
+// (999999) and no runner.pid/heartbeat file put every job below through checkJob's "legacy: no
+// runner_heartbeat file" path, which classifies as `died` once pidAlive/healMetaPid both fail --
+// exactly the "process gone without writing exit_code" case diedCause exists to explain.
+
+test("diedCause \"spawn-error\": exit.json exitReason spawn-error", () => {
+  makeJob("died-spawn-error", { exitJson: { exitCode: null, exitSignal: null, exitReason: "spawn-error",
+    spawnError: "ENOENT", endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [] } });
+  const r = core.checkJob("died-spawn-error");
+  assert.equal(r.status, "died");
+  assert.equal(r.diedCause, "spawn-error");
+});
+
+test("diedCause \"signal\": exit.json exitReason signal", () => {
+  makeJob("died-signal", { exitJson: { exitCode: null, exitSignal: "SIGKILL", exitReason: "signal",
+    endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [] } });
+  const r = core.checkJob("died-signal");
+  assert.equal(r.status, "died");
+  assert.equal(r.diedCause, "signal");
+});
+
+test("diedCause \"exit\": exit.json exitReason exit (a code was recorded, but exit_code never was)", () => {
+  makeJob("died-exit", { exitJson: { exitCode: 1, exitSignal: null, exitReason: "exit",
+    endedAt: new Date().toISOString(), stderrTail: ["boom"], stdoutTail: [] } });
+  const r = core.checkJob("died-exit");
+  assert.equal(r.status, "died");
+  assert.equal(r.diedCause, "exit");
+});
+
+test("diedCause \"unknown\": no exit.json at all (pre-exit.json job, or runner died before writing one)", () => {
+  makeJob("died-no-exit-json");
+  const r = core.checkJob("died-no-exit-json");
+  assert.equal(r.status, "died");
+  assert.equal("exit" in r, false);
+  assert.equal(r.diedCause, "unknown");
+});
+
+test("diedCause \"unknown\": exit.json is unparseable", () => {
+  const dir = makeJob("died-bad-exit-json");
+  fs.writeFileSync(path.join(dir, "exit.json"), "{not valid json");
+  const r = core.checkJob("died-bad-exit-json");
+  assert.equal(r.status, "died");
+  assert.deepEqual(r.exit, { error: "unparseable exit.json" });
+  assert.equal(r.diedCause, "unknown");
+});
+
+test("diedCause is absent for non-died statuses, even with an exit.json present", () => {
+  makeJob("done-with-exit", { exitCode: 0, exitJson: RECORD_OK });
+  const r = core.checkJob("done-with-exit");
+  assert.equal(r.status, "completed");
+  assert.equal("diedCause" in r, false);
+});
+
+test("listJobs surfaces diedCause for a died job, same convention as pidNote", () => {
+  makeJob("died-listed", { exitJson: { exitCode: 1, exitSignal: null, exitReason: "exit",
+    endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [] } });
+  const rows = core.listJobs();
+  const row = rows.find((r) => r.jobId === "died-listed");
+  assert.equal(row.status, "died");
+  assert.equal(row.diedCause, "exit");
+});
+
+// Known gap (reported, not fixed): job-runner.mjs's finish() writes exit.json BEFORE exit_code, so
+// a runner killed in that window leaves a clean exit.json (exitCode 0, exitReason "exit") behind a
+// job that still classifies `died`, because exit_code was never written and there is no heartbeat
+// file. diedCause reads "exit" here, same as any other unfinished-write death -- it does not, and
+// per the task must not, reclassify status to "completed" just because exit.json looks clean.
+test("classification gap: a died job can have a clean exit.json (exitCode 0) behind it", () => {
+  makeJob("died-but-exit-json-clean", { exitJson: { exitCode: 0, exitSignal: null, exitReason: "exit",
+    endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [] } });
+  const r = core.checkJob("died-but-exit-json-clean");
+  assert.equal(r.status, "died");
+  assert.equal(r.exit.exitCode, 0);
+  assert.equal(r.diedCause, "exit");
 });

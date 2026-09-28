@@ -235,6 +235,19 @@ function readExitJson(p) {
   }
 }
 
+// `died` lumps together every "process exited without recording a result" case. diedCause narrows
+// it using the runner's exit.json (when available) without changing the died classification
+// itself: spawn-error/signal/exit mirror exit.json's own exitReason; "unknown" covers both a
+// missing record (pre-exit.json job, or the runner died before writing one) and an unparseable one
+// -- in both cases exit.json has nothing usable to attribute the death to.
+function classifyDiedCause(exitRecord) {
+  if (!exitRecord || exitRecord.error) return "unknown";
+  if (exitRecord.exitReason === "spawn-error") return "spawn-error";
+  if (exitRecord.exitReason === "signal") return "signal";
+  if (exitRecord.exitReason === "exit") return "exit";
+  return "unknown";
+}
+
 function readTail(file, maxBytes) {
   try {
     const { size } = fs.statSync(file);
@@ -790,6 +803,7 @@ export function checkJob(id, tailBytes = 8000) {
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
            ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
+           ...(state === "died" ? { diedCause: classifyDiedCause(exitRecord) } : {}),
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
@@ -804,6 +818,7 @@ export function listJobs() {
     if (s.elapsed) row.elapsed = s.elapsed;
     if (s.stalled) row.stalled = true;
     if (s.pidNote) row.pidNote = s.pidNote;
+    if (s.diedCause) row.diedCause = s.diedCause;
     return row;
   }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
 }
