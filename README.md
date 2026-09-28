@@ -146,20 +146,24 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
 - Missing file, missing/blank `discord.webhookUrl`, or unparseable JSON all mean the feature is
   off — no error. Config is read fresh at the end of every job, never cached, so editing it takes
   effect on the next job with no restart needed.
-- `includeHeadline` (default `true`): when true, the message's second line is the first line of
-  the job's final stdout that isn't a markdown heading (`#…`) or a code-fence marker (```` ``` ````),
+- `includeHeadline` (default `true`): when true, the message's second line is the first non-empty
+  line of the job's own stdout log (`out.log`, read from the top — job reports conventionally put
+  their verdict there) that isn't a markdown heading (`#…`) or a code-fence marker (```` ``` ````),
   truncated to 200 characters, with `@`, `` ` ``, `<`, `>` backslash-escaped so it can't render as a
-  mention or break message formatting. Set it `false` for a status-only ping.
+  mention or break message formatting. Falls back to the tail of stdout when `out.log` is missing/
+  unreadable or has no qualifying line near the top. Set it `false` for a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
   output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
-  a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, jobId, exit code, and
+  a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a title, exit code, and
   duration. It never includes the prompt, stderr, environment, tokens, or file paths.
+- **Title**: the ping's title is `claude_start`'s dispatch `intent` when one was given for the job
+  (the same text the dispatch card's title shows), otherwise the jobId.
 
 **3. Lock the file down** — it holds a webhook URL, which is a credential (posting to it needs no
 auth beyond the URL itself):
 
 ```powershell
-icacls "$env:USERPROFILE\.claude-async\notify.json" /inheritance:r /grant:r "$env:USERNAME:F"
+icacls "$env:USERPROFILE\.claude-async\notify.json" /inheritance:r /grant:r "${env:USERNAME}:F"
 ```
 ```bash
 chmod 600 ~/.claude-async/notify.json   # Linux receiver

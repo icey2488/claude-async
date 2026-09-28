@@ -197,6 +197,28 @@ test("valid token: start writes exactly one ticket; check + list work; hostname 
   assert.equal((await nf.json()).hostname, HOSTNAME);
 });
 
+// Cross-host dispatch: claude_start's `intent` travels host-api's own /v1/start body (the same
+// body dispatch.mjs's dispatchStart forwards to a remote host) into startLocal -> startJob, so it
+// ends up persisted in meta.json here exactly as a same-host dispatch would.
+test("intent flows through /v1/start into meta.json, and surfaces on both /v1/check and /v1/jobs", async () => {
+  const url = await apiServer();
+  const auth = { authorization: `Bearer ${TOKEN}`, "content-type": "application/json" };
+  const res = await fetch(url + "/v1/start", { method: "POST", headers: auth,
+    body: startBody({ jobId: "api-intent", intent: "Ship the release" }) });
+  const body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(body.intent, "Ship the release");
+
+  const chk = await (await fetch(`${url}/v1/check?jobId=${encodeURIComponent(body.jobId)}`, { headers: auth })).json();
+  assert.equal(chk.intent, "Ship the release");
+  const list = await (await fetch(url + "/v1/jobs", { headers: auth })).json();
+  assert.equal(list.jobs.find((r) => r.jobId === body.jobId).intent, "Ship the release");
+
+  const noIntent = await (await fetch(url + "/v1/start", { method: "POST", headers: auth,
+    body: startBody({ jobId: "api-no-intent" }) })).json();
+  assert.equal("intent" in noIntent, false);
+});
+
 test("API rejections write nothing: wrong host, bad body, depth, caps (429), preflight (422)", async () => {
   const url = await apiServer({ caps: { maxConcurrent: 1, maxStartsPerMinute: 100 } });
   const post = async (body, headers = {}) => {

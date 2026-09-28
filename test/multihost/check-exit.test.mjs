@@ -155,6 +155,27 @@ test("listJobs surfaces diedCause for a died job, same convention as pidNote", (
   assert.equal(row.diedCause, "exit");
 });
 
+// meta.json's `intent` (persisted by startJob when claude_start was given one -- see
+// postlaunch.test.mjs) needs no extra plumbing in checkJob: checkJob already spreads `...meta`
+// into its return value, so any meta field -- intent included -- surfaces for free.
+test("checkJob surfaces meta.intent for free via its ...meta spread; absent intent means no key", () => {
+  makeJob("with-intent", { exitCode: 0, meta: { intent: "Fix the flaky test" } });
+  assert.equal(core.checkJob("with-intent").intent, "Fix the flaky test");
+  makeJob("no-intent", { exitCode: 0 });
+  assert.equal("intent" in core.checkJob("no-intent"), false);
+});
+
+// listJobs builds its row explicitly (jobId/status/exitCode/startedAt plus conditional extras like
+// pidNote/diedCause) rather than spreading meta, so intent needs the same one-line conditional as
+// those other optional fields.
+test("listJobs surfaces intent for a job that has one, same convention as pidNote/diedCause; omitted when absent", () => {
+  makeJob("intent-listed", { exitCode: 0, meta: { intent: "Ship the release" } });
+  makeJob("intent-absent", { exitCode: 0 });
+  const rows = core.listJobs();
+  assert.equal(rows.find((r) => r.jobId === "intent-listed").intent, "Ship the release");
+  assert.equal("intent" in rows.find((r) => r.jobId === "intent-absent"), false);
+});
+
 // Known gap (reported, not fixed): job-runner.mjs's finish() writes exit.json BEFORE exit_code, so
 // a runner killed in that window leaves a clean exit.json (exitCode 0, exitReason "exit") behind a
 // job that still classifies `died`, because exit_code was never written and there is no heartbeat

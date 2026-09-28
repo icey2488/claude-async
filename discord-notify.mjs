@@ -28,6 +28,7 @@ import { configDir } from "./hosts.mjs";
 export const NOTIFY_TIMEOUT_MS = 5000;
 const MAX_CONTENT_CHARS = 1800;
 const HEADLINE_MAX_CHARS = 200;
+const HEAD_BYTES = 8 * 1024;
 
 export function notifyConfigPath() {
   return path.join(configDir(), "notify.json");
@@ -60,6 +61,48 @@ export function extractHeadline(stdoutLines) {
     return line;
   }
   return null;
+}
+
+// Reads at most the first `maxBytes` of `file` and returns it split into lines. Mirrors job-
+// runner.mjs's readTail() bounded-read shape but anchored at the head instead of the tail: job
+// reports put their verdict on the FIRST line ("GATE FAILED...", "Everything checks out.", ...),
+// not the last, so the headline source needs to be the head of the log, not its tail.
+// When the file is bigger than maxBytes, the read window ends mid-line (or mid-character for
+// multibyte UTF-8), so the last line of the chunk is dropped -- it is likely partial, same
+// reasoning as readTail()'s drop of its FIRST line. Any failure (missing file, read error, decode
+// error, ...) yields [] -- this is best-effort diagnostic data; the caller falls back to the
+// stdoutTail rule.
+export function readHead(file, maxBytes = HEAD_BYTES) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size;
+    const length = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(length);
+    if (length > 0) fs.readSync(fd, buf, 0, length, 0);
+    let text = buf.toString("utf8");
+    if (size > length) {
+      // Truncated: the last "line" in the chunk is almost certainly partial. Drop it.
+      const nl = text.lastIndexOf("\n");
+      text = nl === -1 ? "" : text.slice(0, nl);
+    }
+    if (!text) return [];
+    const lines = text.split("\n");
+    if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the file's last write
+    return lines.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+  }
+}
+
+// Picks which line set boundHeadline() should read from: the head of out.log when it has a
+// qualifying line (job reports put their verdict at the top), else the stdoutTail rule this
+// module used before -- covers out.log missing/unreadable (readHead yields []) and out.log
+// present but with no qualifying line in the first HEAD_BYTES (e.g. a long banner/heading block).
+export function chooseHeadlineLines(headLines, tailLines) {
+  return extractHeadline(headLines) ? headLines : tailLines;
 }
 
 // Neutralizes Discord markdown/mention syntax by backslash-escaping @, `, <, > so job output can
@@ -99,9 +142,8 @@ export function markerFor(exitReason, exitCode) {
 }
 
 // Pure builder (no I/O) so tests can check shape/escaping/truncation without a network call.
-// `title` and `jobId` are deliberately the SAME value today -- see the header of notifyJobFinished
-// for why (intent is never persisted past card-mint time) -- but are kept as separate call-sites'
-// worth of intent so a future title source only needs to change the caller, not this function.
+// `jobId` here is really "whatever the caller wants shown as the title" -- see notifyJobFinished's
+// header for why the caller (not this function) resolves that to meta.intent-or-jobId.
 export function buildDiscordContent({ marker, host, jobId, exitCode, durationMs, headline }) {
   const lines = [
     `${marker} host=${host} job=${jobId} exit=${exitCode === null || exitCode === undefined ? "null" : exitCode} ` +
@@ -129,15 +171,21 @@ function sanitizeForLog(msg, webhookUrl) {
  * with a message that has been passed through sanitizeForLog() -- msg never contains the webhook
  * URL. logLine itself is expected to be best-effort too (job-runner.mjs's own diagnostic writer).
  *
- * jobId: meta.json's own jobId field is used as BOTH the "title" and "jobId" fields in the
- * message. This is a deliberate finding, not an oversight: dispatch.mjs/job-core.mjs's `intent`
- * (claude_start's optional one-line summary) is consumed exactly once, at card-mint time
- * (card-hook.mjs's mintCard(), via boundIntent/intentSummary), to build the EXTERNAL jobcard's
- * title/body -- it is never written back into meta.json or any other job-dir file. job-runner.mjs
- * only ever reads meta.json, so by the time a job finishes, the original intent is gone from
- * every file this process can see. jobId is therefore the only stable "title" left.
+ * title: meta.json's `intent` field (job-core.mjs's startJob() persists the dispatcher-supplied,
+ * boundIntent()-bounded intent there, additively, when one was given -- see job-core.mjs) is used
+ * as the message's title when present; jobId is the fallback, same as mintCard()'s own card-title
+ * rule (`boundIntent(intent) || intentSummary(prompt)`, jobId-equivalent being the card's own
+ * last resort). intent is free text from the ORIGINAL dispatcher, so it is escaped the same way
+ * headline text is (escapeDiscordText) before being used -- allowed_mentions:{parse:[]} already
+ * stops it from ever pinging, but escaping keeps it from breaking message formatting too.
+ *
+ * headline: sourced from the HEAD of the job's own stdout log (job reports conventionally put
+ * their verdict on the FIRST line -- "GATE FAILED...", "Everything checks out.", ...), read
+ * bounded via readHead()/outLogPath. Falls back to the stdoutTail rule (the `stdoutLines` param,
+ * exit.json's own stdoutTail) when outLogPath is absent/unreadable or has no qualifying line in
+ * its head window -- see chooseHeadlineLines().
  */
-export async function notifyJobFinished({ jobId, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, includeHeadlineOverride, logLine, fetchImpl = fetch }) {
+export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, logLine, fetchImpl = fetch }) {
   let config;
   try { config = loadNotifyConfig(); } catch { return; }
   if (!config) return;
@@ -145,8 +193,10 @@ export async function notifyJobFinished({ jobId, host, exitCode, exitReason, sta
   const marker = markerFor(exitReason, exitCode);
   const includeHeadline = includeHeadlineOverride !== undefined ? includeHeadlineOverride : config.includeHeadline;
   const durationMs = startedAt && endedAt ? (endedAt.getTime() - new Date(startedAt).getTime()) : NaN;
-  const headline = includeHeadline ? boundHeadline(stdoutLines) : null;
-  const content = buildDiscordContent({ marker, host, jobId, exitCode, durationMs, headline });
+  const headLines = includeHeadline && outLogPath ? readHead(outLogPath) : [];
+  const headline = includeHeadline ? boundHeadline(chooseHeadlineLines(headLines, stdoutLines)) : null;
+  const title = intent ? escapeDiscordText(intent) : jobId;
+  const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, headline });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);

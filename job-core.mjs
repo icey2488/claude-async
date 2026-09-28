@@ -18,7 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { mintCard, failCard } from "./card-hook.mjs";
+import { mintCard, failCard, boundIntent } from "./card-hook.mjs";
 import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
@@ -712,12 +712,17 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
+  // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
+  // ping's title (discord-notify.mjs) can use the same value the dispatch card shows -- omitted
+  // entirely (no key) when no intent was given, rather than stored as null/empty.
+  const persistedIntent = boundIntent(intent);
   const meta = { jobId: id, ...(opts.host ? { host: opts.host } : {}), hostname,
                  pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
                  workFolder: cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
-                 cardId: cardId || null, startHead: startHead || null };
+                 cardId: cardId || null, startHead: startHead || null,
+                 ...(persistedIntent ? { intent: persistedIntent } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -819,6 +824,7 @@ export function listJobs() {
     if (s.stalled) row.stalled = true;
     if (s.pidNote) row.pidNote = s.pidNote;
     if (s.diedCause) row.diedCause = s.diedCause;
+    if (s.intent) row.intent = s.intent;
     return row;
   }).sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)));
 }

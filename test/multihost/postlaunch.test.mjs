@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { core, fakeLaunch, tickets, resetState, BIG_CAPS, cleanupTmp, JOBS, QUEUE } from "./_setup.mjs";
 import { claimOneTicket } from "../../launcher-claim.mjs";
+import { boundIntent } from "../../card-hook.mjs";
 
 after(cleanupTmp);
 beforeEach(resetState);
@@ -60,6 +61,35 @@ test("meta.json: a healthy write is unchanged (no warnings key, meta matches the
   const meta = JSON.parse(fs.readFileSync(path.join(JOBS, "healthy", "meta.json"), "utf8"));
   assert.equal(meta.jobId, "healthy");
   assert.equal(meta.launchPath, "test");
+});
+
+// intent: an additive meta.json field, bounded the same way card-hook.mjs's boundIntent() bounds
+// the card body, so discord-notify.mjs (via job-runner.mjs, which only ever reads meta.json) can
+// use the same title the dispatch card shows. Omitted entirely (no key) rather than null/empty
+// when claude_start was not given one.
+test("meta.json: intent is persisted verbatim when supplied", async () => {
+  const r = await core.startJob({ prompt: "p", jobId: "with-intent", intent: "Fix the flaky test" },
+    { launch: fakeLaunch, caps: BIG_CAPS });
+  assert.equal(r.error, undefined);
+  const meta = JSON.parse(fs.readFileSync(path.join(JOBS, "with-intent", "meta.json"), "utf8"));
+  assert.equal(meta.intent, "Fix the flaky test");
+});
+
+test("meta.json: no intent key at all when none was supplied", async () => {
+  const r = await startWith("no-intent-meta", undefined);
+  assert.equal(r.error, undefined);
+  const meta = JSON.parse(fs.readFileSync(path.join(JOBS, "no-intent-meta", "meta.json"), "utf8"));
+  assert.equal("intent" in meta, false);
+});
+
+test("meta.json: an over-long intent is bounded the same way boundIntent bounds the card body", async () => {
+  const long = "word ".repeat(100).trim(); // far past card_hook's INTENT_SUMMARY_MAX (200 chars)
+  const r = await core.startJob({ prompt: "p", jobId: "long-intent", intent: long },
+    { launch: fakeLaunch, caps: BIG_CAPS });
+  assert.equal(r.error, undefined);
+  const meta = JSON.parse(fs.readFileSync(path.join(JOBS, "long-intent", "meta.json"), "utf8"));
+  assert.equal(meta.intent, boundIntent(long));
+  assert.ok(meta.intent.length <= 200, `expected a bounded intent, got ${meta.intent.length} chars`);
 });
 
 // ---------------------------------------------------------------------------------------------

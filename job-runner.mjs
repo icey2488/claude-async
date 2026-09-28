@@ -213,13 +213,14 @@ async function finish(code) {
   try { fs.writeFileSync(exit, String(code)); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
-  let cardId = null, startHead = null, jobId = null, startedAt = null;
+  let cardId = null, startHead = null, jobId = null, startedAt = null, intent = null;
   try {
     const m = JSON.parse(fs.readFileSync(path.join(path.dirname(specPath), "meta.json"), "utf8"));
     cardId = m.cardId || null;
     startHead = m.startHead || null;
     jobId = m.jobId || null;
     startedAt = m.startedAt || null;
+    intent = m.intent || null;
   } catch {}
   try { closeCard(cardId, code, cwd, startHead); } catch {}
   // Discord ping: strictly best-effort and bounded (see discord-notify.mjs). Runs AFTER exit.json
@@ -229,12 +230,14 @@ async function finish(code) {
   try {
     await notifyJobFinished({
       jobId: jobId || path.basename(path.dirname(specPath)),
+      intent,
       host: os.hostname(),
       exitCode: exitInfo.exitCode,
       exitReason: exitInfo.exitReason,
       startedAt,
       endedAt: new Date(exitRecord && exitRecord.endedAt ? exitRecord.endedAt : Date.now()),
       stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
+      outLogPath: out,
       logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
     });
   } catch {}

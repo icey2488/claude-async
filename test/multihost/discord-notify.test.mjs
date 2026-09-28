@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP, hosts } from "./_setup.mjs";
 import {
   NOTIFY_TIMEOUT_MS, loadNotifyConfig, extractHeadline, escapeDiscordText, boundHeadline,
-  formatDuration, markerFor, buildDiscordContent,
+  formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -73,6 +73,32 @@ test("buildDiscordContent: shape, and a 1800-char hard cap", () => {
     marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: "x".repeat(5000),
   });
   assert.equal(huge.length, 1800);
+});
+
+test("readHead: file at or under maxBytes is read whole, no line dropped", () => {
+  const p = path.join(TMP, `readhead-small-${Date.now()}.txt`);
+  fs.writeFileSync(p, "line one\nline two\nline three\n");
+  assert.deepEqual(readHead(p, 8192), ["line one", "line two", "line three"]);
+});
+
+test("readHead: a file bigger than maxBytes drops the last (likely partial) line of the read window", () => {
+  const p = path.join(TMP, `readhead-big-${Date.now()}.txt`);
+  // Each line is exactly 10 bytes ("0123456789\n" is 11) so a maxBytes of 55 lands mid-line-6.
+  const lines = Array.from({ length: 10 }, (_, i) => String(i).repeat(9));
+  fs.writeFileSync(p, lines.join("\n") + "\n");
+  const head = readHead(p, 55); // covers lines 0-4 whole plus a partial line 5
+  assert.deepEqual(head, lines.slice(0, 5), "the partial 6th line must be dropped, not truncated");
+});
+
+test("readHead: missing file yields []", () => {
+  assert.deepEqual(readHead(path.join(TMP, "does-not-exist-at-all.txt")), []);
+});
+
+test("chooseHeadlineLines: head wins when it has a qualifying line; tail is the fallback otherwise", () => {
+  const tail = ["tail line"];
+  assert.deepEqual(chooseHeadlineLines(["head line"], tail), ["head line"]);
+  assert.deepEqual(chooseHeadlineLines(["# only a heading"], tail), tail, "no qualifying line in head -> fallback");
+  assert.deepEqual(chooseHeadlineLines([], tail), tail, "empty head (missing/unreadable out.log) -> fallback");
 });
 
 test("loadNotifyConfig: absent file, unparseable JSON, and missing/blank webhookUrl all mean off", () => {
@@ -243,6 +269,83 @@ test("includeHeadline=false: headline line is omitted even when stdout has one",
   server.close();
   assert.equal(requests.length, 1);
   assert.equal(requests[0].body.content.split("\n").length, 1);
+});
+
+// Fix: the headline used to come from stdoutTail (the LAST 20 lines of stdout), which for a long
+// job report lands mid-report -- job reports put their verdict on the FIRST line instead ("GATE
+// FAILED...", "Everything checks out.", "Branch pushed..."). These tests exercise the new
+// HEAD-of-out.log source and its fallback to the old tail rule.
+test("headline source: the verdict on the FIRST line wins even though the last 20 lines are pure boilerplate", async () => {
+  const verdict = "GATE FAILED — stopping immediately";
+  const boilerplate = Array.from({ length: 25 }, (_, i) => `delegation report line ${i}`);
+  const stdoutText = [verdict, ...boilerplate].join("\n") + "\n";
+  const dir = prepareJob({ exitCode: 1, stdoutText });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(requests.length, 1);
+  const lines = requests[0].body.content.split("\n");
+  assert.equal(lines[1], verdict, "headline must be the first line, not something from the last-20-lines tail");
+});
+
+test("headline source: a markdown heading as the first line of out.log is skipped to the next qualifying line", async () => {
+  const stdoutText = ["# Job Report", "Everything checks out.", "trailing detail, never the headline"].join("\n") + "\n";
+  const dir = prepareJob({ exitCode: 0, stdoutText });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(requests[0].body.content.split("\n")[1], "Everything checks out.");
+});
+
+test("headline source: out.log over 8 KiB whose only qualifying line is past the 8 KiB mark falls back to the stdoutTail rule", async () => {
+  // ~600 heading lines comfortably exceeds the 8 KiB head-read bound; every one of them is skipped
+  // by extractHeadline() (both in the head window and in the tail fallback), so the real line at
+  // the very end is the only line either rule could possibly surface.
+  const padding = Array.from({ length: 600 }, (_, i) => `# padding heading line ${i}`);
+  const stdoutText = [...padding, "Verdict from the tail"].join("\n") + "\n";
+  assert.ok(Buffer.byteLength(padding.join("\n"), "utf8") > 8192, "test setup: padding must exceed the 8 KiB head bound");
+  const dir = prepareJob({ exitCode: 0, stdoutText });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(requests[0].body.content.split("\n")[1], "Verdict from the tail");
+});
+
+// Fix: `intent` (claude_start's optional one-line summary) is now persisted to meta.json by
+// job-core.mjs's startJob() (see postlaunch.test.mjs), so job-runner.mjs's finish() -- which only
+// ever reads meta.json -- can pass it through as the notification's title.
+test("title: meta.json's intent is used as the title, escaped the same way headline text is", async () => {
+  const dir = prepareJob({ exitCode: 0 });
+  const metaPath = path.join(dir, "meta.json");
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  meta.intent = "Ship it @everyone `now`";
+  fs.writeFileSync(metaPath, JSON.stringify(meta));
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(requests.length, 1);
+  const statusLine = requests[0].body.content.split("\n")[0];
+  assert.match(statusLine, /job=Ship it \\@everyone \\`now\\`/);
+  assert.ok(!statusLine.includes(meta.jobId), "the raw jobId must not appear once intent supplies the title");
+});
+
+test("title: falls back to jobId when meta.json has no intent", async () => {
+  const dir = prepareJob({ exitCode: 0 });
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.match(requests[0].body.content, new RegExp(`job=${meta.jobId} `));
 });
 
 for (const status of [429, 500]) {
