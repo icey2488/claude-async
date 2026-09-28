@@ -28,6 +28,14 @@ RestartSec=5
 # Jobs are spawn(detached)+unref children that stay in this unit's cgroup. The default
 # KillMode=control-group would kill every running job whenever the API is restarted or stopped.
 KillMode=process
+# Hardening that does not touch job execution: blocks the service (and any detached job under
+# it) from gaining new privileges via setuid/setgid/file-capability binaries, and gives it a
+# private /tmp instead of the host's shared one. Deliberately NOT setting ProtectHome or
+# ProtectSystem=strict here: jobs read/write CLAUDE_ASYNC_DEFAULT_CWD and the job-log dir under
+# the service user's home (CLAUDE_ASYNC_JOB_DIR, default ~/.claude-async-jobs), and those
+# directives would make $HOME read-only and break both.
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

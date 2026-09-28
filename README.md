@@ -2,7 +2,7 @@
 
 A fire-and-poll [MCP](https://modelcontextprotocol.io) server that lets Claude Code run **long background jobs** without hitting the Claude app's tool-call timeout.
 
-**Requirements:** Node.js 18+ (20+ recommended) and the [`claude` CLI](https://docs.claude.com/en/docs/claude-code) installed and authenticated.
+**Requirements:** Node.js 18+ (20+ recommended; on a receiver, match the dispatcher's major version — see "Linux receiver") and the [`claude` CLI](https://docs.claude.com/en/docs/claude-code) installed and authenticated.
 **License:** MIT
 
 ## The problem
@@ -218,24 +218,41 @@ node host-api.mjs               # run (foreground)
 > the receiver code are exercised by the test suite only on Windows so far. On a new receiver, run
 > `npm run test:multihost` first, before pointing anything at it, and read any failure as a real finding.
 
-- **Non-root service user.** The `claude` CLI refuses `--dangerously-skip-permissions` as root, and every job
-  is started with it. Create a user (the sample unit uses `claude`), install the CLI for that user and log it in.
+- **Non-root service user, unprivileged container.** The `claude` CLI refuses `--dangerously-skip-permissions`
+  as root, and every job is started with it. Create a dedicated user (the sample unit uses `claude`) inside an
+  **unprivileged** LXC — not a privileged one, and not a user on the Proxmox host itself, which also hosts the
+  HA OS VM. The service user's home should be the only writable work area (`CLAUDE_ASYNC_DEFAULT_CWD` and the
+  job-log dir both live under it); install the CLI for that user and log it in.
 - **The `claude` binary.** Put it on the service's `PATH`, or set `CLAUDE_CLI_PATH` to its absolute path
   (a systemd unit does not read your shell profile, so set one of the two explicitly).
-- **Node.** A current Node on the box (`/usr/bin/node` in the sample unit); `npm ci` in the checkout.
+- **Node.** Match the dispatcher's major version, Node 24 (`node --version` on the dispatching machine tells
+  you which); `/usr/bin/node` in the sample unit. `npm ci` in the checkout, not `npm install`, so the receiver
+  gets the exact locked versions the dispatcher tested against.
 - **Tailscale in the container.** `host-api.mjs` binds only to a Tailscale address that is on a local
   interface. An LXC needs the TUN device passed through for `tailscaled` to create that interface
-  (userspace-networking mode has no interface, so the API would refuse to start). This is Proxmox-side setup,
-  not exercised here.
+  (userspace-networking mode has no interface, so the API would refuse to start). Run `tailscale up` inside
+  the LXC itself (or whichever host actually runs the receiver process) — not only on the Proxmox host, and
+  not as the Home Assistant OS Tailscale add-on, which is a different node on the tailnet. This is
+  Proxmox-side setup, not exercised here.
+- **Tailnet ACL.** Add a rule allowing the dispatcher to reach the receiver on its port, e.g. (Tailscale ACL
+  JSON) `{"action": "accept", "src": ["claunker"], "dst": ["ha:7850"]}`, using whatever tags or host names your
+  tailnet ACL already keys on.
 - **Service.** `deploy/claude-async-api.service` is a sample unit: `User=claude`, `WorkingDirectory=/home/claude/code/claude-async`,
-  `Environment` for `HOME`, `PATH`, `CLAUDE_CLI_PATH`, `CLAUDE_ASYNC_DEFAULT_CWD`, `Restart=on-failure`, and
-  **`KillMode=process`**. The POSIX launch is `spawn(detached)` + `unref`, so running jobs stay in the unit's cgroup;
+  `Environment` for `HOME`, `PATH`, `CLAUDE_CLI_PATH`, `CLAUDE_ASYNC_DEFAULT_CWD`, `Restart=on-failure`,
+  **`KillMode=process`**, and `NoNewPrivileges=true` / `PrivateTmp=true` (hardening that doesn't touch job
+  execution; see the unit's own comments for why `ProtectHome`/`ProtectSystem=strict` are deliberately not
+  set). The POSIX launch is `spawn(detached)` + `unref`, so running jobs stay in the unit's cgroup;
   the default `KillMode=control-group` would kill them whenever the API restarts. Copy it to
   `/etc/systemd/system/`, then `systemctl daemon-reload && systemctl enable --now claude-async-api`. The unit has not been run.
 - **Optional:** `CLAUNKER_JOBCARD_CMD` overrides the dispatch-card command. Without the claunker-hermes venv the card step
   fails open (jobs still run; the start response carries an `UNCARDED` note), so set it only if the receiver has a card command.
 - **Config:** `~/.claude-async/hosts.json` `{ "localHost": "ha", "receiver": true }` for the service user, then
   `node host-api.mjs --new-token` as that user, and add `ha` to the dispatchers' registries (steps above).
+- **Token storage.** `--new-token` prints the plaintext token once and stores only its sha256 in `api.json`;
+  that printed value is the only copy. Don't leave it sitting in a shell history file or a scratch note —
+  put it in a password manager (e.g. Bitwarden) long-term, and `chmod 600` any file you do stage it in
+  temporarily (and the dispatcher's `hosts.json`, since it holds the plaintext token) before it leaves your
+  terminal.
 
 **Guard (one, server-side).** Every start on the executing host, local or via the API, is
 checked for caps: max concurrent running jobs (default 4) and max starts per rolling minute

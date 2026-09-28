@@ -115,7 +115,8 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   startJob allowed `.`) now errors instead of resolving locally. Ids the multihost work minted are unaffected.
 - **Adding a receiver:** README "Multi-host" ("Adding a receiver (both sides)"). **Linux receiver:** README "Linux receiver";
   `deploy/claude-async-api.service` is the sample unit (`KillMode=process` so an API restart does not take running jobs
-  with it). `--new-token` now prints the target key as `hosts.<this host's localHost>.token`.
+  with it; also `NoNewPrivileges=true` / `PrivateTmp=true`, hardening that doesn't touch job execution). `--new-token`
+  now prints the target key as `hosts.<this host's localHost>.token`.
 - **Tests:** `test/multihost/registry.test.mjs` (schema validation: each bad field is an error naming the file and field,
   and `claude_start` refuses with nothing written), `routing.test.mjs` (three-host registry: `ha` forwards, `laptop` is
   unknown), `mcp.test.mjs` (enum built from a three-name `hosts.json`; a host removed after startup is refused with no
