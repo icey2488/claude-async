@@ -73,8 +73,11 @@ Design and config are in README's "Multi-host" section. Operational notes:
   which a running job's heartbeat keeps fresh, so running jobs read as recent starts and can block new starts
   for up to 60s until the rewritten ledger ages out. Claunker and the laptop are NTFS (birthtime supported).
 - **Host API live test** (Claunker, Tailscale up): `node host-api.mjs --new-token`, then
-  `node host-api.mjs`. It prints `listening on http://100.x.y.z:7850` or refuses with the reason.
-  Before merge, run it from a non-live checkout **only with
+  `node host-api.mjs`. It prints `listening on http://100.x.y.z:7850` once bound; if Tailscale
+  isn't up yet it waits and retries instead of exiting (see "Host API: Tailscale wait and
+  bind-loss recovery" below) and only exits non-zero for a genuine misconfiguration (bad
+  `api.json`/`hosts.json`, `receiver` not `true`, or a `bindAddress` that isn't a Tailscale
+  literal). Before merge, run it from a non-live checkout **only with
   `CLAUDE_ASYNC_WIN32_LAUNCH_MODE=breakaway`** (see the next point).
 
 **Test hazards discovered while building this (2026-09-25):**
@@ -179,6 +182,41 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   Then confirm the port 7850 listener is a fresh `node` running `host-api.mjs` (`Get-NetTCPConnection -LocalPort
   7850 -State Listen`, then its `CommandLine` via `Get-CimInstance Win32_Process`) and that `host-api.log` got a new
   `listening on` line.
+
+## Host API: Tailscale wait and bind-loss recovery (`fix/hostapi-tailnet-wait`, 2026-10-16)
+
+Incident (2026-10-06): Claunker rebooted and the `ClaudeAsyncHostApi` logon trigger ran ~90s later,
+before Tailscale had an address. host-api logged "no Tailscale address ... refusing to start" and
+exited 1. Task Scheduler's restart-on-failure does not help here — it fires on *launch* failure,
+not on a process that starts, logs, and exits non-zero — so the API stayed down for ~10.6 days
+until someone noticed and ran `Start-ScheduledTask` by hand. `host-api.mjs` no longer exits for
+this:
+
+- **Startup wait.** If no Tailscale address (100.64.0.0/10) is present yet, host-api logs
+  `waiting for Tailscale address...` once and retries with backoff (starts at 5s, caps at 60s),
+  logging again at most every ~10 minutes while it waits. By default it waits indefinitely. Set
+  `CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS` to a positive number of milliseconds to bound the wait;
+  past that it logs a clear reason and exits non-zero. Unset, empty, non-numeric, or `<= 0` all
+  mean "wait indefinitely."
+- **A host-api that is waiting is a running `node` process with nothing listening on 7850.** The
+  health probe (claunker-ops) only checks the port, so it will correctly keep reporting the API as
+  down for as long as the wait lasts — that is expected, not a bug in the probe.
+- **Bind-loss recovery.** If the listener errors after a successful bind (e.g. `EADDRNOTAVAIL`
+  because the Tailscale address went away or changed), host-api logs the error, closes the
+  server, and goes back into the same wait-and-rebind loop rather than crashing or exiting.
+- **`EADDRINUSE` at startup** (almost always a second host-api already running) gets its own
+  short, bounded retry — a handful of tries a few seconds apart — then a clear non-zero exit. It
+  is never treated as "wait for Tailscale," and nothing is killed automatically; use the restart
+  procedure above to find and stop the other instance yourself.
+- **What never changed:** host-api still binds *only* to a currently-present Tailscale IPv4
+  address — never `0.0.0.0`, `::`, loopback, or a LAN address — and a misconfigured `bindAddress`
+  (wrong format, or ambiguous with no `bindAddress` set when multiple Tailscale addresses are
+  present) still fails immediately instead of waiting, since no amount of waiting fixes a config
+  mistake. Token auth and the bare-401 behavior on every route are unchanged.
+- **Tests:** `test/multihost/hostapi-wait.test.mjs` (startup wait + bind, bind-loss + rebind, the
+  `CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS` timeout path, `EADDRINUSE` bounded retry, and that a
+  permanent misconfiguration still fails fast) — all via injected interfaces/listen/sleep/now, no
+  real Tailscale or sockets.
 
 ## Dispatch defaults (model + effort)
 

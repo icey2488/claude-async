@@ -260,9 +260,12 @@ can never route to a host that has since been removed (that call errors with the
 **Host API (`host-api.mjs`, receivers only).** `POST /v1/start`, `GET /v1/check?jobId=`,
 `GET /v1/jobs`, all behind `Authorization: Bearer <token>` (bare `401` on failure, checked before
 anything is read or written). It rejects a start whose `host` is not this receiver's `localHost`. It
-binds only to a Tailscale address (100.64.0.0/10) that is present
-on an interface and refuses to start otherwise; it never binds `0.0.0.0` or loopback. Starts go
-through the same guarded `startJob()` and the same launcher queue as the MCP bridge.
+binds only to a Tailscale address (100.64.0.0/10) that is present on an interface; it never binds
+`0.0.0.0` or loopback. If no such address is up yet it waits and retries with backoff instead of
+exiting (bounded by `CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS` if set; see RUNBOOK "Host API:
+Tailscale wait and bind-loss recovery"), and the same wait-and-rebind loop runs again if the
+listener later errors (e.g. the address goes away). Starts go through the same guarded
+`startJob()` and the same launcher queue as the MCP bridge.
 
 ```
 node host-api.mjs --new-token   # once: stores sha256 in api.json, prints the token once

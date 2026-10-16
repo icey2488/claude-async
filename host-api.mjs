@@ -12,8 +12,12 @@
  * the MCP bridge uses; job-runner.mjs and job-launcher.mjs are untouched. It never forwards.
  *
  * Network exposure:
- *   - Binds ONLY to a Tailscale IPv4 address (100.64.0.0/10) present on a local interface. No
- *     Tailscale address at startup -> refuses to start. Never 0.0.0.0, never loopback.
+ *   - Binds ONLY to a Tailscale IPv4 address (100.64.0.0/10) present on a local interface. Never
+ *     0.0.0.0, never loopback. No Tailscale address at startup -> waits (logging once, then at
+ *     most every ~10 min) and retries with backoff instead of exiting; see runHostApi() and the
+ *     CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS env var for a bounded wait. If the listener errors
+ *     after a successful bind (address revoked, interface flaps) it closes and re-enters the same
+ *     wait-and-rebind loop rather than crashing.
  *   - Bearer-token auth on every route (checked before the body is read or anything is touched).
  *     api.json stores only sha256(token); comparison is crypto.timingSafeEqual over the digests.
  *     Failure is a bare 401 with an empty body.
@@ -65,20 +69,23 @@ export function tailscaleAddresses(interfaces) {
   return [...new Set(out)];
 }
 
-// Returns { address } or { error }. Only ever yields an address that is BOTH inside 100.64.0.0/10
-// AND actually present on an interface right now.
+// Returns { address } or { error, transient }. Only ever yields an address that is BOTH inside
+// 100.64.0.0/10 AND actually present on an interface right now. `transient` marks errors that can
+// resolve themselves once Tailscale finishes coming up (so a caller may retry instead of exiting);
+// a misconfigured bindAddress (wrong format, or ambiguity needing one) is never transient.
 export function selectBindAddress(interfaces, configured) {
   const present = tailscaleAddresses(interfaces);
   if (present.length === 0) {
     return { error: "no Tailscale address (100.64.0.0/10) on any network interface; refusing to start " +
-      "(is Tailscale installed and connected?)" };
+      "(is Tailscale installed and connected?)", transient: true };
   }
   if (configured !== undefined && configured !== null && configured !== "") {
     if (!isTailscaleIPv4(configured)) {
       return { error: `bindAddress ${JSON.stringify(configured)} is not a Tailscale address (100.64.0.0/10); refusing to start` };
     }
     if (!present.includes(configured)) {
-      return { error: `bindAddress ${configured} is not present on any interface (found: ${present.join(", ")}); refusing to start` };
+      return { error: `bindAddress ${configured} is not present on any interface (found: ${present.join(", ")}); refusing to start`,
+        transient: true };
     }
     return { address: configured };
   }
@@ -202,7 +209,10 @@ const defaultListen = (server, port, address) => new Promise((resolve, reject) =
 });
 
 // Every refusal path returns { error } before a socket is ever opened. `listen` and `interfaces`
-// are injectable so the bind logic is testable without a live Tailscale interface.
+// are injectable so the bind logic is testable without a live Tailscale interface. A listen()
+// failure (e.g. EADDRINUSE, or EADDRNOTAVAIL if the address vanished between selection and bind)
+// is also returned as { error, code, transient } rather than thrown; `transient` is false only for
+// EADDRINUSE, since another instance already holding the port will not resolve itself by waiting.
 export async function startApi({ interfaces = os.networkInterfaces(), cfg = loadHostsConfig(), apiCfg = loadApiConfig(),
                                  listen = defaultListen, startOptions } = {}) {
   if (cfg.error) return { error: cfg.error };
@@ -212,13 +222,84 @@ export async function startApi({ interfaces = os.networkInterfaces(), cfg = load
   }
   if (apiCfg.error) return { error: apiCfg.error };
   const sel = selectBindAddress(interfaces, apiCfg.bindAddress);
-  if (sel.error) return { error: sel.error };
+  if (sel.error) return { error: sel.error, transient: sel.transient };
   if (!isTailscaleIPv4(sel.address)) return { error: `internal: refusing non-Tailscale bind ${sel.address}` };
   const server = createApiServer({ cfg, apiCfg, startOptions });
   server.requestTimeout = 30_000;
   server.headersTimeout = 10_000;
-  await listen(server, apiCfg.port, sel.address);
+  try {
+    await listen(server, apiCfg.port, sel.address);
+  } catch (e) {
+    return { error: `failed to bind ${sel.address}:${apiCfg.port}: ${e.message}`, code: e.code, transient: e.code !== "EADDRINUSE" };
+  }
   return { server, address: sel.address, port: apiCfg.port };
+}
+
+const MIN_WAIT_BACKOFF_MS = 5_000;
+const MAX_WAIT_BACKOFF_MS = 60_000;
+const WAIT_LOG_INTERVAL_MS = 10 * 60 * 1000;
+const EADDRINUSE_MAX_RETRIES = 5;
+const EADDRINUSE_RETRY_MS = 5_000;
+
+// CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS: how long runHostApi() will keep retrying a transient bind
+// failure (no Tailscale address yet, or it dropped) before giving up and exiting non-zero. Unset,
+// empty, non-numeric, or <= 0 all mean "wait indefinitely" (returned here as 0).
+export function tailnetWaitMsFromEnv(env = process.env) {
+  const raw = env.CLAUDE_ASYNC_HOSTAPI_TAILNET_WAIT_MS;
+  if (raw === undefined || raw === null || raw === "") return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// Keeps the API alive across Tailscale being late (or briefly gone) at startup, and across bind
+// loss afterwards (address revoked, interface flaps). startApi() above still refuses to bind
+// anywhere but a currently-present Tailscale address; this only decides whether to retry instead
+// of exiting when startApi() fails for a reason that can resolve itself (sel.transient / a
+// non-EADDRINUSE listen error), with backoff capped at MAX_WAIT_BACKOFF_MS and a progress log at
+// most every WAIT_LOG_INTERVAL_MS. EADDRINUSE gets its own short, bounded retry (it most likely
+// means another host-api is already running, so waiting longer won't help and nothing is killed).
+// Returns the same shape as startApi(): { server, address, port } or { error }.
+export async function runHostApi({
+  getInterfaces = () => os.networkInterfaces(), cfg = loadHostsConfig(), apiCfg = loadApiConfig(),
+  listen = defaultListen, startOptions, maxWaitMs = tailnetWaitMsFromEnv(),
+  sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = () => Date.now(),
+  log = (line) => console.log(line),
+} = {}) {
+  async function waitAndBind() {
+    const deadline = maxWaitMs > 0 ? now() + maxWaitMs : Infinity;
+    let backoff = MIN_WAIT_BACKOFF_MS;
+    let waiting = false;
+    let lastLog = -Infinity;
+    let addrInUseRetries = 0;
+    for (;;) {
+      const attempt = await startApi({ interfaces: getInterfaces(), cfg, apiCfg, listen, startOptions });
+      if (!attempt.error) {
+        if (waiting) log(`host api: Tailscale address ${attempt.address} is up; bound to ${attempt.address}:${attempt.port}.`);
+        attempt.server.on("error", (err) => {
+          log(`host api: listener error (${err.code || err.message}); closing and waiting for a Tailscale address to rebind`);
+          attempt.server.close(() => { waitAndBind().catch((e) => log(`host api: fatal: ${e.message}`)); });
+        });
+        return attempt;
+      }
+      if (attempt.code === "EADDRINUSE") {
+        addrInUseRetries += 1;
+        log(`host api: port ${apiCfg.port} already in use (another host-api running?); retry ${addrInUseRetries}/${EADDRINUSE_MAX_RETRIES}`);
+        if (addrInUseRetries >= EADDRINUSE_MAX_RETRIES) {
+          return { error: `giving up after ${EADDRINUSE_MAX_RETRIES} EADDRINUSE retries on port ${apiCfg.port}: ${attempt.error}` };
+        }
+        await sleep(EADDRINUSE_RETRY_MS);
+        continue;
+      }
+      if (!attempt.transient) return attempt;
+      const t = now();
+      if (!waiting) { log("host api: waiting for Tailscale address..."); waiting = true; lastLog = t; }
+      else if (t - lastLog >= WAIT_LOG_INTERVAL_MS) { log(`host api: still waiting for Tailscale address (${attempt.error})`); lastLog = t; }
+      if (t >= deadline) return { error: `gave up waiting for a Tailscale address after ${maxWaitMs}ms (last error: ${attempt.error})` };
+      await sleep(Math.max(0, Math.min(backoff, deadline - t)));
+      backoff = Math.min(backoff * 2, MAX_WAIT_BACKOFF_MS);
+    }
+  }
+  return waitAndBind();
 }
 
 // An api.json that exists but does not parse to a JSON object is REFUSED, not rewritten: the rewrite
@@ -251,7 +332,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const self = loadHostsConfig().localHost || "<this host's name>";
     console.log(`Token (shown once; put it in each dispatching machine's hosts.json under hosts.${self}.token):\n${token}`);
   } else {
-    const r = await startApi();
+    const r = await runHostApi();
     if (r.error) { console.error(`claude-async host API: ${r.error}`); process.exit(1); }
     console.log(`claude-async host API listening on http://${r.address}:${r.port} (host ${loadHostsConfig().localHost})`);
   }
