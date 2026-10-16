@@ -27,7 +27,10 @@ import { configDir } from "./hosts.mjs";
 
 export const NOTIFY_TIMEOUT_MS = 5000;
 const MAX_CONTENT_CHARS = 1800;
-const HEADLINE_MAX_CHARS = 200;
+// 450 fits 2-3 lines on a phone notification (vs. the old 200, which routinely cut a verdict
+// sentence in half) while leaving comfortable headroom under MAX_CONTENT_CHARS alongside the
+// status line.
+export const HEADLINE_MAX_CHARS = 450;
 const HEAD_BYTES = 8 * 1024;
 
 export function notifyConfigPath() {
@@ -80,13 +83,19 @@ export function containsPath(line) {
   return PATH_PATTERNS.some((re) => re.test(line));
 }
 
+const VERDICT_LINE = /^\**verdict\s*:/i;
+
 // First non-empty line of `stdoutLines` that isn't a markdown heading ("#..."), a code-fence
 // marker ("```..."), a bare markdown label (isLabelLine), or a line containing a filesystem path
 // (containsPath). Headings, fences and labels are skipped because they read as noise/broken
 // formatting as a one-line phone notification; path lines because a local path says nothing
 // about the outcome and should not leave the host. Escaping (escapeDiscordText) handles safety.
+// A qualifying "Verdict:" line wins over an earlier qualifying line -- job reports conventionally
+// open with one, but some lead with a preamble paragraph first, and the verdict is the one
+// sentence Erick actually needs on his phone.
 export function extractHeadline(stdoutLines) {
   if (!Array.isArray(stdoutLines)) return null;
+  let fallback = null;
   for (const raw of stdoutLines) {
     const line = String(raw).trim();
     if (!line) continue;
@@ -94,9 +103,10 @@ export function extractHeadline(stdoutLines) {
     if (line.startsWith("```")) continue;
     if (isLabelLine(line)) continue;
     if (containsPath(line)) continue;
-    return line;
+    if (VERDICT_LINE.test(line)) return line;
+    if (fallback === null) fallback = line;
   }
-  return null;
+  return fallback;
 }
 
 // Reads at most the first `maxBytes` of `file` and returns it split into lines. Mirrors job-
@@ -141,6 +151,76 @@ export function chooseHeadlineLines(headLines, tailLines) {
   return extractHeadline(headLines) ? headLines : tailLines;
 }
 
+// Index of the last sentence-ending ".", "!", or "?" at or before `max - 1` that is followed by
+// whitespace or end-of-line, or -1 if none. "Mr." / "e.g." false positives are not worth guarding
+// against here: landing a cut one clause early is harmless, the thing this exists to prevent is
+// landing it mid-word.
+function lastSentenceEnd(line, max) {
+  const limit = Math.min(max, line.length);
+  let best = -1;
+  for (let i = 0; i < limit; i++) {
+    const c = line[i];
+    if (c === "." || c === "!" || c === "?") {
+      const next = line[i + 1];
+      if (next === undefined || /\s/.test(next)) best = i;
+    }
+  }
+  return best;
+}
+
+function lastWhitespace(text) {
+  for (let i = text.length - 1; i >= 0; i--) {
+    if (/\s/.test(text[i])) return i;
+  }
+  return -1;
+}
+
+// Truncates `line` to at most `max` characters without ever cutting inside a word: prefers the
+// last complete sentence within the budget, falls back to the last complete word, and marks the
+// cut with a trailing ellipsis. Returns `line` unchanged when it already fits.
+export function truncateHeadline(line, max = HEADLINE_MAX_CHARS) {
+  if (line.length <= max) return line;
+  const sentenceEnd = lastSentenceEnd(line, max);
+  if (sentenceEnd !== -1) return line.slice(0, sentenceEnd + 1) + "…";
+  const slice = line.slice(0, max);
+  const wsEnd = lastWhitespace(slice);
+  const cut = wsEnd === -1 ? slice : slice.slice(0, wsEnd);
+  return cut.trimEnd() + "…";
+}
+
+// Strips a dangling "[text](" (with or without a partial URL after it) that truncation left with
+// no closing ")", and a dangling "[text" left with no closing "]" at all. Either would otherwise
+// render as broken, literal link syntax instead of being silently dropped.
+function stripDanglingLink(text) {
+  let s = text.replace(/\[[^\]]*\]\([^)]*$/, "");
+  const openIdx = s.lastIndexOf("[");
+  if (openIdx !== -1 && s.indexOf("]", openIdx) === -1) s = s.slice(0, openIdx);
+  return s;
+}
+
+// Removes the last occurrence of `token` from `text` when it appears an odd number of times (one
+// unmatched opening marker), leaving any complete, balanced pairs alone.
+function stripUnbalancedToken(text, token) {
+  const count = text.split(token).length - 1;
+  if (count % 2 === 0) return text;
+  const idx = text.lastIndexOf(token);
+  return idx === -1 ? text : text.slice(0, idx) + text.slice(idx + token.length);
+}
+
+// Neutralizes any markdown span (fenced code, bold, italic, inline code, link) left open by
+// truncateHeadline() by removing its lone opening marker, rather than appending a matching closer
+// -- a closer tacked on right after a mid-sentence ellipsis would read even stranger than plain
+// text. Order matters: longer tokens ("```", "**", "__") are stripped before the shorter tokens
+// that are their building blocks, so a complete "**" pair is never mistaken for two unmatched "*"
+// markers.
+export function closeMarkdownSpans(text) {
+  let s = stripDanglingLink(text);
+  for (const token of ["```", "**", "__", "*", "_", "`"]) {
+    s = stripUnbalancedToken(s, token);
+  }
+  return s;
+}
+
 // Neutralizes Discord markdown/mention syntax by backslash-escaping @, `, <, > so job output can
 // never render as a live mention, break out into a code span, or form a custom-emoji/link token.
 // This is independent of (and in addition to) allowed_mentions:{parse:[]} on the request itself,
@@ -149,13 +229,15 @@ export function escapeDiscordText(text) {
   return String(text).replace(/[@`<>]/g, (c) => "\\" + c);
 }
 
-// Extracted, truncated (to HEADLINE_MAX_CHARS), then escaped -- in that order, so the length cap
-// applies to the raw job-output line, not to however many backslashes escaping happens to add.
+// Extracted, truncated (to HEADLINE_MAX_CHARS, on a sentence/word boundary), freed of any markdown
+// span the cut left open, then escaped -- in that order, so the length cap applies to the raw
+// job-output line, not to however many backslashes escaping happens to add.
 export function boundHeadline(stdoutLines) {
   const line = extractHeadline(stdoutLines);
   if (!line) return null;
-  const truncated = line.length > HEADLINE_MAX_CHARS ? line.slice(0, HEADLINE_MAX_CHARS) : line;
-  return escapeDiscordText(truncated);
+  const truncated = truncateHeadline(line);
+  const safe = closeMarkdownSpans(truncated);
+  return escapeDiscordText(safe);
 }
 
 export function formatDuration(ms) {

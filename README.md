@@ -152,10 +152,16 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
   bare markdown label (only list/number/emphasis markers around a short label, such as `1.`,
   `- **Report**`, `**Summary:**`, or a `---` rule), or a line containing a filesystem path (Windows
   drive paths like `C:\` or `D:/`, UNC `\\server`, absolute POSIX paths like `/home/` or `/c/Users/`).
-  It is truncated to 200 characters, with `@`, `` ` ``, `<`, `>` backslash-escaped so it can't render
-  as a mention or break message formatting. Falls back to the tail of stdout, under the same rules,
-  when `out.log` is missing/unreadable or has no qualifying line near the top; if the tail has no
-  qualifying line either, the headline is omitted. Set it `false` for a status-only ping.
+  A qualifying `Verdict:` line wins over an earlier qualifying line, since some reports lead with a
+  preamble paragraph before their verdict. It is truncated to 450 characters (long enough to read as
+  a real sentence on a phone, well short of the message's own 1800-char hard cap) — cutting after
+  the last complete sentence within budget, or failing that the last complete word, never mid-word,
+  with a trailing `…`. Any `**`/`*`/`_`/`` ` ``/`` ``` `` span or `[link](` left unterminated by the
+  cut is stripped (not closed) before `@`, `` ` ``, `<`, `>` are backslash-escaped, so the result
+  can't render as a mention, break message formatting, or leave a dangling code/bold/italic/link
+  span. Falls back to the tail of stdout, under the same rules, when `out.log` is missing/unreadable
+  or has no qualifying line near the top; if the tail has no qualifying line either, the headline is
+  omitted. Set it `false` for a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
   output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
   a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a title, exit code, and

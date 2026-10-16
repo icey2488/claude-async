@@ -16,7 +16,7 @@ import { cleanupTmp, TMP, hosts } from "./_setup.mjs";
 import {
   NOTIFY_TIMEOUT_MS, loadNotifyConfig, extractHeadline, escapeDiscordText, boundHeadline,
   formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
-  isLabelLine, containsPath,
+  isLabelLine, containsPath, truncateHeadline, closeMarkdownSpans, HEADLINE_MAX_CHARS,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -37,16 +37,86 @@ test("escapeDiscordText: backslash-escapes @, `, <, > and nothing else", () => {
   assert.equal(escapeDiscordText("no special chars here"), "no special chars here");
 });
 
-test("boundHeadline: truncates to 200 chars BEFORE escaping, then escapes", () => {
-  const long = "@".repeat(250); // an escape-heavy line, so truncate-then-escape vs escape-then-truncate diverge sharply
+test("boundHeadline: truncates to HEADLINE_MAX_CHARS BEFORE escaping, then escapes", () => {
+  const long = "@".repeat(HEADLINE_MAX_CHARS + 50); // an escape-heavy line with no word/sentence boundary at all
   const result = boundHeadline([long]);
-  // truncate(250 @'s, 200) -> 200 @'s, THEN escape -> 200 "\@" pairs -> 400 chars
-  assert.equal(result, "\\@".repeat(200));
-  assert.equal(result.length, 400);
+  // no whitespace anywhere -> truncateHeadline falls back to the raw slice, THEN escape doubles it, plus the ellipsis
+  assert.equal(result, "\\@".repeat(HEADLINE_MAX_CHARS) + "…");
+  assert.equal(result.length, HEADLINE_MAX_CHARS * 2 + 1);
 });
 
 test("boundHeadline: returns null when no usable line exists", () => {
   assert.equal(boundHeadline(["# heading only"]), null);
+});
+
+test("boundHeadline: empty stdout yields no headline", () => {
+  assert.equal(boundHeadline([]), null);
+  assert.equal(boundHeadline([""]), null);
+});
+
+test("boundHeadline: a short headline needing no truncation passes through unchanged (plus escaping)", () => {
+  assert.equal(boundHeadline(["Everything checks out."]), "Everything checks out.");
+});
+
+test("extractHeadline: a Verdict line wins over an earlier qualifying preamble line", () => {
+  const stdout = "A quick note before the result.\n**Verdict: PASS, all clear.**\nmore detail".split("\n");
+  assert.equal(extractHeadline(stdout), "**Verdict: PASS, all clear.**");
+});
+
+test("truncateHeadline: cuts at the last sentence boundary within budget, never mid-word", () => {
+  const line = "First sentence here. Second sentence that runs long enough to push the whole thing well past the limit we are testing against today for sure. " + "padding ".repeat(40);
+  const result = truncateHeadline(line, 150);
+  assert.ok(result.endsWith("…"));
+  assert.equal(result, "First sentence here. Second sentence that runs long enough to push the whole thing well past the limit we are testing against today for sure.…");
+});
+
+test("truncateHeadline: a long single sentence with no period falls back to the last word boundary", () => {
+  const line = "this is one long sentence with absolutely no period anywhere in it at all " + "word ".repeat(40);
+  const result = truncateHeadline(line, 80);
+  assert.ok(result.endsWith("…"));
+  const withoutEllipsis = result.slice(0, -1);
+  assert.ok(line.startsWith(withoutEllipsis));
+  assert.ok(!withoutEllipsis.endsWith(" "), "trailing whitespace before the ellipsis is trimmed");
+  assert.equal(line[withoutEllipsis.length], " ", "the cut must land exactly on a word boundary, not mid-word");
+});
+
+test("truncateHeadline: a line already within budget is returned unchanged", () => {
+  assert.equal(truncateHeadline("short line", 80), "short line");
+});
+
+test("closeMarkdownSpans: strips a dangling unmatched **, *, _, and ` left open by truncation", () => {
+  assert.equal(closeMarkdownSpans("**bold never closed"), "bold never closed");
+  assert.equal(closeMarkdownSpans("plain **closed** and fine"), "plain **closed** and fine");
+  assert.equal(closeMarkdownSpans("some *italic never closed"), "some italic never closed");
+  assert.equal(closeMarkdownSpans("some _italic never closed"), "some italic never closed");
+  assert.equal(closeMarkdownSpans("a (`drift-check`, then an unclosed `span"), "a (`drift-check`, then an unclosed span");
+});
+
+test("closeMarkdownSpans: strips an unterminated code fence's lone marker instead of letting it swallow the rest", () => {
+  assert.equal(closeMarkdownSpans("before ```js console.log(1)"), "before js console.log(1)");
+  assert.equal(closeMarkdownSpans("before ```js\ncode\n``` after, fine"), "before ```js\ncode\n``` after, fine");
+});
+
+test("closeMarkdownSpans: strips a dangling [link]( with no closing paren, and a bare unmatched [", () => {
+  assert.equal(closeMarkdownSpans("see [the report](https://example.com/very/long/pa"), "see ");
+  assert.equal(closeMarkdownSpans("see [the report for more"), "see ");
+  assert.equal(closeMarkdownSpans("see [closed](https://example.com) fine"), "see [closed](https://example.com) fine");
+});
+
+test("boundHeadline: real example 1 (Verdict cut mid-word, unclosed **) is now sentence-bounded and markdown-safe", () => {
+  const ex1 = "**Verdict: Cause class A/B hybrid — host-api was not running (no process, port free) because its logon-triggered start lost a boot-ordering race against Tailscale. Tailscale is up and the IP is unchanged, so the fix belongs in host-api's own startup ordering, not networking, and no further investigation of the network path is warranted at this time, pending a follow-up ticket for a startup dependency check.**";
+  const result = boundHeadline([ex1]);
+  assert.ok(result.length <= HEADLINE_MAX_CHARS + 1, "ellipsis adds at most one char over budget");
+  assert.equal((result.match(/\*\*/g) || []).length % 2, 0, "** markers must balance");
+  assert.ok(!result.includes("\\*"), "escaping never touches *, so any stray * would mean unbalanced markup");
+});
+
+test("boundHeadline: real example 2 (cut inside an inline-code span) is now sentence-bounded with backticks balanced", () => {
+  const ex2 = "Push is blocked — not by anything in my change, but by a repo-wide pre-push liveness gate (`drift-check`, wired via `core.hooksPath=githooks`). It fails closed if any of three sibling repos (`claunker-ops`, `claunker-web`, `claunker-infra`) look unreachable, even though none of them are touched by this branch at all, which needs fixing upstream before anyone can land anything here again without bypassing the gate every time.";
+  const result = boundHeadline([ex2]);
+  assert.ok(result.length <= HEADLINE_MAX_CHARS + 1, "ellipsis adds at most one char over budget");
+  const rawBackticks = (result.match(/\\`/g) || []).length; // escaping turns every surviving ` into \`
+  assert.equal(rawBackticks % 2, 0, "backtick spans must balance");
 });
 
 // Regression: a report opening "## Report" / "**1. Git -- `C:\...`**" used to put the bold,
@@ -286,8 +356,8 @@ test("success: correct payload shape, allowed_mentions parse [], JSON content-ty
   assert.match(body.content, /^\[OK\] host=\S+ job=notify-job-\d+ exit=0 duration=\d/);
 });
 
-test("headline rule: first non-heading/non-fence line, truncated to 200 chars, then escaped", async () => {
-  const longLine = "Result ready @everyone check the `output` file now " + "x".repeat(250);
+test("headline rule: first non-heading/non-fence line, truncated to HEADLINE_MAX_CHARS on a word boundary, then escaped", async () => {
+  const longLine = "Result ready @everyone check the output file now, no further action needed " + "x ".repeat(250);
   const stdoutText = ["# a heading, skipped", "```", "", longLine, "trailing line, never reached"].join("\n");
   const dir = prepareJob({ exitCode: 0, stdoutText });
   const { server, requests } = startServer(dir);
@@ -299,11 +369,11 @@ test("headline rule: first non-heading/non-fence line, truncated to 200 chars, t
   const lines = requests[0].body.content.split("\n");
   assert.equal(lines.length, 2, "status line + one headline line");
   const headline = lines[1];
-  const expectedTruncated = longLine.slice(0, 200);
-  assert.equal(headline, expectedTruncated.replace(/[@`<>]/g, (c) => "\\" + c));
+  const expectedTruncated = truncateHeadline(longLine);
+  assert.equal(headline, escapeDiscordText(expectedTruncated));
   assert.ok(!/(?<!\\)@everyone/.test(headline), "@everyone must never appear un-escaped");
   assert.ok(headline.includes("\\@everyone"), "escaped form must be present");
-  assert.ok(headline.includes("\\`"), "backtick must be escaped");
+  assert.ok(headline.endsWith("…"), "a truncated headline ends with an ellipsis");
 });
 
 test("includeHeadline=false: headline line is omitted even when stdout has one", async () => {
