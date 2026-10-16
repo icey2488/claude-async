@@ -38,6 +38,12 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   classifies as `died` (or `timed_out`) because `exit_code` was never written. `diedCause` will
   read `"exit"` in that case, not `"unknown"` — check `exit.exitCode` too when triaging a `died`
   job, don't assume `diedCause: "exit"` means the CLI actually failed.
+- **A `[INCOMPLETE]` Discord ping** (see README's "Completeness check") means the job exited 0 but
+  its stdout never carried the final-report `DELEGATION-METRICS:` line — it may have stopped to
+  ask a question, gotten blocked, or otherwise ended early without finishing its report. This is
+  informational only: it never changes `status`. The same signal is visible directly as
+  `reportComplete: false` in the job's `exit.json`, surfaced verbatim by `claude_check`'s `exit`
+  field.
 
 ## Discord notifications — limitation
 

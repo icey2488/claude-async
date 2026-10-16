@@ -12,7 +12,11 @@
  * Discord notification: after exit.json and exit_code are both written in finish(), best-effort
  * pings a Discord webhook (see discord-notify.mjs) if ~/.claude-async/notify.json configures one.
  * Silently does nothing otherwise. Bounded and try/caught so it can never affect exit_code, the
- * runner's own exit code, or write ordering.
+ * runner's own exit code, or write ordering. recordExit() also computes exit.json's
+ * reportComplete field (did stdout carry the DELEGATION-METRICS final-report marker?) -- this
+ * runs regardless of whether notify.json even configures a webhook, since claude_check surfaces
+ * it from exit.json directly, and it is what lets the Discord ping (when configured) label an
+ * exit-0 job that stopped early [INCOMPLETE] instead of [OK].
  *
  * Heartbeat: writes runner_heartbeat (ISO timestamp) to the job dir once at spawn, every
  * 60s while the child runs, and once in finish(). checkJob reads this to classify
@@ -48,7 +52,7 @@ import { closeCard } from "./card-hook.mjs";
 import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
-import { notifyJobFinished } from "./discord-notify.mjs";
+import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -128,9 +132,14 @@ const errFd = fs.openSync(err, "a");
 // meta.json. meta.json already has a writer (job-core), and a second, independent
 // read-modify-write from this process racing that one would silently drop whichever side lost
 // the rename -- one writer per file. Fields: exitCode/exitSignal/exitReason (+ spawnError on a
-// spawn failure), endedAt, and stderrTail/stdoutTail -- the last TAIL_LINES lines read straight
+// spawn failure), endedAt, stderrTail/stdoutTail -- the last TAIL_LINES lines read straight
 // off out.log/err.log on disk at exit time (not a ring buffer kept in memory), since stdout/
-// stderr go to those files' fds directly and the runner never sees the bytes itself.
+// stderr go to those files' fds directly and the runner never sees the bytes itself -- and
+// reportComplete: whether stdoutTail carries the DELEGATION-METRICS final-report marker (see
+// discord-notify.mjs's hasCompletenessMarker/loadCompletenessConfig). This is purely additive,
+// objective reporting (computed from the configured marker regardless of whether completeness
+// enforcement or even Discord notification is turned on) so claude_check's verbatim `exit` field
+// surfaces it for free, same as every other exit.json field.
 const TAIL_LINES = 20;
 // Upper bound on how much of a log file readTail() will read off disk. A job's out.log/err.log
 // can grow to many MB; reading the whole file just to keep the last 20 lines would be wasteful
@@ -177,16 +186,20 @@ let exitInfo = { exitCode: null, exitSignal: null, exitReason: "exit" };
 // Best-effort: a runner that cannot record must still finish normally.
 function recordExit() {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
+  const stdoutTail = readTail(out);
+  let completeness;
+  try { completeness = loadCompletenessConfig(); } catch { completeness = { markerRegex: undefined }; }
   const record = {
     exitCode: exitInfo.exitCode,
     exitSignal: exitInfo.exitSignal,
     exitReason: exitInfo.exitReason,
     endedAt: new Date().toISOString(),
     stderrTail: readTail(err),
-    stdoutTail: readTail(out),
+    stdoutTail,
     // No reliable CLI usage-limit message pattern exists in this repo (no fixture or test carries
     // one), so this is deliberately unknown rather than a guessed regex.
     usageLimitSuspected: null,
+    reportComplete: hasCompletenessMarker(stdoutTail, completeness.markerRegex),
   };
   if (exitInfo.spawnError !== undefined) record.spawnError = exitInfo.spawnError;
   try { writeJsonAtomic(exitPath, record); }
@@ -238,6 +251,7 @@ async function finish(code) {
       endedAt: new Date(exitRecord && exitRecord.endedAt ? exitRecord.endedAt : Date.now()),
       stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
       outLogPath: out,
+      reportComplete: exitRecord ? exitRecord.reportComplete : true,
       logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
     });
   } catch {}

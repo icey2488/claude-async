@@ -164,10 +164,34 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
   omitted. Set it `false` for a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
   output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
-  a status marker (`[OK]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a title, exit code, and
-  duration. It never includes the prompt, stderr, environment, tokens, or file paths.
+  a status marker (`[OK]` / `[INCOMPLETE]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a
+  title, exit code, and duration. It never includes the prompt, stderr, environment, tokens, or
+  file paths.
 - **Title**: the ping's title is `claude_start`'s dispatch `intent` when one was given for the job
   (the same text the dispatch card's title shows), otherwise the jobId.
+- **Completeness check — `[INCOMPLETE]` pings and `reportComplete`**: every Claunker job's final
+  report is required to end with the delegation contract's `DELEGATION-METRICS:` line (see
+  CLAUDE.md's delegation policy). An exit-0 job counts as complete only if its stdout has a line
+  matching `^DELEGATION-METRICS:`, anchored at the line's own start — the same text appearing
+  mid-line (e.g. after other content) does not count. This is controlled by two optional keys
+  under notify.json's `completeness` object (a sibling of `discord`):
+  ```json
+  { "completeness": { "enforce": false, "markerRegex": "^DELEGATION-METRICS:" } }
+  ```
+  - `completeness.enforce` (default `true`): set `false` to turn the check off entirely, for a
+    host that doesn't use the delegation contract.
+  - `completeness.markerRegex` (default `"^DELEGATION-METRICS:"`): a custom regex source string,
+    for a host whose final-report marker differs. An invalid regex string silently falls back to
+    the default.
+
+  When an exit-0 job is missing the marker and enforcement is on, the ping's marker is
+  `[INCOMPLETE]` instead of `[OK]`, with a reason line appended after the headline:
+  `no final report marker (DELEGATION-METRICS) found; job may have stopped early`. Non-zero exits, signals,
+  and spawn errors are never relabeled by this check — `[FAIL]`/`[SIGNAL]`/`[SPAWN-ERROR]` keep
+  their existing meaning regardless of the marker. The check runs and is recorded even when no
+  Discord webhook is configured at all: its result is written as an additive `reportComplete`
+  boolean in the job's `exit.json`, which `claude_check` already surfaces verbatim under its
+  `exit` key — same convention as the existing `diedCause` field, never changing `status`.
 
 **3. Lock the file down** — it holds a webhook URL, which is a credential (posting to it needs no
 auth beyond the URL itself):

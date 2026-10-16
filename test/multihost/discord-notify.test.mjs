@@ -17,6 +17,8 @@ import {
   NOTIFY_TIMEOUT_MS, loadNotifyConfig, extractHeadline, escapeDiscordText, boundHeadline,
   formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
   isLabelLine, containsPath, truncateHeadline, closeMarkdownSpans, HEADLINE_MAX_CHARS,
+  loadCompletenessConfig, hasCompletenessMarker, DEFAULT_COMPLETENESS_MARKER_SOURCE,
+  INCOMPLETE_REASON,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -236,6 +238,108 @@ test("loadNotifyConfig: absent file, unparseable JSON, and missing/blank webhook
 });
 
 // ---------------------------------------------------------------------------
+// Completeness rule: hasCompletenessMarker, loadCompletenessConfig, markerFor's new
+// reportComplete/enforce behavior, buildDiscordContent's incompleteReason line.
+// ---------------------------------------------------------------------------
+
+test("hasCompletenessMarker: a line starting with the marker counts, mid-line does not", () => {
+  assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: calls=1 accepted=1"]), true);
+  assert.equal(hasCompletenessMarker(["note: DELEGATION-METRICS: calls=1"]), false, "marker not at line start must not count");
+  assert.equal(hasCompletenessMarker([]), false);
+  assert.equal(hasCompletenessMarker(["some text", "other text"]), false);
+  assert.equal(hasCompletenessMarker(undefined), false, "non-array input yields false, never throws");
+});
+
+test("hasCompletenessMarker: a custom markerRegex is used instead of the default", () => {
+  assert.equal(hasCompletenessMarker(["CUSTOM-MARKER: hi"], /^CUSTOM-MARKER:/), true);
+  assert.equal(hasCompletenessMarker(["CUSTOM-MARKER: hi"], /^DELEGATION-METRICS:/), false);
+  assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: hi"], /^CUSTOM-MARKER:/), false);
+});
+
+test("loadCompletenessConfig: absent file, no completeness key, and unparseable JSON all default to enforce=true with the DELEGATION-METRICS marker", () => {
+  const p = hosts.notifyConfigPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  try { fs.unlinkSync(p); } catch {}
+  let r = loadCompletenessConfig();
+  assert.equal(r.enforce, true);
+  assert.equal(r.markerRegex.source, DEFAULT_COMPLETENESS_MARKER_SOURCE);
+
+  fs.writeFileSync(p, JSON.stringify({ discord: { webhookUrl: "http://x" } }));
+  r = loadCompletenessConfig();
+  assert.equal(r.enforce, true);
+  assert.equal(r.markerRegex.source, DEFAULT_COMPLETENESS_MARKER_SOURCE);
+
+  fs.writeFileSync(p, "not valid json");
+  r = loadCompletenessConfig();
+  assert.equal(r.enforce, true);
+  assert.equal(r.markerRegex.source, DEFAULT_COMPLETENESS_MARKER_SOURCE);
+  fs.unlinkSync(p);
+});
+
+test("loadCompletenessConfig: completeness.enforce false turns enforcement off", () => {
+  const p = hosts.notifyConfigPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({ completeness: { enforce: false } }));
+  assert.equal(loadCompletenessConfig().enforce, false);
+  fs.unlinkSync(p);
+});
+
+test("loadCompletenessConfig: a custom markerRegex string is compiled and used", () => {
+  const p = hosts.notifyConfigPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({ completeness: { markerRegex: "^CUSTOM:" } }));
+  const r = loadCompletenessConfig();
+  assert.equal(r.markerRegex.test("CUSTOM: hi"), true);
+  assert.equal(r.markerRegex.test("DELEGATION-METRICS: hi"), false);
+  fs.unlinkSync(p);
+});
+
+test("loadCompletenessConfig: an invalid markerRegex string falls back to the default, never throws", () => {
+  const p = hosts.notifyConfigPath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify({ completeness: { markerRegex: "[unclosed" } }));
+  const r = loadCompletenessConfig();
+  assert.equal(r.markerRegex.source, DEFAULT_COMPLETENESS_MARKER_SOURCE);
+  fs.unlinkSync(p);
+});
+
+test("markerFor: exit-0 completeness gating -- [INCOMPLETE] only when enforced and reportComplete is false", () => {
+  assert.equal(markerFor("exit", 0), "[OK]", "no 3rd arg at all preserves old behavior");
+  assert.equal(markerFor("exit", 0, { reportComplete: true }), "[OK]");
+  assert.equal(markerFor("exit", 0, { reportComplete: false }), "[INCOMPLETE]");
+  assert.equal(markerFor("exit", 0, { reportComplete: false, enforce: false }), "[OK]", "enforcement off always OK on exit 0");
+});
+
+test("markerFor: a non-zero exit, signal, or spawn-error is never relabeled by reportComplete/enforce", () => {
+  assert.equal(markerFor("exit", 1, { reportComplete: false }), "[FAIL]");
+  assert.equal(markerFor("exit", 1, { reportComplete: true, enforce: false }), "[FAIL]");
+  assert.equal(markerFor("signal", null, { reportComplete: false }), "[SIGNAL]");
+  assert.equal(markerFor("spawn-error", null, { reportComplete: false }), "[SPAWN-ERROR]");
+});
+
+test("buildDiscordContent: incompleteReason is appended as its own line after the headline", () => {
+  const content = buildDiscordContent({
+    marker: "[INCOMPLETE]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 1000,
+    headline: "did the thing", incompleteReason: INCOMPLETE_REASON,
+  });
+  const lines = content.split("\n");
+  assert.equal(lines.length, 3);
+  assert.equal(lines[1], "did the thing");
+  assert.equal(lines[2], INCOMPLETE_REASON);
+});
+
+test("buildDiscordContent: an absent/falsy incompleteReason adds no extra line", () => {
+  const withHeadline = buildDiscordContent({
+    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: "hi", incompleteReason: undefined,
+  });
+  assert.equal(withHeadline.split("\n").length, 2);
+  const noHeadline = buildDiscordContent({
+    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: null, incompleteReason: "",
+  });
+  assert.equal(noHeadline.split("\n").length, 1);
+});
+
+// ---------------------------------------------------------------------------
 // Integration tests: the real job-runner.mjs, a real (loopback) HTTP server, no fakes.
 // ---------------------------------------------------------------------------
 
@@ -245,6 +349,12 @@ const FAKE = path.join(here, "notify-fake-cli.mjs");
 let seq = 0;
 
 const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+
+// A real final report's last line (see CLAUDE.md's delegation contract). Appended to a fixture's
+// stdoutText wherever a test's point is unrelated to the completeness rule, so the exit-0 job
+// still reads as "complete" ([OK], no trailing reason line) under the new default enforcement --
+// see the dedicated "[INCOMPLETE]" tests further down for the marker-missing path itself.
+const METRICS_LINE = "DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none";
 
 function writeNotify(cfg) {
   const p = hosts.notifyConfigPath();
@@ -342,7 +452,7 @@ test("unparseable notify.json: no request, no throw, job still completes", async
 });
 
 test("success: correct payload shape, allowed_mentions parse [], JSON content-type", async () => {
-  const dir = prepareJob({ exitCode: 0, stdoutText: "plain first line\n" });
+  const dir = prepareJob({ exitCode: 0, stdoutText: `plain first line\n${METRICS_LINE}\n` });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
   writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
@@ -358,7 +468,7 @@ test("success: correct payload shape, allowed_mentions parse [], JSON content-ty
 
 test("headline rule: first non-heading/non-fence line, truncated to HEADLINE_MAX_CHARS on a word boundary, then escaped", async () => {
   const longLine = "Result ready @everyone check the output file now, no further action needed " + "x ".repeat(250);
-  const stdoutText = ["# a heading, skipped", "```", "", longLine, "trailing line, never reached"].join("\n");
+  const stdoutText = ["# a heading, skipped", "```", "", longLine, "trailing line, never reached", METRICS_LINE].join("\n");
   const dir = prepareJob({ exitCode: 0, stdoutText });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
@@ -377,7 +487,7 @@ test("headline rule: first non-heading/non-fence line, truncated to HEADLINE_MAX
 });
 
 test("includeHeadline=false: headline line is omitted even when stdout has one", async () => {
-  const dir = prepareJob({ exitCode: 0, stdoutText: "a perfectly good headline line\n" });
+  const dir = prepareJob({ exitCode: 0, stdoutText: `a perfectly good headline line\n${METRICS_LINE}\n` });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
   writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
@@ -543,4 +653,88 @@ test("webhook URL never appears anywhere in the job dir, including after a netwo
     assert.ok(!contents.includes(dead), `webhook URL leaked into ${f}`);
     assert.ok(!contents.includes("webhook-should-never-be-reached"), `webhook URL fragment leaked into ${f}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// [INCOMPLETE] end-to-end: the real job-runner.mjs writing exit.json's reportComplete field and
+// (when a webhook is configured) labeling the ping, via the real completeness config read from
+// notify.json's "completeness" key.
+// ---------------------------------------------------------------------------
+
+function readExitJson(dir) {
+  return JSON.parse(fs.readFileSync(path.join(dir, "exit.json"), "utf8"));
+}
+
+test("exit 0 with the DELEGATION-METRICS marker: reportComplete=true in exit.json, ping stays [OK]", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: `Everything checks out.\n${METRICS_LINE}\n` });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(readExitJson(dir).reportComplete, true);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].body.content, /^\[OK\] /);
+});
+
+test("exit 0 without the marker (default config, enforced): reportComplete=false in exit.json, ping is [INCOMPLETE] with a reason line", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: "Everything checks out, allegedly.\n" });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(readExitJson(dir).reportComplete, false);
+  assert.equal(requests.length, 1);
+  const lines = requests[0].body.content.split("\n");
+  assert.match(lines[0], /^\[INCOMPLETE\] /);
+  assert.equal(lines[1], "Everything checks out, allegedly.", "headline is kept");
+  assert.equal(lines[2], INCOMPLETE_REASON);
+});
+
+test("non-zero exit without the marker: failure label is unchanged ([FAIL], not [INCOMPLETE]), reportComplete still recorded false", async () => {
+  const dir = prepareJob({ exitCode: 1, stdoutText: "GATE FAILED\n" });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(readExitJson(dir).reportComplete, false);
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].body.content, /^\[FAIL\] /);
+});
+
+test("completeness.enforce=false in notify.json: exit 0 without the marker still pings [OK]; reportComplete is still recorded false", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: "No metrics line here.\n" });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false }, completeness: { enforce: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(readExitJson(dir).reportComplete, false, "the field reports the objective fact regardless of enforcement");
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].body.content, /^\[OK\] /);
+});
+
+test("reportComplete is computed and written to exit.json even with no notify.json at all (no webhook configured)", async () => {
+  clearNotify();
+  const dir = prepareJob({ exitCode: 0, stdoutText: `Everything checks out.\n${METRICS_LINE}\n` });
+  const { res } = await spawnRunner(dir);
+  assert.equal(res.status, 0);
+  assert.equal(readExitJson(dir).reportComplete, true);
+
+  const dir2 = prepareJob({ exitCode: 0, stdoutText: "no marker here\n" });
+  await spawnRunner(dir2);
+  assert.equal(readExitJson(dir2).reportComplete, false);
+});
+
+test("marker present but not at its own line start: does not count as complete", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: `note: ${METRICS_LINE}\n` });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(readExitJson(dir).reportComplete, false);
+  assert.match(requests[0].body.content, /^\[INCOMPLETE\] /);
 });

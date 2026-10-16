@@ -9,12 +9,18 @@
  *
  * Config: ~/.claude-async/notify.json (same CLAUDE_ASYNC_CONFIG_DIR-aware directory hosts.mjs
  * uses for hosts.json/api.json — see notifyConfigPath() there):
- *   { "discord": { "webhookUrl": "https://discord.com/api/webhooks/...", "includeHeadline": true } }
+ *   { "discord": { "webhookUrl": "https://discord.com/api/webhooks/...", "includeHeadline": true },
+ *     "completeness": { "enforce": true, "markerRegex": "^DELEGATION-METRICS:" } }
  * A missing file, a missing/blank discord.webhookUrl, or unparseable JSON all mean "feature off":
  * no error, no throw. There is no debug-level logger anywhere in this codebase to log a debug
  * line to, so "off" is a plain, silent no-op. Read at finish time (loadNotifyConfig() is called
  * fresh on every job), never cached at startup, so Erick can add/edit/remove notify.json without
  * restarting anything.
+ *
+ * `completeness` (see loadCompletenessConfig()/markerFor()) is independent of `discord`: it
+ * governs whether an exit-0 job missing its final DELEGATION-METRICS report line is labeled
+ * [INCOMPLETE] instead of [OK], and is read (and the job's reportComplete field computed) by
+ * job-runner.mjs regardless of whether a webhook is even configured.
  *
  * The webhook URL is a credential (a Discord webhook URL embeds its own auth token in the path)
  * and is treated like one: it is never written to the runner's log, to exit.json/meta.json, or
@@ -48,6 +54,36 @@ export function loadNotifyConfig() {
     ? cfg.discord.webhookUrl.trim() : "";
   if (!webhookUrl) return null; // missing/blank key -> off
   return { webhookUrl, includeHeadline: cfg.discord.includeHeadline !== false };
+}
+
+// The contract line every Claunker job's final report is now required to emit last (see
+// CLAUDE.md's delegation policy). Anchored with "^" and tested per-line (never with a global
+// flag's stateful lastIndex -- see hasCompletenessMarker), so a marker embedded mid-line (e.g.
+// "note: DELEGATION-METRICS: ...") does not count as present.
+export const DEFAULT_COMPLETENESS_MARKER_SOURCE = "^DELEGATION-METRICS:";
+
+// Returns { enforce, markerRegex } from notify.json's optional "completeness" key. Never throws.
+// Default (no file, no key, or a malformed markerRegex string): enforce=true with the
+// DELEGATION-METRICS marker -- a host that does not use the delegation contract can set
+// completeness.enforce:false to turn this off entirely.
+export function loadCompletenessConfig() {
+  let cfg = null;
+  try { cfg = JSON.parse(fs.readFileSync(notifyConfigPath(), "utf8")); } catch { cfg = null; }
+  const c = (cfg && cfg.completeness) || {};
+  const enforce = c.enforce !== false;
+  let markerRegex;
+  try { markerRegex = new RegExp(typeof c.markerRegex === "string" ? c.markerRegex : DEFAULT_COMPLETENESS_MARKER_SOURCE); }
+  catch { markerRegex = new RegExp(DEFAULT_COMPLETENESS_MARKER_SOURCE); }
+  return { enforce, markerRegex };
+}
+
+// True when any line in `lines` matches markerRegex. lastIndex is reset before every test so a
+// caller-supplied global-flag regex can never skip a line due to leftover state from the
+// previous one.
+export function hasCompletenessMarker(lines, markerRegex) {
+  if (!Array.isArray(lines)) return false;
+  const re = markerRegex || new RegExp(DEFAULT_COMPLETENESS_MARKER_SOURCE);
+  return lines.some((l) => { re.lastIndex = 0; return re.test(String(l)); });
 }
 
 const LABEL_MAX_CHARS = 80;
@@ -253,21 +289,32 @@ export function formatDuration(ms) {
 
 // Emoji-free status marker; doubles as the message's status word (no separate emoji is used
 // anywhere in this module, deliberately, so the message renders identically on any client/font).
-export function markerFor(exitReason, exitCode) {
+// `completeness` ({ reportComplete, enforce }, both defaulting true) only ever matters for an
+// exit-0 "exit" job: an exit 0 job whose stdout never carried the DELEGATION-METRICS final-report
+// marker, with enforcement on, is labeled [INCOMPLETE] instead of [OK] -- it exited cleanly but
+// may have stopped early (asked a question, backgrounded a call it needed, etc.) without ever
+// writing its report. Non-zero exits, signals, and spawn errors are unchanged by this.
+export function markerFor(exitReason, exitCode, { reportComplete = true, enforce = true } = {}) {
   if (exitReason === "spawn-error") return "[SPAWN-ERROR]";
   if (exitReason === "signal") return "[SIGNAL]";
-  return exitCode === 0 ? "[OK]" : "[FAIL]";
+  if (exitCode !== 0) return "[FAIL]";
+  if (enforce && !reportComplete) return "[INCOMPLETE]";
+  return "[OK]";
 }
+
+// Shown on the ping when markerFor returns [INCOMPLETE], appended after the headline.
+export const INCOMPLETE_REASON = "no final report marker (DELEGATION-METRICS) found; job may have stopped early";
 
 // Pure builder (no I/O) so tests can check shape/escaping/truncation without a network call.
 // `jobId` here is really "whatever the caller wants shown as the title" -- see notifyJobFinished's
 // header for why the caller (not this function) resolves that to meta.intent-or-jobId.
-export function buildDiscordContent({ marker, host, jobId, exitCode, durationMs, headline }) {
+export function buildDiscordContent({ marker, host, jobId, exitCode, durationMs, headline, incompleteReason }) {
   const lines = [
     `${marker} host=${host} job=${jobId} exit=${exitCode === null || exitCode === undefined ? "null" : exitCode} ` +
     `duration=${formatDuration(durationMs)}`,
   ];
   if (headline) lines.push(headline);
+  if (incompleteReason) lines.push(incompleteReason);
   const content = lines.join("\n");
   return content.length > MAX_CONTENT_CHARS ? content.slice(0, MAX_CONTENT_CHARS) : content;
 }
@@ -302,19 +349,28 @@ function sanitizeForLog(msg, webhookUrl) {
  * bounded via readHead()/outLogPath. Falls back to the stdoutTail rule (the `stdoutLines` param,
  * exit.json's own stdoutTail) when outLogPath is absent/unreadable or has no qualifying line in
  * its head window -- see chooseHeadlineLines().
+ *
+ * reportComplete: whether the job's stdout carried the DELEGATION-METRICS final-report marker
+ * (job-runner.mjs computes this once, via hasCompletenessMarker(), and both writes it to
+ * exit.json and passes it in here, so the completeness check and the field claude_check surfaces
+ * always agree). Only changes the marker on an exit-0 "exit" job, and only when
+ * completeness.enforce (notify.json, default true) is also on -- see markerFor().
  */
-export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, logLine, fetchImpl = fetch }) {
+export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, reportComplete, logLine, fetchImpl = fetch }) {
   let config;
   try { config = loadNotifyConfig(); } catch { return; }
   if (!config) return;
 
-  const marker = markerFor(exitReason, exitCode);
+  let completeness;
+  try { completeness = loadCompletenessConfig(); } catch { completeness = { enforce: true }; }
+  const marker = markerFor(exitReason, exitCode, { reportComplete, enforce: completeness.enforce });
   const includeHeadline = includeHeadlineOverride !== undefined ? includeHeadlineOverride : config.includeHeadline;
   const durationMs = startedAt && endedAt ? (endedAt.getTime() - new Date(startedAt).getTime()) : NaN;
   const headLines = includeHeadline && outLogPath ? readHead(outLogPath) : [];
   const headline = includeHeadline ? boundHeadline(chooseHeadlineLines(headLines, stdoutLines)) : null;
   const title = intent ? escapeDiscordText(intent) : jobId;
-  const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, headline });
+  const incompleteReason = marker === "[INCOMPLETE]" ? INCOMPLETE_REASON : null;
+  const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, headline, incompleteReason });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);
