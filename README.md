@@ -122,6 +122,11 @@ Optional environment variables:
 | `CLAUDE_ASYNC_ALLOW_ANY_URL` | unset | `1` skips the Tailscale-range check on `hosts.json` urls (never the http/https check). For tests and local development only; a config-sanity check, NOT a security control (the receiver's bind address and token are what protect it) |
 | `CLAUDE_ASYNC_MAX_CONCURRENT` | `4` | Max running jobs on this host (`hosts.json` `caps.maxConcurrent` wins) |
 | `CLAUDE_ASYNC_MAX_STARTS_PER_MINUTE` | `6` | Max starts per rolling 60s on this host (`hosts.json` `caps.maxStartsPerMinute` wins) |
+| `CLAUDE_ASYNC_PING_MS` | `30000` | Ping watchdog interval (see "How it works" and `RUNBOOK.md`) |
+| `CLAUDE_ASYNC_PING_TIMEOUT_MS` | `10000` | Per-ping timeout before counting a miss |
+| `CLAUDE_ASYNC_PING_MAX_MISSES` | `3` | Consecutive misses before the watchdog exits, if the parent also looks gone |
+| `CLAUDE_ASYNC_PING_HARD_CAP_MISSES` | `6` | Consecutive misses before the watchdog exits unconditionally |
+| `CLAUDE_ASYNC_PING_RESUME_FACTOR` | `2` | A tick-to-tick gap bigger than this many ping intervals is treated as a sleep/resume, forgiving that tick's miss |
 
 ## Discord notifications
 
@@ -389,6 +394,14 @@ kept as an automatic fallback if the task can't be registered or triggered. See
 `RUNBOOK.md`'s "Task Scheduler launcher" section for the full design and its verification, and
 `test/survival.mjs` for the tests (three independent kill mechanisms plus a launcher claim-race
 test).
+
+**Bridge exit visibility.** Every way the bridge process can end — the ping watchdog giving up,
+the peer closing stdin, a stdout write error, the MCP SDK's own transport close, a signal, or a
+crash — logs one reason-tagged line to `bridge-crash.log` (next to `JOB_ROOT`) and to stderr
+before exiting, so a dead-or-respawned bridge is attributable after the fact. The watchdog itself
+tolerates a brief parent stall (e.g. Desktop waking from sleep) rather than exiting on the very
+first missed pong — see `RUNBOOK.md`'s "Bridge exit logging and ping tolerance" section for the
+exit-reason tags, the miss-tolerance rule, and the env vars above that tune it.
 
 ## Gotchas
 

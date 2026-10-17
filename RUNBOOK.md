@@ -22,6 +22,54 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
   that a job timed out. A healthy bridge returns a `jobId` immediately, and you poll with
   `claude_check`.
 
+## Bridge exit logging and ping tolerance (`fix/bridge-exit-logging`, 2026-10-16)
+
+Every exit path in `claude-async-server.mjs` — the ping watchdog giving up, stdin end/close/error,
+a stdout EPIPE, the SDK's `transport.onclose`, SIGTERM/SIGINT, and an uncaughtException/
+unhandledRejection — now logs one line to `bridge-crash.log` (next to `JOB_ROOT`) and to stderr
+before exiting, in the format:
+
+```
+[2026-10-16T21:58:58.123Z] exit: code=0 reason=ping-timeout pid=85124 ppid=12345 uptime=3421.0s misses=3 parentAlive=false
+```
+
+Before this, most of these paths called `process.exit(0)` directly with no log line at all, so
+`bridge-crash.log`'s entire history was bare `exit: code=0` lines with no way to tell a clean
+peer-initiated close from the watchdog giving up. To diagnose a bridge restart, open
+`bridge-crash.log`, find the last `exit:` line before the new bridge's first logged line, and read
+its `reason=` tag:
+
+| `reason=` tag | Exit code | Fired by |
+|---|---|---|
+| `ping-timeout` | 0 | Ping watchdog gave up (see below) |
+| `stdin-end` | 0 | Peer sent EOF on stdin (graceful release) |
+| `stdin-close` | 0 | stdin stream closed |
+| `stdin-error` | 0 | Hard pipe fault on stdin (detail carries the error code) |
+| `transport-onclose` | 0 | MCP SDK's in-band transport close |
+| `stdout-epipe` | 0 | Write to a closed read end (EPIPE/ERR_STREAM_DESTROYED) |
+| `stdout-error` | 1 | Any other stdout write error |
+| `sigterm` / `sigint` | 0 | Console Ctrl+C/Ctrl+Break (not a forceful Windows kill — see the file's header comment) |
+| `uncaught` / `unhandled-rejection` | 1 | Crash (detail carries the stack) |
+
+The ping watchdog sends an MCP ping every `CLAUDE_ASYNC_PING_MS` (default 30000ms) and used to
+exit on the very first missed pong (`CLAUDE_ASYNC_PING_TIMEOUT_MS`, default 10000ms) — too
+aggressive: a Windows sleep/resume cycle stalls Claude Desktop's own process for several seconds
+right after wake (observed 18.4s on 2026-10-16), missing one pong even though Desktop was
+completely healthy, and killed the bridge anyway. Misses now accumulate instead of triggering an
+immediate exit. The bridge exits once `CLAUDE_ASYNC_PING_MAX_MISSES` (default 3) consecutive
+misses have landed *and* the parent process is no longer alive (checked with
+`process.kill(ppid, 0)`, which on Windows only probes whether the process exists — it does not
+terminate it), or once `CLAUDE_ASYNC_PING_HARD_CAP_MISSES` (default 6) misses have piled up
+regardless of parent liveness (covers a wedged-but-technically-running parent, or pid reuse making
+"alive" a false positive). A wall-clock jump between ticks bigger than
+`CLAUDE_ASYNC_PING_RESUME_FACTOR` (default 2) times the ping interval is logged as `ping-resume`
+and treated as evidence the machine itself slept — that tick's miss, if any, is forgiven rather
+than counted toward either threshold, giving the peer one full interval to recover before misses
+resume counting against it. `stdin-end`/`stdin-close` are unaffected by any of this tolerance:
+those are true in-band peer-gone signals, not a probabilistic probe, so they still exit on first
+sight. See `ping-watchdog.mjs` for the exact decision function and `test/multihost/ping-watchdog.
+test.mjs` / `test/multihost/bridge-exit.test.mjs` for its coverage.
+
 ## Gotchas
 
 - **Use Bash for `npm`/`git`, not the PowerShell `npm` wrapper** — the wrapper misbehaves.
