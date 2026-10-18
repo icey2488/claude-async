@@ -86,11 +86,7 @@ If you'd rather not use the prompt above, or you're not on Windows:
 | `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
-`status` is one of `running | completed | failed | died | timed_out`. `completed` is
-reported only when the job exited with code 0 AND wasn't killed by the CLI's own background-task
-wait ceiling (see `exitReason: "bg_tasks_terminated"` below); a non-zero exit, or that kill, is
-`failed`. `died` means the process exited without recording a result (crash, SIGKILL, pid recycled
-to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
+`status` is one of `running | completed | incomplete | failed | died | timed_out`. `completed` is reported only when the job exited with code 0 AND wasn't killed by the CLI's own background-task wait ceiling (see `exitReason: "bg_tasks_terminated"` below); a non-zero exit, or that kill, is `failed`. An exit-0 job whose exit.json has `reportComplete:false` (no DELEGATION-METRICS marker in stdout) reports status `incomplete` instead of `completed`; `failed` always takes precedence over `incomplete`. `died` means the process exited without recording a result (crash, SIGKILL, pid recycled to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
 
 `claude_check` also includes an `exit` field when the runner's `exit.json` record (see
 `job-runner.mjs`) exists in the job's dir: the parsed `{ exitCode, exitSignal, exitReason,

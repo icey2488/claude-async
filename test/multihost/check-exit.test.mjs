@@ -117,16 +117,66 @@ test("listJobs also reports bg_tasks_terminated as failed, not completed", () =>
   assert.equal(row.exitCode, 0);
 });
 
-// reportComplete (exit.json) measures only whether stdout ever carried the completeness marker --
-// it says nothing about status by itself. checkJob lifts it to a top-level reportIncomplete flag +
-// warning (previously visible only nested under `exit.reportComplete`) without changing what the
-// field itself means or what it's computed from.
-test("reportComplete:false surfaces as a top-level reportIncomplete flag and warning, without changing status", () => {
+// reportComplete (exit.json) measures only whether stdout ever carried the completeness marker.
+// checkJob lifts it to a top-level reportIncomplete flag + warning (previously visible only
+// nested under `exit.reportComplete`), AND downgrades an otherwise-"completed" status to
+// "incomplete" -- 2026-10-18 claunker.bg-wait-agent-test-20261018-se7vmzea: exit 0, no
+// DELEGATION-METRICS marker, no bg_tasks_terminated line, must not read as a finished success.
+test("reportComplete:false downgrades status to incomplete and surfaces a top-level reportIncomplete flag + warning", () => {
   makeJob("no-report", { exitCode: 0, exitJson: { ...RECORD_OK, reportComplete: false } });
   const r = core.checkJob("no-report");
-  assert.equal(r.status, "completed", "reportIncomplete is additive, not a status override");
+  assert.equal(r.status, "incomplete");
   assert.equal(r.reportIncomplete, true);
   assert.match(r.warning, /final report/);
+});
+
+// Failed always takes precedence over incomplete: a non-zero exit with reportComplete:false is
+// still "failed", never "incomplete".
+test("reportComplete:false on a failed (non-zero exit) job stays failed, not incomplete", () => {
+  makeJob("failed-no-report", { exitCode: 1, exitJson: { ...RECORD_FAILED, reportComplete: false } });
+  const r = core.checkJob("failed-no-report");
+  assert.equal(r.status, "failed");
+  assert.equal(r.reportIncomplete, true);
+});
+
+// Failed always takes precedence over incomplete: bg_tasks_terminated is failed, not incomplete,
+// even though it also carries reportComplete:false (see the "bg-killed" fixture above).
+test("bg_tasks_terminated with reportComplete:false stays failed, not incomplete", () => {
+  makeJob("bg-killed-no-report", { exitCode: 0, exitJson: { exitCode: 0, exitSignal: null,
+    exitReason: "bg_tasks_terminated", endedAt: new Date().toISOString(),
+    stderrTail: ["Background tasks still running after 600s; terminating."], stdoutTail: [],
+    usageLimitSuspected: null, reportComplete: false } });
+  const r = core.checkJob("bg-killed-no-report");
+  assert.equal(r.status, "failed");
+  assert.equal(r.reportIncomplete, true);
+});
+
+// Running jobs are never "incomplete": exit.json/reportComplete only exist once the job has
+// finished, so a still-running job can't be reclassified by this logic at all.
+test("a running job (no exit.json yet) is never incomplete", () => {
+  makeJob("still-running", { meta: { pid: process.pid } });
+  const r = core.checkJob("still-running");
+  assert.equal(r.status, "running");
+});
+
+// The exact shape of claunker.bg-wait-agent-test-20261018-se7vmzea: exit 0, exitReason "exit"
+// (not bg_tasks_terminated -- the CLI itself exited cleanly after ending its turn early), no
+// DELEGATION-METRICS marker in stdout. Must read as "incomplete", not "completed".
+test("se7vmzea shape: exit 0, exitReason exit, reportComplete false -> incomplete", () => {
+  makeJob("se7vmzea", { exitCode: 0, exitJson: { exitCode: 0, exitSignal: null, exitReason: "exit",
+    endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [], usageLimitSuspected: null,
+    reportComplete: false } });
+  const r = core.checkJob("se7vmzea");
+  assert.equal(r.status, "incomplete");
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.reportIncomplete, true);
+});
+
+test("listJobs also reports the incomplete status for the se7vmzea shape", () => {
+  makeJob("se7vmzea-listed", { exitCode: 0, exitJson: { exitCode: 0, exitSignal: null, exitReason: "exit",
+    endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [], reportComplete: false } });
+  const row = core.listJobs().find((r) => r.jobId === "se7vmzea-listed");
+  assert.equal(row.status, "incomplete");
 });
 
 test("reportComplete:true (or absent) adds neither reportIncomplete nor warning", () => {

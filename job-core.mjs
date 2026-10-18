@@ -761,8 +761,8 @@ export function checkJob(id, tailBytes = 8000) {
   const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
   let state, exitCode = null, finishedAt = null;
   const extra = {};
-  // Read once, up front: both the "completed vs failed" classification below and diedCause
-  // (further down) key off it.
+  // Read once, up front: both the "completed/incomplete vs failed" classification below and
+  // diedCause (further down) key off it.
   const exitRecord = readExitJson(p);
 
   if (fs.existsSync(p.exit)) {
@@ -772,7 +772,16 @@ export function checkJob(id, tailBytes = 8000) {
     // its own background-task wait ceiling must never read as "completed" -- job-runner.mjs's
     // recordExit() tags this case exitReason "bg_tasks_terminated" (see its BG_TASKS_TERMINATED_RE)
     // regardless of exitCode; that overrides "completed" here the same way a nonzero exitCode always has.
-    state = (exitCode === 0 && exitRecord?.exitReason !== "bg_tasks_terminated") ? "completed" : "failed";
+    // Failed always takes precedence over incomplete.
+    if (exitCode === 0 && exitRecord?.exitReason !== "bg_tasks_terminated") {
+      // 2026-10-18 claunker.bg-wait-agent-test-20261018-se7vmzea: an exit-0 run that never wrote
+      // its final-report marker (reportComplete:false) must not read as "completed" either -- it
+      // may have handed off to a background agent/task and ended its turn with the work still
+      // unfinished, and the CLI's own wait ceiling can exit it without ever coming back to report.
+      state = exitRecord?.reportComplete === false ? "incomplete" : "completed";
+    } else {
+      state = "failed";
+    }
   } else {
     const lastAlive = readLastAlive(p.heartbeat);
     if (lastAlive === null) {
@@ -835,10 +844,11 @@ export function checkJob(id, tailBytes = 8000) {
   // stdout ever carried the configured completeness marker (default: a line matching
   // ^DELEGATION-METRICS:, see discord-notify.mjs's loadCompletenessConfig/hasCompletenessMarker)
   // before the process exited -- NOT whether the job "succeeded". false means the run ended
-  // (any status) without ever writing that final-report line, e.g. because it handed off to a
-  // background task and ended its turn, asked a question, or was cut off mid-report. Surfaced
-  // here as its own top-level field + a human-readable warning (previously only visible nested
-  // under `exit.reportComplete`) rather than changing what the field itself means.
+  // (any status, as long as it wasn't already failed -- see the "incomplete" branch above)
+  // without ever writing that final-report line, e.g. because it handed off to a background task
+  // and ended its turn, asked a question, or was cut off mid-report. Surfaced here as its own
+  // top-level field + a human-readable warning (previously only visible nested under
+  // `exit.reportComplete`) in addition to (not instead of) downgrading status to "incomplete".
   if (exitRecord && exitRecord.reportComplete === false) {
     extra.reportIncomplete = true;
     extra.warning = "job exited without ever writing a final report (no completeness marker " +

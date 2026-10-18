@@ -184,7 +184,9 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
   server.registerTool("claude_check", {
     description: "Check a background job's status and recent output. Routed by the jobId's host prefix " +
                  "(<host>.…); un-prefixed (older) ids are local. Returns hostname, status " +
-                 "(running | completed | failed | died | timed_out), exit code, and a tail of stdout/stderr. " +
+                 "(running | completed | incomplete | failed | died | timed_out), exit code, and a tail of " +
+                 "stdout/stderr. \"incomplete\" means the job exited 0 but never wrote its final-report " +
+                 "marker (see reportIncomplete below) -- failed always takes precedence over incomplete. " +
                  "running may include elapsed and lastAlive fields; stalled:true means heartbeat is stale " +
                  "but pid is still alive. died means the process exited without recording a result. " +
                  "timed_out means no heartbeat for longer than CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h). " +
@@ -208,8 +210,9 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                  "exitCode is 0 -- see CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in RUNBOOK.md. `reportIncomplete`: " +
                  "true (plus a `warning` string) means the job ended without ever writing a final report (no " +
                  "DELEGATION-METRICS marker in stdout) -- it may have stopped early, e.g. by handing a task " +
-                 "off to a background subagent and ending its turn. This does not by itself mean the job " +
-                 "failed; check status/exit for that.",
+                 "off to a background subagent and ending its turn; an otherwise-clean exit (0, not " +
+                 "bg_tasks_terminated) with reportIncomplete:true reports status \"incomplete\" rather than " +
+                 "\"completed\", so it never reads as a finished success.",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
