@@ -89,6 +89,14 @@ const DEFAULT_CWD = process.env.CLAUDE_ASYNC_DEFAULT_CWD || os.homedir();
 // is definitely running. JOB_TIMEOUT_MS: beyond this, the job is timed_out regardless of pid.
 const HEARTBEAT_FRESH_MS = 3 * 60 * 1000; // 3 minutes
 export const JOB_TIMEOUT_MS = Number(process.env.CLAUDE_ASYNC_JOB_TIMEOUT_MS) || 4 * 60 * 60 * 1000; // 4h
+// Default for the CLI's own background-task wait ceiling (CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS,
+// set below). Finite, not 0: 0 tells the CLI to wait for background work INDEFINITELY, and the
+// runner's own heartbeat keeps ticking while the CLI waits, so CLAUDE_ASYNC_JOB_TIMEOUT_MS (above)
+// never fires to catch a hung background agent -- nothing in the bridge would stop it. 2h is
+// comfortably above the CLI's old 600s default (so legitimate background work still finishes)
+// while still well under JOB_TIMEOUT_MS's 4h, leaving headroom for the heartbeat ceiling to act
+// as the real outer backstop.
+export const BG_WAIT_CEILING_MS = Number(process.env.CLAUDE_ASYNC_BG_WAIT_CEILING_MS) || 2 * 60 * 60 * 1000; // 2h
 const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(REPO_DIR, "job-runner.mjs");
 // win32-only: shells out through CreateProcessW(CREATE_BREAKAWAY_FROM_JOB) so job-runner.mjs
@@ -709,16 +717,16 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
   // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: default the CLI's own background-task
-  // wait ceiling to "wait forever" so a job's background work (subagents handed off and the
-  // turn ended) finishes instead of being killed mid-flight at the CLI's internal 600s default --
-  // which silently looked like success (exit 0, nothing in exitCode/status pointing at a kill).
-  // CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h, JOB_TIMEOUT_MS above) remains the real ceiling.
+  // wait ceiling to a finite BG_WAIT_CEILING_MS (see its definition above for why not 0) so a
+  // job's background work (subagents handed off and the turn ended) finishes instead of being
+  // killed mid-flight at the CLI's internal 600s default -- which silently looked like success
+  // (exit 0, nothing in exitCode/status pointing at a kill).
   // Only set it when the bridge's own ambient env hasn't already: collectEnvOverrides() (below)
   // forwards any CLAUDE_*/ANTHROPIC_* var already in process.env into the launch ticket, and
   // extraEnv here takes precedence over that forwarding, so setting it unconditionally would
   // stomp an operator's deliberate override.
   if (process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === undefined) {
-    extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
+    extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = String(BG_WAIT_CEILING_MS);
   }
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);

@@ -93,18 +93,29 @@ test("meta.json: an over-long intent is bounded the same way boundIntent bounds 
 });
 
 // ---------------------------------------------------------------------------------------------
-// claunker.gemini-mcp-v2-20261018-pfvzx44f: default CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 for
-// every launched job's env, so the CLI waits for background work to finish instead of killing it
-// at its own internal 600s default -- but never stomp a value the ambient env already set.
+// claunker.gemini-mcp-v2-20261018-pfvzx44f: default CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS to a
+// finite ceiling (BG_WAIT_CEILING_MS, 2h) for every launched job's env, so the CLI waits long
+// enough for background work to finish instead of killing it at its own internal 600s default --
+// but never stomp a value the ambient env already set.
 // ---------------------------------------------------------------------------------------------
 
-test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 is set in the launch ticket's env by default", async () => {
-  const r = await startWith("bg-ceiling-default", undefined);
-  assert.equal(r.error, undefined);
-  assert.equal(readTicket("bg-ceiling-default").envOverrides.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, "0");
+test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=7200000 is set in the launch ticket's env by default", async () => {
+  // Guard against the ambient env already carrying this var (e.g. this very test process was
+  // itself launched as a Claude Code job, which sets it) -- that would exercise the
+  // ambient-preserved path below, not the default.
+  const prior = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+  delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+  try {
+    const r = await startWith("bg-ceiling-default", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("bg-ceiling-default").envOverrides.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, "7200000");
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+    else process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = prior;
+  }
 });
 
-test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: an existing ambient value is preserved, not overridden to 0", async () => {
+test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: an existing ambient value is preserved, not overridden", async () => {
   const prior = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
   process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "120000";
   try {

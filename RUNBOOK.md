@@ -84,12 +84,18 @@ Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG
 The runner still recorded exit code 0, and the job silently showed status `"completed"` — nothing
 surfaced the kill as a failure, even though `exit.reportComplete` was already `false` for it.
 
-`job-core.mjs`'s `startJob()` now defaults `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` in the env
-passed to every launched job's CLI, so background work runs to completion instead of being killed
-at the CLI's internal 600s default. `CLAUDE_ASYNC_JOB_TIMEOUT_MS` (default 4h) remains the real
-outer ceiling — the heartbeat timeout still applies. If the ambient environment already defines
-`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` when a job starts, that existing value is preserved, not
-overridden.
+`job-core.mjs`'s `startJob()` now defaults `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` to a finite
+`BG_WAIT_CEILING_MS` (2h, `job-core.mjs`'s own named constant) in the env passed to every launched
+job's CLI, so background work has a generous window to run to completion instead of being killed
+at the CLI's internal 600s default. The ceiling is finite rather than 0 ("wait forever") on
+purpose: 0 means the runner's heartbeat keeps ticking while the CLI waits forever on background
+work, so `CLAUDE_ASYNC_JOB_TIMEOUT_MS` (below) would never fire to catch a hung background agent
+— nothing in the bridge would stop it. `BG_WAIT_CEILING_MS` can be overridden with
+`CLAUDE_ASYNC_BG_WAIT_CEILING_MS`, following the same pattern as `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
+`CLAUDE_ASYNC_JOB_TIMEOUT_MS` (default 4h) remains the real outer ceiling — the heartbeat timeout
+still applies, now with headroom above the 2h background-task ceiling. If the ambient environment
+already defines `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` when a job starts, that existing value is
+preserved, not overridden.
 
 As a backstop for a build whose ceiling fires anyway, `job-runner.mjs`'s `recordExit()` matches
 the CLI's own "Background tasks still running after Ns; terminating" line in stderr (a loose
