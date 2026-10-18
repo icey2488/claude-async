@@ -708,6 +708,18 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
+  // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: default the CLI's own background-task
+  // wait ceiling to "wait forever" so a job's background work (subagents handed off and the
+  // turn ended) finishes instead of being killed mid-flight at the CLI's internal 600s default --
+  // which silently looked like success (exit 0, nothing in exitCode/status pointing at a kill).
+  // CLAUDE_ASYNC_JOB_TIMEOUT_MS (default 4h, JOB_TIMEOUT_MS above) remains the real ceiling.
+  // Only set it when the bridge's own ambient env hasn't already: collectEnvOverrides() (below)
+  // forwards any CLAUDE_*/ANTHROPIC_* var already in process.env into the launch ticket, and
+  // extraEnv here takes precedence over that forwarding, so setting it unconditionally would
+  // stomp an operator's deliberate override.
+  if (process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === undefined) {
+    extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "0";
+  }
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
 
@@ -741,11 +753,18 @@ export function checkJob(id, tailBytes = 8000) {
   const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
   let state, exitCode = null, finishedAt = null;
   const extra = {};
+  // Read once, up front: both the "completed vs failed" classification below and diedCause
+  // (further down) key off it.
+  const exitRecord = readExitJson(p);
 
   if (fs.existsSync(p.exit)) {
     exitCode = parseInt(fs.readFileSync(p.exit, "utf8").trim(), 10);
-    state = exitCode === 0 ? "completed" : "failed";
     finishedAt = fs.statSync(p.exit).mtime.toISOString();
+    // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: an exit-0 run whose CLI was killed by
+    // its own background-task wait ceiling must never read as "completed" -- job-runner.mjs's
+    // recordExit() tags this case exitReason "bg_tasks_terminated" (see its BG_TASKS_TERMINATED_RE)
+    // regardless of exitCode; that overrides "completed" here the same way a nonzero exitCode always has.
+    state = (exitCode === 0 && exitRecord?.exitReason !== "bg_tasks_terminated") ? "completed" : "failed";
   } else {
     const lastAlive = readLastAlive(p.heartbeat);
     if (lastAlive === null) {
@@ -803,7 +822,21 @@ export function checkJob(id, tailBytes = 8000) {
   }
 
   const runnerJobMembership = readRunnerJobMembership(p);
-  const exitRecord = readExitJson(p);
+
+  // reportComplete (exit.json, written by job-runner.mjs's recordExit()) measures only whether
+  // stdout ever carried the configured completeness marker (default: a line matching
+  // ^DELEGATION-METRICS:, see discord-notify.mjs's loadCompletenessConfig/hasCompletenessMarker)
+  // before the process exited -- NOT whether the job "succeeded". false means the run ended
+  // (any status) without ever writing that final-report line, e.g. because it handed off to a
+  // background task and ended its turn, asked a question, or was cut off mid-report. Surfaced
+  // here as its own top-level field + a human-readable warning (previously only visible nested
+  // under `exit.reportComplete`) rather than changing what the field itself means.
+  if (exitRecord && exitRecord.reportComplete === false) {
+    extra.reportIncomplete = true;
+    extra.warning = "job exited without ever writing a final report (no completeness marker " +
+      "found in stdout) -- it may have stopped early, e.g. by handing off to a background task " +
+      "and ending its turn";
+  }
 
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),

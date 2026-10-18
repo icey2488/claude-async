@@ -181,6 +181,15 @@ test("markerFor: emoji-free status markers", () => {
   assert.equal(markerFor("spawn-error", null), "[SPAWN-ERROR]");
 });
 
+// claunker.gemini-mcp-v2-20261018-pfvzx44f: an exit-0 run killed by the CLI's own background-task
+// wait ceiling must never ping [OK] -- regardless of exitCode or reportComplete, it always gets
+// its own marker so the ping unambiguously says the run failed.
+test("markerFor: bg_tasks_terminated always reads as failed, exitCode 0 and reportComplete notwithstanding", () => {
+  assert.equal(markerFor("bg_tasks_terminated", 0), "[BG-TASKS-TERMINATED]");
+  assert.equal(markerFor("bg_tasks_terminated", 0, { reportComplete: true }), "[BG-TASKS-TERMINATED]");
+  assert.equal(markerFor("bg_tasks_terminated", 1), "[BG-TASKS-TERMINATED]");
+});
+
 test("buildDiscordContent: shape, and a 1800-char hard cap", () => {
   const content = buildDiscordContent({
     marker: "[OK]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 5000, headline: "did the thing",

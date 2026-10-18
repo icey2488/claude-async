@@ -93,6 +93,49 @@ test("status classification for a completed job is unchanged when exit.json is u
   assert.deepEqual(r.exit, { error: "unparseable exit.json" });
 });
 
+// claunker.gemini-mcp-v2-20261018-pfvzx44f: the real-world reproduction case. The CLI's own
+// background-task wait ceiling killed background work mid-flight, but the runner still recorded
+// exit_code 0 (the process did exit cleanly, just early) -- job-runner.mjs's recordExit() tags
+// this exitReason "bg_tasks_terminated" in exit.json, and checkJob must never let that read as
+// "completed" just because exitCode is 0.
+test("exitReason bg_tasks_terminated: status is failed even though exitCode is 0", () => {
+  makeJob("bg-killed", { exitCode: 0, exitJson: { exitCode: 0, exitSignal: null,
+    exitReason: "bg_tasks_terminated", endedAt: new Date().toISOString(),
+    stderrTail: ["Background tasks still running after 600s; terminating."], stdoutTail: [],
+    usageLimitSuspected: null, reportComplete: false } });
+  const r = core.checkJob("bg-killed");
+  assert.equal(r.status, "failed");
+  assert.equal(r.exitCode, 0, "the raw exit code is still reported verbatim");
+  assert.equal(r.exit.exitReason, "bg_tasks_terminated");
+});
+
+test("listJobs also reports bg_tasks_terminated as failed, not completed", () => {
+  makeJob("bg-killed-listed", { exitCode: 0, exitJson: { exitCode: 0, exitSignal: null,
+    exitReason: "bg_tasks_terminated", endedAt: new Date().toISOString(), stderrTail: [], stdoutTail: [] } });
+  const row = core.listJobs().find((r) => r.jobId === "bg-killed-listed");
+  assert.equal(row.status, "failed");
+  assert.equal(row.exitCode, 0);
+});
+
+// reportComplete (exit.json) measures only whether stdout ever carried the completeness marker --
+// it says nothing about status by itself. checkJob lifts it to a top-level reportIncomplete flag +
+// warning (previously visible only nested under `exit.reportComplete`) without changing what the
+// field itself means or what it's computed from.
+test("reportComplete:false surfaces as a top-level reportIncomplete flag and warning, without changing status", () => {
+  makeJob("no-report", { exitCode: 0, exitJson: { ...RECORD_OK, reportComplete: false } });
+  const r = core.checkJob("no-report");
+  assert.equal(r.status, "completed", "reportIncomplete is additive, not a status override");
+  assert.equal(r.reportIncomplete, true);
+  assert.match(r.warning, /final report/);
+});
+
+test("reportComplete:true (or absent) adds neither reportIncomplete nor warning", () => {
+  makeJob("has-report", { exitCode: 0, exitJson: { ...RECORD_OK, reportComplete: true } });
+  assert.equal("reportIncomplete" in core.checkJob("has-report"), false);
+  makeJob("no-reportcomplete-field", { exitCode: 0, exitJson: RECORD_OK });
+  assert.equal("reportIncomplete" in core.checkJob("no-reportcomplete-field"), false);
+});
+
 // diedCause narrows the `died` bucket using exit.json's exitReason. makeJob's default meta.pid
 // (999999) and no runner.pid/heartbeat file put every job below through checkJob's "legacy: no
 // runner_heartbeat file" path, which classifies as `died` once pidAlive/healMetaPid both fail --

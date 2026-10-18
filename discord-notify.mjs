@@ -293,10 +293,16 @@ export function formatDuration(ms) {
 // exit-0 "exit" job: an exit 0 job whose stdout never carried the DELEGATION-METRICS final-report
 // marker, with enforcement on, is labeled [INCOMPLETE] instead of [OK] -- it exited cleanly but
 // may have stopped early (asked a question, backgrounded a call it needed, etc.) without ever
-// writing its report. Non-zero exits, signals, and spawn errors are unchanged by this.
+// writing its report. Non-zero exits, signals, spawn errors, and bg_tasks_terminated are
+// unchanged by this (bg_tasks_terminated always reads as its own marker regardless of exitCode
+// or reportComplete -- see the dedicated branch below).
 export function markerFor(exitReason, exitCode, { reportComplete = true, enforce = true } = {}) {
   if (exitReason === "spawn-error") return "[SPAWN-ERROR]";
   if (exitReason === "signal") return "[SIGNAL]";
+  // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: the CLI's own background-task wait
+  // ceiling killed background work mid-flight but the CLI still exited 0 -- never let that read
+  // as [OK] just because exitCode is 0 (see job-runner.mjs's BG_TASKS_TERMINATED_RE).
+  if (exitReason === "bg_tasks_terminated") return "[BG-TASKS-TERMINATED]";
   if (exitCode !== 0) return "[FAIL]";
   if (enforce && !reportComplete) return "[INCOMPLETE]";
   return "[OK]";

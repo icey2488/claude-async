@@ -72,6 +72,39 @@ test("death by signal: exitReason signal, exitSignal set, exitCode null", { skip
   assert.deepEqual(exitRecord.stderrTail, ["err line 1"]);
 });
 
+// claunker.gemini-mcp-v2-20261018-pfvzx44f: job claunker.gemini-mcp-v2-20261018-pfvzx44f handed
+// off to a background subagent, ended its turn, and the CLI's own background-task wait ceiling
+// (600s default) killed that work half-done -- but the CLI still exited 0, so exit.json's
+// exitReason stayed "exit" and the job silently read as "completed". recordExit() must catch the
+// CLI's own line (job-runner.mjs's BG_TASKS_TERMINATED_RE) and relabel exitReason, even at exit
+// code 0.
+test("CLI's own background-task-terminated line: exitReason becomes bg_tasks_terminated despite exit code 0", () => {
+  const { exitRecord } = fake("--stderr-raw",
+    "Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.",
+    "--exit", 0);
+  assert.equal(exitRecord.exitCode, 0);
+  assert.equal(exitRecord.exitReason, "bg_tasks_terminated");
+});
+
+// The second count varies by build -- the matcher is a loose \d+s, not the literal "600s".
+test("CLI's own background-task-terminated line: matches regardless of the exact second count", () => {
+  const { exitRecord } = fake("--stderr-raw", "Background tasks still running after 42s; terminating.", "--exit", 0);
+  assert.equal(exitRecord.exitReason, "bg_tasks_terminated");
+});
+
+test("control: ordinary stderr with no termination line keeps exitReason \"exit\" as before, exit code 0", () => {
+  const { exitRecord } = fake("--stderr-lines", 2, "--exit", 0);
+  assert.equal(exitRecord.exitCode, 0);
+  assert.equal(exitRecord.exitReason, "exit");
+});
+
+// A plain nonzero exit (no termination line) must not be mistakenly relabeled.
+test("control: a nonzero exit with no termination line keeps exitReason \"exit\"", () => {
+  const { exitRecord } = fake("--stderr-lines", 1, "--exit", 1);
+  assert.equal(exitRecord.exitReason, "exit");
+  assert.equal(exitRecord.exitCode, 1);
+});
+
 test("spawn failure (bad CLI path): spawn-error with message, null code and signal, empty stdout tail", () => {
   const bad = path.join(TMP, "no-such-cli-binary");
   const { exitRecord, dir } = runJob(bad, []);

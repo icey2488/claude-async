@@ -201,7 +201,15 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                  "opening its job dir; it is absent for jobs that predate exit.json and never null. " +
                  "died jobs also get `diedCause`, derived from `exit`: \"spawn-error\" (the CLI never " +
                  "started), \"signal\" (killed by a signal), \"exit\" (the CLI exited with a code but the " +
-                 "runner never recorded exit_code), or \"unknown\" (no exit.json, or an unparseable one).",
+                 "runner never recorded exit_code), or \"unknown\" (no exit.json, or an unparseable one). " +
+                 "A job whose CLI printed its own \"Background tasks still running after ...s; terminating\" " +
+                 "line (its background-task wait ceiling fired mid-job, killing backgrounded work half done) " +
+                 "always reports status \"failed\" with exit.exitReason \"bg_tasks_terminated\", even though " +
+                 "exitCode is 0 -- see CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in RUNBOOK.md. `reportIncomplete`: " +
+                 "true (plus a `warning` string) means the job ended without ever writing a final report (no " +
+                 "DELEGATION-METRICS marker in stdout) -- it may have stopped early, e.g. by handing a task " +
+                 "off to a background subagent and ending its turn. This does not by itself mean the job " +
+                 "failed; check status/exit for that.",
     inputSchema: {
       jobId: z.string(),
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),

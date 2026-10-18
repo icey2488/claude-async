@@ -70,6 +70,43 @@ those are true in-band peer-gone signals, not a probabilistic probe, so they sti
 sight. See `ping-watchdog.mjs` for the exact decision function and `test/multihost/ping-watchdog.
 test.mjs` / `test/multihost/bridge-exit.test.mjs` for its coverage.
 
+## Background-task wait ceiling and silent-success kills (`fix/bg-wait-ceiling`, 2026-10-18)
+
+Job `claunker.gemini-mcp-v2-20261018-pfvzx44f` (2026-10-18, 19:38–19:50 UTC) handed its work off
+to a background subagent and ended its turn. The Claude Code CLI's own internal background-task
+wait ceiling (600s default) fired mid-job, killing that backgrounded work half done, and printed
+this line to stderr before exiting 0:
+
+```
+Background tasks still running after 600s; terminating. Set CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 to wait indefinitely.
+```
+
+The runner still recorded exit code 0, and the job silently showed status `"completed"` — nothing
+surfaced the kill as a failure, even though `exit.reportComplete` was already `false` for it.
+
+`job-core.mjs`'s `startJob()` now defaults `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` in the env
+passed to every launched job's CLI, so background work runs to completion instead of being killed
+at the CLI's internal 600s default. `CLAUDE_ASYNC_JOB_TIMEOUT_MS` (default 4h) remains the real
+outer ceiling — the heartbeat timeout still applies. If the ambient environment already defines
+`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` when a job starts, that existing value is preserved, not
+overridden.
+
+As a backstop for a build whose ceiling fires anyway, `job-runner.mjs`'s `recordExit()` matches
+the CLI's own "Background tasks still running after Ns; terminating" line in stderr (a loose
+regex, `BG_TASKS_TERMINATED_RE`, since the number of seconds varies by build) and, when found,
+tags `exit.json`'s `exitReason` `"bg_tasks_terminated"` instead of `"exit"` — regardless of exit
+code. `job-core.mjs`'s `checkJob()` (and therefore `claude_jobs`) treats
+`exitReason: "bg_tasks_terminated"` as status `"failed"` even when the exit code is 0.
+`discord-notify.mjs`'s `markerFor()` gives this case its own marker, `[BG-TASKS-TERMINATED]`,
+instead of `[OK]`.
+
+`claude_check`'s `reportComplete` field (in `exit.json`) already existed and its meaning is
+unchanged by any of this: it measures only whether stdout ever carried the completeness marker
+(default: a line matching `^DELEGATION-METRICS:`) before the process exited, not whether the job
+succeeded. It is now additionally surfaced at the top level of `claude_check`'s own response as
+`reportIncomplete: true` plus a human-readable `warning` string, instead of being visible only
+nested inside the `exit` field.
+
 ## Gotchas
 
 - **Use Bash for `npm`/`git`, not the PowerShell `npm` wrapper** — the wrapper misbehaves.
@@ -91,7 +128,11 @@ test.mjs` / `test/multihost/bridge-exit.test.mjs` for its coverage.
   ask a question, gotten blocked, or otherwise ended early without finishing its report. This is
   informational only: it never changes `status`. The same signal is visible directly as
   `reportComplete: false` in the job's `exit.json`, surfaced verbatim by `claude_check`'s `exit`
-  field.
+  field, and lifted to a top-level `reportIncomplete: true` + `warning` string on `claude_check`'s
+  own response (added 2026-10-18, `fix/bg-wait-ceiling`) so it isn't missed buried inside `exit`.
+- **A `[BG-TASKS-TERMINATED]` Discord ping, or `claude_check` status `"failed"` with
+  `exit.exitReason: "bg_tasks_terminated"`, on a job whose exit code is 0** (added 2026-10-18,
+  `fix/bg-wait-ceiling`) — see the dedicated section below.
 
 ## Discord notifications — limitation
 

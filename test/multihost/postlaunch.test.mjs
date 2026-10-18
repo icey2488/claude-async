@@ -5,7 +5,7 @@ import { test, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
-import { core, fakeLaunch, tickets, resetState, BIG_CAPS, cleanupTmp, JOBS, QUEUE } from "./_setup.mjs";
+import { core, fakeLaunch, tickets, readTicket, resetState, BIG_CAPS, cleanupTmp, JOBS, QUEUE } from "./_setup.mjs";
 import { claimOneTicket } from "../../launcher-claim.mjs";
 import { boundIntent } from "../../card-hook.mjs";
 
@@ -90,6 +90,31 @@ test("meta.json: an over-long intent is bounded the same way boundIntent bounds 
   const meta = JSON.parse(fs.readFileSync(path.join(JOBS, "long-intent", "meta.json"), "utf8"));
   assert.equal(meta.intent, boundIntent(long));
   assert.ok(meta.intent.length <= 200, `expected a bounded intent, got ${meta.intent.length} chars`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// claunker.gemini-mcp-v2-20261018-pfvzx44f: default CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 for
+// every launched job's env, so the CLI waits for background work to finish instead of killing it
+// at its own internal 600s default -- but never stomp a value the ambient env already set.
+// ---------------------------------------------------------------------------------------------
+
+test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 is set in the launch ticket's env by default", async () => {
+  const r = await startWith("bg-ceiling-default", undefined);
+  assert.equal(r.error, undefined);
+  assert.equal(readTicket("bg-ceiling-default").envOverrides.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, "0");
+});
+
+test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: an existing ambient value is preserved, not overridden to 0", async () => {
+  const prior = process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+  process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = "120000";
+  try {
+    const r = await startWith("bg-ceiling-preset", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("bg-ceiling-preset").envOverrides.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, "120000");
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS;
+    else process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = prior;
+  }
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -2,8 +2,13 @@
 //   node fake-cli.mjs --stderr-lines N --exit CODE [--signal SIGTERM] [--stdout-lines M]
 //   node fake-cli.mjs --stderr-numbered N --exit CODE
 //   node fake-cli.mjs --stderr-fixed COUNT WIDTH --exit CODE
+//   node fake-cli.mjs --stderr-raw TEXT --exit CODE
 // Writes "err line <i>" (i = 1..N) to stderr and "out line <i>" (i = 1..M) to stdout, then either
 // exits with CODE or kills itself with --signal. Defaults: N=0, M=0, CODE=0.
+//
+// --stderr-raw TEXT writes TEXT verbatim (plus a trailing newline) to stderr instead -- used to
+// reproduce the real CLI's own diagnostic lines (e.g. its background-task wait ceiling message)
+// exactly, rather than approximating them with the synthetic "err line N" format above.
 //
 // --stderr-numbered N writes N FIXED-WIDTH lines "line 000001\n" .. "line NNNNNN\n" (each exactly
 // 12 bytes) to stderr instead. Fixed width makes the total byte count exactly predictable, which
@@ -32,6 +37,7 @@ const m = Number(opt("stdout-lines", 0));
 const numbered = Number(opt("stderr-numbered", 0));
 const fixedCount = Number(opt("stderr-fixed", 0));
 const fixedWidth = Number(optAt("stderr-fixed", 1, 0));
+const raw = opt("stderr-raw", null);
 const code = Number(opt("exit", 0));
 const signal = opt("signal", null);
 
@@ -42,6 +48,7 @@ for (let i = 1; i <= fixedCount; i++) {
   const body = `line ${String(i).padStart(6, "0")}`.padEnd(fixedWidth - 1, "x");
   err += `${body}\n`;
 }
+if (raw !== null) err += `${raw}\n`;
 let out = "";
 for (let i = 1; i <= m; i++) out += `out line ${i}\n`;
 process.stdout.write(out, () => process.stderr.write(err, () => {

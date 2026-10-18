@@ -87,16 +87,23 @@ If you'd rather not use the prompt above, or you're not on Windows:
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
 `status` is one of `running | completed | failed | died | timed_out`. `completed` is
-reported only when the job exited with code 0; a non-zero exit is `failed`. `died` means the
-process exited without recording a result (crash, SIGKILL, pid recycled to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
+reported only when the job exited with code 0 AND wasn't killed by the CLI's own background-task
+wait ceiling (see `exitReason: "bg_tasks_terminated"` below); a non-zero exit, or that kill, is
+`failed`. `died` means the process exited without recording a result (crash, SIGKILL, pid recycled
+to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
 
 `claude_check` also includes an `exit` field when the runner's `exit.json` record (see
 `job-runner.mjs`) exists in the job's dir: the parsed `{ exitCode, exitSignal, exitReason,
-spawnError?, endedAt, stderrTail, stdoutTail, usageLimitSuspected }` object, letting a dead or
-failed job be attributed without opening the job dir. It is omitted (never `null`) for jobs that
+spawnError?, endedAt, stderrTail, stdoutTail, usageLimitSuspected, reportComplete }` object,
+letting a dead or failed job be attributed without opening the job dir. `exitReason` is one of
+`"exit"`, `"signal"`, `"spawn-error"`, or `"bg_tasks_terminated"` — the last one means the CLI
+printed its own "Background tasks still running after ...s; terminating" line (its internal
+background-task wait ceiling fired, killing backgrounded work half done) and is always reported as
+`status: "failed"` regardless of exit code; see RUNBOOK.md's "Background-task wait ceiling and
+silent-success kills" for the incident this fixed. `exit` is omitted (never `null`) for jobs that
 predate `exit.json`, and degrades to `{ error: "unparseable exit.json" }` if the file is missing,
-partial, oversized (>256 KiB), or otherwise unparseable. This is purely additive: it never affects
-the `status` classification above.
+partial, oversized (>256 KiB), or otherwise unparseable. This is purely additive: besides the
+`bg_tasks_terminated` case above, it never affects the `status` classification.
 
 `died` jobs additionally get a `diedCause` field, derived from `exit`: `"spawn-error"` (the CLI
 never started), `"signal"` (killed by a signal), `"exit"` (the CLI exited with a code, but the
@@ -169,7 +176,8 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
   omitted. Set it `false` for a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
   output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
-  a status marker (`[OK]` / `[INCOMPLETE]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]`), host, a
+  a status marker (`[OK]` / `[INCOMPLETE]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]` /
+  `[BG-TASKS-TERMINATED]`), host, a
   title, exit code, and duration. It never includes the prompt, stderr, environment, tokens, or
   file paths.
 - **Title**: the ping's title is `claude_start`'s dispatch `intent` when one was given for the job
@@ -192,11 +200,14 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
   When an exit-0 job is missing the marker and enforcement is on, the ping's marker is
   `[INCOMPLETE]` instead of `[OK]`, with a reason line appended after the headline:
   `no final report marker (DELEGATION-METRICS) found; job may have stopped early`. Non-zero exits, signals,
-  and spawn errors are never relabeled by this check — `[FAIL]`/`[SIGNAL]`/`[SPAWN-ERROR]` keep
+  spawn errors, and `bg_tasks_terminated` (see the `exit.exitReason` table above) are never
+  relabeled by this check — `[FAIL]`/`[SIGNAL]`/`[SPAWN-ERROR]`/`[BG-TASKS-TERMINATED]` keep
   their existing meaning regardless of the marker. The check runs and is recorded even when no
   Discord webhook is configured at all: its result is written as an additive `reportComplete`
   boolean in the job's `exit.json`, which `claude_check` already surfaces verbatim under its
   `exit` key — same convention as the existing `diedCause` field, never changing `status`.
+  `reportComplete: false` is also lifted to `claude_check`'s own top level as `reportIncomplete:
+  true` plus a `warning` string, so it isn't missed buried inside `exit`.
 
 **3. Lock the file down** — it holds a webhook URL, which is a credential (posting to it needs no
 auth beyond the URL itself):

@@ -131,10 +131,11 @@ const errFd = fs.openSync(err, "a");
 // Exit record: written to its OWN file (exit.json, next to meta.json), never merged into
 // meta.json. meta.json already has a writer (job-core), and a second, independent
 // read-modify-write from this process racing that one would silently drop whichever side lost
-// the rename -- one writer per file. Fields: exitCode/exitSignal/exitReason (+ spawnError on a
-// spawn failure), endedAt, stderrTail/stdoutTail -- the last TAIL_LINES lines read straight
-// off out.log/err.log on disk at exit time (not a ring buffer kept in memory), since stdout/
-// stderr go to those files' fds directly and the runner never sees the bytes itself -- and
+// the rename -- one writer per file. Fields: exitCode/exitSignal/exitReason ("exit" | "signal" |
+// "spawn-error" (+ spawnError on a spawn failure) | "bg_tasks_terminated", see
+// BG_TASKS_TERMINATED_RE above), endedAt, stderrTail/stdoutTail -- the last TAIL_LINES lines read
+// straight off out.log/err.log on disk at exit time (not a ring buffer kept in memory), since
+// stdout/stderr go to those files' fds directly and the runner never sees the bytes itself -- and
 // reportComplete: whether stdoutTail carries the DELEGATION-METRICS final-report marker (see
 // discord-notify.mjs's hasCompletenessMarker/loadCompletenessConfig). This is purely additive,
 // objective reporting (computed from the configured marker regardless of whether completeness
@@ -183,18 +184,34 @@ function readTail(file) {
 
 let exitInfo = { exitCode: null, exitSignal: null, exitReason: "exit" };
 
+// 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: job claunker.gemini-mcp-v2-20261018-pfvzx44f
+// handed work to a background subagent, ended its turn, and the CLI's own "wait for background
+// tasks" ceiling (600s default) fired and killed that work half-done -- but the CLI still exited
+// 0, so the job silently recorded status "completed". Matched loosely (the second count varies
+// by build) and kept in this ONE place: recordExit() below is the only place this regex is
+// tested, and job-core.mjs's checkJob()/discord-notify.mjs's markerFor() both key off the
+// exitReason value it produces ("bg_tasks_terminated") rather than re-matching the string.
+const BG_TASKS_TERMINATED_RE = /Background tasks still running after \d+s; terminating/;
+
 // Best-effort: a runner that cannot record must still finish normally.
 function recordExit() {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
   const stdoutTail = readTail(out);
+  const stderrTail = readTail(err);
   let completeness;
   try { completeness = loadCompletenessConfig(); } catch { completeness = { markerRegex: undefined }; }
+  // Only overrides a plain "exit" (the CLI ran and exited on its own, which is what printing its
+  // own ceiling-reached line implies) -- never a signal or spawn-error, which mean something else
+  // entirely happened.
+  const exitReason = exitInfo.exitReason === "exit" && BG_TASKS_TERMINATED_RE.test(stderrTail.join("\n"))
+    ? "bg_tasks_terminated"
+    : exitInfo.exitReason;
   const record = {
     exitCode: exitInfo.exitCode,
     exitSignal: exitInfo.exitSignal,
-    exitReason: exitInfo.exitReason,
+    exitReason,
     endedAt: new Date().toISOString(),
-    stderrTail: readTail(err),
+    stderrTail,
     stdoutTail,
     // No reliable CLI usage-limit message pattern exists in this repo (no fixture or test carries
     // one), so this is deliberately unknown rather than a guessed regex.
@@ -246,7 +263,7 @@ async function finish(code) {
       intent,
       host: os.hostname(),
       exitCode: exitInfo.exitCode,
-      exitReason: exitInfo.exitReason,
+      exitReason: exitRecord ? exitRecord.exitReason : exitInfo.exitReason,
       startedAt,
       endedAt: new Date(exitRecord && exitRecord.endedAt ? exitRecord.endedAt : Date.now()),
       stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
