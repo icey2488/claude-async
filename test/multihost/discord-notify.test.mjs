@@ -19,6 +19,7 @@ import {
   isLabelLine, containsPath, truncateHeadline, closeMarkdownSpans, HEADLINE_MAX_CHARS,
   loadCompletenessConfig, hasCompletenessMarker, DEFAULT_COMPLETENESS_MARKER_SOURCE,
   INCOMPLETE_REASON, notifyJobFinished, isTestMode, getRealSendBlockedCount,
+  stripMarkdownWrapping, isJunkHeadlineLine,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -263,6 +264,83 @@ test("hasCompletenessMarker: a custom markerRegex is used instead of the default
   assert.equal(hasCompletenessMarker(["CUSTOM-MARKER: hi"], /^CUSTOM-MARKER:/), true);
   assert.equal(hasCompletenessMarker(["CUSTOM-MARKER: hi"], /^DELEGATION-METRICS:/), false);
   assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: hi"], /^CUSTOM-MARKER:/), false);
+});
+
+// 2026-10-18 claunker.test-discord-isolation-20261018-582t1o1k: finished its work fully but ended
+// with its final report line wrapped in inline code (`` `DELEGATION-METRICS: ...` ``), so the
+// plain ^DELEGATION-METRICS: regex didn't match, the job was marked "incomplete", and Discord
+// posted [INCOMPLETE] for a job that actually completed. hasCompletenessMarker must tolerate
+// common markdown wrapping while still rejecting a mid-sentence mention.
+test("hasCompletenessMarker: tolerates common markdown wrapping around the marker line", () => {
+  assert.equal(hasCompletenessMarker(["`DELEGATION-METRICS: calls=0 accepted=0`"]), true, "inline backtick");
+  assert.equal(hasCompletenessMarker(["```", "DELEGATION-METRICS: calls=0 accepted=0", "```"]), true, "fenced block");
+  assert.equal(hasCompletenessMarker(["**DELEGATION-METRICS: calls=0 accepted=0**"]), true, "bold");
+  assert.equal(hasCompletenessMarker(["> DELEGATION-METRICS: calls=0 accepted=0"]), true, "blockquote");
+  assert.equal(hasCompletenessMarker(["    DELEGATION-METRICS: calls=0 accepted=0"]), true, "indented");
+  assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: calls=0 accepted=0"]), true, "plain line still works");
+  assert.equal(hasCompletenessMarker(["note: DELEGATION-METRICS: calls=1 is mentioned here"]), false, "mid-sentence mention must not match");
+});
+
+test("stripMarkdownWrapping: strips wrapper chars without touching the hyphen inside DELEGATION-METRICS", () => {
+  assert.equal(stripMarkdownWrapping("`DELEGATION-METRICS: x`"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("**DELEGATION-METRICS: x**"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("> DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("    DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
+});
+
+// Regression: the exact final stdoutTail array recorded in claunker.test-discord-isolation-
+// 20261018-582t1o1k's exit.json, whose last line is the DELEGATION-METRICS report wrapped in
+// inline backticks. Must now read as complete.
+test("hasCompletenessMarker: regression -- exact stdoutTail from claunker.test-discord-isolation-20261018-582t1o1k", () => {
+  const stdoutTail = [
+    "In `notifyJobFinished`: when test mode (`CLAUDE_ASYNC_TEST=1` or `NODE_TEST_CONTEXT`) is on **and** the resolved webhook host is a genuine `discord.com`/`discordapp.com` domain **and** the caller is using the default (real, network-capable) `fetch` — the send is blocked, logged, and counted via `getRealSendBlockedCount()`. A test-injected fake `fetchImpl`, or a non-Discord URL (the existing integration tests' local HTTP servers), passes through unaffected — so the existing `discord-notify.test.mjs` integration tests still work.",
+    "",
+    "### Verify — real results",
+    "- `npm run test:multihost`: **354 pass, 1 skip** (pre-existing, platform-specific — Windows has no self-kill signal), **0 fail**.",
+    "- `node test/survival.mjs`: all 4 scenarios **PASS**.",
+    "- `node test-card-hook.mjs`: **24/24 PASS**.",
+    "",
+    "**Real-send count: 0** across the full run, proven by instrumentation (not by eye):",
+    "- New regression test monkey-patches `globalThis.fetch` as a zero-call spy, configures a real-looking `discord.com` webhook (simulating the exact incident), and asserts `realFetchCalls === 0` while `getRealSendBlockedCount()` increments by exactly 1.",
+    "- Same test then uses an injected fake sender against the identical Discord-host URL and confirms it still receives the call (1 fake send recorded) — proving the guard doesn't break intentional instrumentation.",
+    "- A third test confirms a non-Discord (local-server) URL is unaffected — the existing integration tests' real local-server POSTs still land (`requests.length === 1`), and the blocked-counter doesn't move.",
+    "- `test-card-hook.mjs`/`test/survival.mjs` runs now have an isolated, notify.json-free `CLAUDE_ASYNC_CONFIG_DIR`, so `loadNotifyConfig()` returns `null` immediately — zero network attempts of any kind.",
+    "",
+    "### Restart: **No**",
+    "`claude-async-server.mjs` (the long-lived bridge) never imports `discord-notify.mjs` — only `job-runner.mjs` does, and that's a fresh detached process spawned per job, never cached by the bridge. The change takes effect on the next job run with no bridge restart needed.",
+    "",
+    "### Ollama delegation report",
+    "**Zero Ollama calls.** No eligible work existed: this job was entirely test-harness/notify-logic/git work (all explicitly excluded from delegation), and there was no README/RUNBOOK prose task with exact instructions to delegate.",
+    "",
+    "`DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=148 model=none`",
+  ];
+  assert.equal(hasCompletenessMarker(stdoutTail), true);
+});
+
+// 2026-10-18 claunker.card-hook-incomplete-20261018-0rn2fuur: the [OK] ping's headline was
+// "129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none." -- leftover arithmetic from
+// the job's own report, not a meaningful summary. extractHeadline must skip arithmetic-leftover
+// and DELEGATION-* lines so a real content line wins instead.
+test("isJunkHeadlineLine: flags arithmetic leftovers and DELEGATION-* lines, not real content", () => {
+  assert.equal(isJunkHeadlineLine("129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none."), true);
+  assert.equal(isJunkHeadlineLine("DELEGATION-METRICS: calls=0 accepted=0"), true);
+  assert.equal(isJunkHeadlineLine("DELEGATION-CALL: task_type=doc outcome=accepted"), true);
+  assert.equal(isJunkHeadlineLine("**Branch/commit:** `fix/x` fast-forwarded into `main`."), false);
+  assert.equal(isJunkHeadlineLine("129 files changed in this release."), false, "a number followed by prose is not arithmetic");
+});
+
+test("extractHeadline: regression -- real head lines from claunker.card-hook-incomplete-20261018-0rn2fuur pick real content over the arithmetic leftover", () => {
+  const headLines = [
+    "129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none.",
+    "",
+    "## Final Summary",
+    "",
+    "**Branch/commit:** `fix/card-hook-status` → fast-forwarded into `main`, new HEAD `538d24b` (was `a582cbf`).",
+  ];
+  assert.equal(
+    extractHeadline(headLines),
+    "**Branch/commit:** `fix/card-hook-status` → fast-forwarded into `main`, new HEAD `538d24b` (was `a582cbf`).",
+  );
 });
 
 test("loadCompletenessConfig: absent file, no completeness key, and unparseable JSON all default to enforce=true with the DELEGATION-METRICS marker", () => {

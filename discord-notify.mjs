@@ -90,13 +90,26 @@ export function loadCompletenessConfig() {
   return { enforce, markerRegex };
 }
 
-// True when any line in `lines` matches markerRegex. lastIndex is reset before every test so a
-// caller-supplied global-flag regex can never skip a line due to leftover state from the
-// previous one.
+// Strips markdown wrapping a model commonly puts around its own final-report line -- leading
+// whitespace/indentation, blockquote/list markers ("> ", "- ", "* "), bold/italic emphasis
+// ("**", "__", "*", "_"), and backticks (inline code or a one-line fenced-code wrap) -- from the
+// start and end of `line`. Only touches leading/trailing runs of those characters, so the literal
+// hyphen inside "DELEGATION-METRICS" is never affected (stripping stops at the first non-wrapper
+// character, which is "D"). A fenced block's OWN delimiter lines ("```" alone) are separate lines
+// from the marker line itself and need no special handling here -- they just strip to "".
+export function stripMarkdownWrapping(line) {
+  return String(line).replace(/^[\s`>*_+-]+/, "").replace(/[\s`*_]+$/, "");
+}
+
+// True when any line in `lines`, after stripMarkdownWrapping(), matches markerRegex. lastIndex is
+// reset before every test so a caller-supplied global-flag regex can never skip a line due to
+// leftover state from the previous one. This is the one function every reportComplete computation
+// goes through (job-runner.mjs's recordExit()), so a markdown-wrapped marker line (e.g. a model
+// wrapping its final report line in backticks) is recognized the same way everywhere.
 export function hasCompletenessMarker(lines, markerRegex) {
   if (!Array.isArray(lines)) return false;
   const re = markerRegex || new RegExp(DEFAULT_COMPLETENESS_MARKER_SOURCE);
-  return lines.some((l) => { re.lastIndex = 0; return re.test(String(l)); });
+  return lines.some((l) => { re.lastIndex = 0; return re.test(stripMarkdownWrapping(String(l))); });
 }
 
 const LABEL_MAX_CHARS = 80;
@@ -134,6 +147,18 @@ export function containsPath(line) {
 
 const VERDICT_LINE = /^\**verdict\s*:/i;
 
+// Leftover arithmetic a model sometimes leaves at the top of its report ("129+19 = 148
+// lines_total, ...") and the delegation-contract lines themselves (DELEGATION-CALL:/
+// DELEGATION-METRICS:) are headline noise, not a verdict a human wrote -- skipping them lets the
+// real content line that follows (often right under a "## Final Summary"-style heading) win
+// instead.
+const ARITHMETIC_LEFTOVER = /^\d+(?:\s*[+\-*/]\s*\d+)+\s*=\s*\d+/;
+const DELEGATION_CONTRACT_LINE = /^(?:DELEGATION-(?:CALL|METRICS):)/;
+
+export function isJunkHeadlineLine(line) {
+  return ARITHMETIC_LEFTOVER.test(line) || DELEGATION_CONTRACT_LINE.test(line);
+}
+
 // First non-empty line of `stdoutLines` that isn't a markdown heading ("#..."), a code-fence
 // marker ("```..."), a bare markdown label (isLabelLine), or a line containing a filesystem path
 // (containsPath). Headings, fences and labels are skipped because they read as noise/broken
@@ -150,6 +175,7 @@ export function extractHeadline(stdoutLines) {
     if (!line) continue;
     if (line.startsWith("#")) continue;
     if (line.startsWith("```")) continue;
+    if (isJunkHeadlineLine(line)) continue;
     if (isLabelLine(line)) continue;
     if (containsPath(line)) continue;
     if (VERDICT_LINE.test(line)) return line;
