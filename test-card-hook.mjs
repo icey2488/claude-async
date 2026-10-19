@@ -63,6 +63,11 @@ const ERROR_CMD = JSON.stringify([process.execPath, ERROR_SCRIPT]);
 process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 process.env.CLAUDE_CLI_PATH = process.execPath; // node as "claude" — exits fast with unknown flags
+// startJob() here spawns a REAL job-runner.mjs, which pings Discord on finish() -- never read the
+// real ~/.claude-async/notify.json, and mark every spawned job-runner child as test mode too (see
+// discord-notify.mjs's real-send guard; 2026-10-18 test-isolation incident).
+process.env.CLAUDE_ASYNC_CONFIG_DIR = path.join(TMP, "config");
+process.env.CLAUDE_ASYNC_TEST = "1";
 
 // ─── Imports (dynamic so env vars are set first) ──────────────────────────────
 

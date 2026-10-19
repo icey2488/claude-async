@@ -14,7 +14,10 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "claude-async-server.mjs");
-const FAST = { ...process.env, CLAUDE_ASYNC_PING_MS: "800", CLAUDE_ASYNC_PING_TIMEOUT_MS: "800" };
+// This test never starts a job (just the MCP initialize/ping handshake), so it can't reach
+// discord-notify.mjs today -- mark the spawned server as test mode anyway so it stays covered if
+// that ever changes (see discord-notify.mjs's real-send guard; 2026-10-18 test-isolation incident).
+const FAST = { ...process.env, CLAUDE_ASYNC_PING_MS: "800", CLAUDE_ASYNC_PING_TIMEOUT_MS: "800", CLAUDE_ASYNC_TEST: "1" };
 const send = (c, m) => c.stdin.write(JSON.stringify(m) + "\n");
 
 // Spawn a server, complete initialize + initialized, and return the child + a queue of

@@ -56,6 +56,11 @@ process.env.CLAUDE_ASYNC_HEARTBEAT_MS = "1000";
 // RUNNER_PID_POLL_MS in job-core.mjs is 2000ms; delay well past it so the poll always times out.
 process.env.CLAUDE_ASYNC_TEST_DELAY_PIDFILE_MS = "3500";
 process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
+// This spawns the REAL win32 launch path end to end, ending in a real job-runner.mjs that pings
+// Discord on finish() -- never read the real ~/.claude-async/notify.json, and mark the spawned
+// runner as test mode too (see discord-notify.mjs's real-send guard; 2026-10-18 incident).
+process.env.CLAUDE_ASYNC_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pid-heal-config-"));
+process.env.CLAUDE_ASYNC_TEST = "1";
 
 const core = await import(pathToFileURL(path.join(REPO, "job-core.mjs")).href + "?scenario=pid-heal");
 

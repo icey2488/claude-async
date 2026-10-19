@@ -22,8 +22,11 @@ let seq = 0;
 // waits for it to exit (or the given timeoutMs), and returns { code, pid, crashLog }.
 function spawnBridge(extraEnv, timeoutMs = 10_000) {
   const jobDir = path.join(TMP, `jobs-${++seq}`);
+  // This spawns the REAL bridge; mark it (and anything it launches) as test mode so a real
+  // Discord send can never happen even if this file is ever extended to start a job (see
+  // discord-notify.mjs's real-send guard; 2026-10-18 test-isolation incident).
   const env = { ...process.env, CLAUDE_ASYNC_JOB_DIR: jobDir, CLAUDE_CLI_PATH: process.execPath,
-                CLAUDE_ASYNC_WIN32_LAUNCH_MODE: "breakaway", ...extraEnv };
+                CLAUDE_ASYNC_WIN32_LAUNCH_MODE: "breakaway", CLAUDE_ASYNC_TEST: "1", ...extraEnv };
   const child = spawn(process.execPath, [SERVER], { env, stdio: ["pipe", "pipe", "pipe"] });
   let stderr = "";
   child.stderr.on("data", (d) => { stderr += d; });

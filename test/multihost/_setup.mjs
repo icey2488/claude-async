@@ -21,6 +21,9 @@ const home = path.join(TMP, "home");
 fs.mkdirSync(home, { recursive: true });
 process.env.USERPROFILE = home;
 process.env.HOME = home;
+// See discord-notify.mjs's real-send guard: marks every process in this suite (and any
+// job-runner.mjs child it spawns, which inherits process.env) as test mode.
+process.env.CLAUDE_ASYNC_TEST = "1";
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 process.env.CLAUDE_ASYNC_CONFIG_DIR = path.join(home, ".claude-async");
 process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);

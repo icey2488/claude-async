@@ -13,10 +13,16 @@
  *
  * Run: node test-heartbeat.mjs   (exit 0 = all pass)
  */
-import { checkJob, JOB_ROOT, JOB_TIMEOUT_MS } from "./job-core.mjs";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
+
+// This file never calls startJob() (checkJob() only reads job dirs this test fabricates by hand),
+// so it can't reach discord-notify.mjs today -- set anyway so it stays marked as test mode if that
+// ever changes (see discord-notify.mjs's real-send guard; 2026-10-18 test-isolation incident).
+process.env.CLAUDE_ASYNC_TEST = "1";
+
+import { checkJob, JOB_ROOT, JOB_TIMEOUT_MS } from "./job-core.mjs";
 
 // ---- helpers ---------------------------------------------------------------
 

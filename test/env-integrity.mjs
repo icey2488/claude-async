@@ -67,6 +67,11 @@ async function runScenario(label, coreModulePath, dumperExe, sentinel) {
   process.env.ENV_DUMP_OUTPUT_PATH = dumpFile;
   process.env.CLAUDE_ASYNC_ENV_SENTINEL = sentinel;
   process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
+  // This spawns the REAL win32 launch path end to end, ending in a real job-runner.mjs that pings
+  // Discord on finish() -- never read the real ~/.claude-async/notify.json, and mark the spawned
+  // runner as test mode too (see discord-notify.mjs's real-send guard; 2026-10-18 incident).
+  process.env.CLAUDE_ASYNC_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "env-integrity-config-"));
+  process.env.CLAUDE_ASYNC_TEST = "1";
 
   const parentPathext = process.env.PATHEXT;
   const parentPath = process.env.PATH;

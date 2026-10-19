@@ -52,6 +52,14 @@ const REAL_CORE = path.join(REPO, "job-core.mjs");
 const DUMMY_CLI = path.join(REPO, "test", "dummy-claude.exe");
 const TEST_PARENT = path.join(REPO, "test", "test-parent.mjs");
 
+// Every scenario below spawns job-core.mjs's REAL launch path end to end, which ends in a real
+// job-runner.mjs that pings Discord on finish(). Set once here, before any scenario builds its own
+// `env` object (each does `{ ...process.env, ... }`, so this is inherited automatically) -- never
+// read the real ~/.claude-async/notify.json, and mark every spawned process as test mode too (see
+// discord-notify.mjs's real-send guard; 2026-10-18 test-isolation incident).
+process.env.CLAUDE_ASYNC_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "survival-config-"));
+process.env.CLAUDE_ASYNC_TEST = "1";
+
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function pidAlive(pid) {

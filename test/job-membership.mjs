@@ -7,6 +7,11 @@
  *
  * Run: node test/job-membership.mjs   (exit 0 = both shapes well-formed)
  */
+// This test never calls startJob() and can't reach discord-notify.mjs today -- set anyway so it
+// stays marked as test mode if that ever changes (see discord-notify.mjs's real-send guard;
+// 2026-10-18 test-isolation incident).
+process.env.CLAUDE_ASYNC_TEST = "1";
+
 import { queryJobMembershipOnce, createSelfMembershipQuerier } from "../tools/jobMembership.mjs";
 
 const REQUIRED_KEYS = ["inJob", "limitFlags", "killOnClose", "silentBreakawayOk", "breakawayOk"];

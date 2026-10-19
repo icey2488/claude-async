@@ -63,6 +63,11 @@ async function runScenario(label, presetPathext) {
   process.env.CLAUDE_CLI_PATH = DUMPER_EXE;
   process.env.ENV_DUMP_OUTPUT_PATH = dumpFile;
   process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
+  // This spawns the REAL win32 launch path end to end, ending in a real job-runner.mjs that pings
+  // Discord on finish() -- never read the real ~/.claude-async/notify.json, and mark the spawned
+  // runner as test mode too (see discord-notify.mjs's real-send guard; 2026-10-18 incident).
+  process.env.CLAUDE_ASYNC_CONFIG_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pathext-integrity-config-"));
+  process.env.CLAUDE_ASYNC_TEST = "1";
 
   // Cache-busting query so each scenario gets its own module instance (job-core.mjs reads
   // CLAUDE_CLI_PATH/JOB_ROOT at import time into module-level consts).

@@ -18,7 +18,7 @@ import {
   formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
   isLabelLine, containsPath, truncateHeadline, closeMarkdownSpans, HEADLINE_MAX_CHARS,
   loadCompletenessConfig, hasCompletenessMarker, DEFAULT_COMPLETENESS_MARKER_SOURCE,
-  INCOMPLETE_REASON,
+  INCOMPLETE_REASON, notifyJobFinished, isTestMode, getRealSendBlockedCount,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -746,4 +746,67 @@ test("marker present but not at its own line start: does not count as complete",
   server.close();
   assert.equal(readExitJson(dir).reportComplete, false);
   assert.match(requests[0].body.content, /^\[INCOMPLETE\] /);
+});
+
+// ---------------------------------------------------------------------------
+// 2026-10-18 test-isolation incident regression: fixture jobs minted by the test suites posted
+// real pings to Erick's #notifications channel because job-runner.mjs children inherit the
+// bridge's real CLAUDE_ASYNC_CONFIG_DIR/notify.json whenever a test forgets to isolate it.
+// Config-dir isolation (this suite's _setup.mjs) is the primary fix; these tests prove the
+// secondary guard in notifyJobFinished itself -- a real Discord webhook host, reached through the
+// DEFAULT network-capable fetch, is never sent while in test mode, by instrumenting the real send
+// path directly (monkey-patching globalThis.fetch as a zero-call spy) rather than trusting config
+// isolation alone.
+// ---------------------------------------------------------------------------
+
+test("real-send guard: a Discord-host webhook never reaches the real fetch in test mode; a fake sender still works", async () => {
+  assert.equal(isTestMode(), true, "this suite runs under CLAUDE_ASYNC_TEST=1 (see _setup.mjs)");
+  // Simulates exactly the incident shape: a test process that inherited a real-looking webhook
+  // (e.g. from the live ~/.claude-async/notify.json) rather than one isolated to a local server.
+  writeNotify({ discord: { webhookUrl: "https://discord.com/api/webhooks/123456789/fake-token-should-never-be-posted-to" } });
+
+  let realFetchCalls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (...args) => { realFetchCalls++; return realFetch(...args); };
+  const blockedBefore = getRealSendBlockedCount();
+  const logLines = [];
+  try {
+    await notifyJobFinished({
+      jobId: "test-mode-job", intent: null, host: "test-host", exitCode: 0, exitReason: "exit",
+      startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: [], outLogPath: null,
+      reportComplete: true, logLine: (m) => logLines.push(m),
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(realFetchCalls, 0, "the real, network-capable fetch must never be invoked");
+  assert.equal(getRealSendBlockedCount(), blockedBefore + 1, "the guard's counter must record exactly one blocked send");
+  assert.ok(logLines.some((l) => l.includes("blocked real Discord send")),
+    `expected a blocked-send log line, got: ${JSON.stringify(logLines)}`);
+
+  // The SAME real-looking Discord URL, but with an injected fake sender -- exactly what a test
+  // asserting notification content does. The guard must not interfere with that instrumentation.
+  const fakeSends = [];
+  await notifyJobFinished({
+    jobId: "test-mode-job-2", intent: null, host: "test-host", exitCode: 0, exitReason: "exit",
+    startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: ["Everything checks out."], outLogPath: null,
+    reportComplete: true, logLine: () => {},
+    fetchImpl: async (url, opts) => { fakeSends.push({ url, body: JSON.parse(opts.body) }); return { ok: true }; },
+  });
+  assert.equal(fakeSends.length, 1, "the fake sender must still receive the call");
+  assert.match(fakeSends[0].body.content, /^\[OK\] /);
+  assert.equal(realFetchCalls, 0, "injecting a fake sender must not somehow also trigger a real send");
+});
+
+test("real-send guard: a non-Discord host (a test's own local server) is unaffected by test mode", async () => {
+  assert.equal(isTestMode(), true);
+  const dir = prepareJob({ exitCode: 0, stdoutText: `Everything checks out.\n${METRICS_LINE}\n` });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
+  const blockedBefore = getRealSendBlockedCount();
+  await spawnRunner(dir);
+  server.close();
+  assert.equal(requests.length, 1, "a local test server must still receive the real-runner's default-fetch POST");
+  assert.equal(getRealSendBlockedCount(), blockedBefore, "a non-Discord host must never increment the blocked-send counter");
 });

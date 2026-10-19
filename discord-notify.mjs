@@ -43,6 +43,19 @@ export function notifyConfigPath() {
   return path.join(configDir(), "notify.json");
 }
 
+// See the 2026-10-18 incident comment on notifyJobFinished's real-send guard below for why these
+// exist: CLAUDE_ASYNC_TEST=1 is the explicit marker every test entry point sets; NODE_TEST_CONTEXT
+// is Node's own test-runner marker, honored as a second, no-setup-required signal.
+export function isTestMode() {
+  return process.env.CLAUDE_ASYNC_TEST === "1" || process.env.NODE_TEST_CONTEXT !== undefined;
+}
+let realSendBlockedCount = 0;
+export function getRealSendBlockedCount() { return realSendBlockedCount; }
+export function resetRealSendBlockedCount() { realSendBlockedCount = 0; }
+function isDiscordWebhookHost(url) {
+  try { return /(^|\.)discord(app)?\.com$/i.test(new URL(url).hostname); } catch { return false; }
+}
+
 // Returns { webhookUrl, includeHeadline } or null ("feature off"). Never throws.
 export function loadNotifyConfig() {
   let raw;
@@ -366,6 +379,21 @@ export async function notifyJobFinished({ jobId, intent, host, exitCode, exitRea
   let config;
   try { config = loadNotifyConfig(); } catch { return; }
   if (!config) return;
+
+  // 2026-10-18 test-isolation incident: fixture jobs minted by the test suites (j1-j4, job-t1b,
+  // job-intent1, ...) posted real pings to Erick's #notifications channel, because job-runner.mjs
+  // child processes inherit the bridge's real CLAUDE_ASYNC_CONFIG_DIR/notify.json whenever a test
+  // forgets to override it. Config-dir isolation in the test harness is the primary fix; this is
+  // the last-line-of-defense belt: in test mode (CLAUDE_ASYNC_TEST=1, or Node's own
+  // NODE_TEST_CONTEXT) a request aimed at a genuine discord.com webhook through the DEFAULT
+  // network-capable fetch is never sent. A test-injected fetchImpl (a fake sender) or a non-Discord
+  // URL (a test's own local HTTP server, as discord-notify.test.mjs's integration tests use) is
+  // unaffected -- this only blocks the one shape that would actually leave the machine for real.
+  if (isTestMode() && fetchImpl === fetch && isDiscordWebhookHost(config.webhookUrl)) {
+    realSendBlockedCount++;
+    try { logLine && logLine("discord notify: blocked real Discord send in test mode (CLAUDE_ASYNC_TEST)"); } catch {}
+    return;
+  }
 
   let completeness;
   try { completeness = loadCompletenessConfig(); } catch { completeness = { enforce: true }; }
