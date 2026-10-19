@@ -129,6 +129,43 @@ const WIN32_LAUNCH_MODE = (process.env.CLAUDE_ASYNC_WIN32_LAUNCH_MODE || "auto")
 // Empty MCP config: paired with --strict-mcp-config so detached jobs load ZERO MCP servers,
 // preventing a project .mcp.json from recursively respawning claude-async.
 const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty-mcp.json");
+// 2026-10-19 no-background enforcement: CLAUDE.md's "claude-async jobs never background work"
+// rule (added 2026-10-18) was still being ignored at the prompt level (an Agent launched with
+// run_in_background, a backgrounded `find` later killed at its time limit) -- this PreToolUse
+// hook enforces it mechanically instead. Scoped to claude-async job launches only via the
+// per-job --settings object below (buildNoBackgroundHookSettings()); never written to Erick's
+// own ~/.claude/settings.json, so interactive sessions are unaffected. See hooks/no-background-
+// hook.mjs's own header for the full contract and RUNBOOK.md for rollback.
+const NO_BACKGROUND_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "no-background-hook.mjs");
+const NO_BACKGROUND_HOOK_MATCHER = "Bash|PowerShell|Agent|Task|Monitor";
+
+// The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
+// path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
+// avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
+// accepts forward-slash paths natively, so this never needs real backslashes at all.
+function quotedPosixPath(p) {
+  return `"${p.replace(/\\/g, "/")}"`;
+}
+
+// Builds the --settings object every claude-async job launch gets (merged with any other
+// settings a job needs, e.g. ultracode below, into ONE --settings flag -- passing --settings
+// twice was observed to let the later flag silently win, which would otherwise drop whichever
+// of ultracode/hooks lost that race).
+function buildNoBackgroundHookSettings() {
+  return {
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: NO_BACKGROUND_HOOK_MATCHER,
+          hooks: [
+            { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
+          ],
+        },
+      ],
+    },
+  };
+}
+
 // Dispatch defaults: fail-SAFE, not fail-EXPENSIVE. An unspecified job used to inherit the
 // `claude` CLI's own default model (Fable) at xhigh effort — the priciest configuration
 // available — and that combination absorbed 99.6% of dispatch spend on 2026-07-23. Both
@@ -704,6 +741,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   argv.push("--model", resolvedModel);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
+  // Every claude-async job gets the no-background-hook settings; ultracode merges its own
+  // `ultracode: true` into the SAME object below rather than pushing a second --settings flag
+  // (two --settings flags were observed to let the later one win outright, silently dropping
+  // whichever of ultracode/hooks lost that race).
+  const settingsObj = buildNoBackgroundHookSettings();
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
     // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the
@@ -711,10 +753,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     argv.push("--effort", "xhigh");
     // STEP 1 confirmed `--settings '{"ultracode":true}'` surfaces the Workflow tool headlessly,
     // so use the settings mechanism (not the prompt-keyword fallback) to enable the composite.
-    argv.push("--settings", JSON.stringify({ ultracode: true }));
+    settingsObj.ultracode = true;
   } else if (FLAG_EFFORT.has(eff)) {
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
+  argv.push("--settings", JSON.stringify(settingsObj));
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
   // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: default the CLI's own background-task
