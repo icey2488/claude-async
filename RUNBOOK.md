@@ -9,13 +9,27 @@ Job state is durable on disk under `JOB_ROOT` (`CLAUDE_ASYNC_JOB_DIR`, default
 
 ## Restarting the bridge
 
+- **Use `tools\restart-bridge.ps1 -RequestedBy <job id or "manual">` to do the kill.** 2026-10-18:
+  several jobs restarted the bridge by finding its node.exe pid(s) and killing them ad hoc, with
+  nothing recording that the resulting outage was expected — claunker-ops's health-probe.ps1
+  posted BRIDGE DOWN/RECOVERED to Discord for every one of them. The script finds the live
+  `claude-async-server.mjs` pid(s) the same way the probe does, writes a one-line
+  `bridge-crash.log`-adjacent marker (`bridge-restart.marker`, next to `JOB_ROOT`) BEFORE killing
+  anything, then force-kills. The probe reads that marker and suppresses the DOWN/RECOVERED pair
+  for up to 10 minutes (`-PlannedRestartWindowMin`, default 10) after it — past that, it alerts
+  normally that a planned restart did not come back (Desktop did not respawn the bridge), since
+  that has genuinely happened before (73 min non-respawn on 2026-10-16). Run with `-WhatIf` first
+  to see which pid(s) it would kill without touching anything. A forceful kill gives the bridge
+  no chance to run its own `exitWith()` handler (see `claude-async-server.mjs`'s header), which is
+  exactly why the marker has to be written by the killer, not the bridge itself.
 - **Warm up first.** After restarting the bridge, fire a `claude_jobs` call once as a
   throwaway warmup **before** any `claude_start`. A cold start path can otherwise hang the
   full 4-minute wall on the first call.
 - **If `claude_start` still hangs the full 4 minutes after the warmup**, the previous bridge
-  process is probably still alive and squatting on the start path (a plain relaunch may not
-  have killed it). Force-close the old process in Task Manager, then warm up again. The
-  warmup clears a cold start path; it does **not** clear a stale process holding it.
+  process is probably still alive and squatting on the start path (`restart-bridge.ps1` may not
+  have killed it, or a new one started between the kill and the warmup). Re-run
+  `restart-bridge.ps1`, then warm up again. The warmup clears a cold start path; it does
+  **not** clear a stale process holding it.
 - **A job absent from the `claude_jobs` ledger after a restart never started** and is safe to
   re-fire — reusing the same `jobId` is fine.
 - **A `claude_start` that hangs the full 4 minutes means the server is unresponsive**, not
