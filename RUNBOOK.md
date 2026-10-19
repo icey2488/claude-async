@@ -126,51 +126,88 @@ with a `PreToolUse` hook instead.
 **Mechanism.** `job-core.mjs`'s `startJob()` builds a `--settings` JSON object for every job launch
 (`buildNoBackgroundHookSettings()`, merged with the existing `ultracode` settings into the SAME
 object — two `--settings` flags were observed to let the later one silently win) wiring a
-`PreToolUse` hook, matcher `Bash|PowerShell|Agent|Task|Monitor`, to
-`hooks/no-background-hook.mjs`. This is scoped to claude-async job launches only — it rides the
-argv `startJob()` builds for the detached `claude` CLI process, never touching Erick's own
-`~/.claude/settings.json`, so interactive sessions are completely unaffected.
+`PreToolUse` hook, matcher `"*"`, to `hooks/no-background-hook.mjs`. This is scoped to claude-async
+job launches only — it rides the argv `startJob()` builds for the detached `claude` CLI process,
+never touching Erick's own `~/.claude/settings.json`, so interactive sessions are completely
+unaffected.
+
+**Catch-all matcher (2026-10-19 follow-up).** The matcher was originally a hardcoded tool-name
+list (`Bash|PowerShell|Agent|Task|Monitor`): a renamed or newly-added background-capable tool
+would silently bypass the hook entirely, since an unmatched tool call never invokes the script at
+all (not fail-closed — just invisible). Switched to `"*"`, empirically confirmed on this machine's
+`claude.exe` 2.1.303 to invoke the hook for every tool call: a throwaway `--settings` with
+`matcher: "*"` pointed at a logging-only probe script fired for `Read` and `Glob` — two tools with
+no background-capable fields at all — proving `"*"` is not scoped to any tool list. (`"*"` was
+verified, not assumed; it is not documented in the public Claude Code docs for this build.) All
+tool-specific decisions now live inside `hooks/no-background-hook.mjs` itself (see its own header
+for the full decision order), which keeps the common case cheap: ~31.6ms/call average on this
+machine, measured over 300 direct invocations of the script via `spawnSync` (bypassing the CLI
+round-trip, so this isolates the script's own cost) — almost entirely node process startup, not
+the hook's own logic.
 
 **Decision logic** (`hooks/no-background-hook.mjs`, see its own header for the full contract,
 empirically verified against this machine's `claude.exe` 2.1.303 on 2026-10-19):
-- `Bash` / `PowerShell`: foreground is the default (field absent or `false`); `run_in_background:
-  true` is denied.
-- `Agent` / `Task`: the INVERSE default — confirmed live that omitting `run_in_background`
-  entirely still launches the subagent in the background. Only an explicit `run_in_background:
-  false` is allowed.
+- Any tool, known or not, with `tool_input.run_in_background === true`: denied. This is what makes
+  the catch-all matcher meaningful — a future tool with this field is covered without the script
+  needing to know its name.
 - `Monitor`: always denied — it is inherently a background/unattended mechanism with no foreground
   mode at all.
+- `Workflow`: gated by job **effort**, not by `run_in_background` (it has no such field — see
+  "Workflow gating" below).
+- `Agent` / `Task`: the INVERSE default from Bash/PowerShell — confirmed live that omitting
+  `run_in_background` entirely still launches the subagent in the background. Only an explicit
+  `run_in_background: false` is allowed.
+- Everything else (including `Bash`/`PowerShell` with the field absent/`false`, and any tool this
+  script doesn't specifically recognize): allowed, fast.
 - Malformed/unparseable hook input (bad JSON, missing `tool_name`/`tool_input`), or any exception
   in the script itself: denied (fail closed). The script never falls through to an implicit allow.
-- **Deliberately NOT denied: the `Workflow` tool.** It always runs in the background by design
-  (returns a task id immediately), but it's a separate, sanctioned, explicitly opt-in mechanism —
-  `startJob()`'s own `effort: "ultracode"` path turns it on via `--settings '{"ultracode":true}'`.
-  Denying it would break ultracode jobs; it isn't the "hand off and forget" pattern this hook
-  exists to stop.
+
+**Workflow gating (2026-10-19 follow-up).** The `Workflow` tool (the ultracode orchestration
+mechanism) was previously left completely unpoliced by this hook — deliberately, since it always
+runs in the background by design (returns a task id immediately) and denying it outright would
+break every ultracode job. But nothing stopped a non-ultracode job from invoking it too. Rule now:
+`Workflow` is allowed **only** for jobs launched with `effort: "ultracode"`; every other effort
+level gets a clear deny reason naming the job's actual effort. `job-core.mjs`'s `startJob()` is the
+only place that knows a job's effort authoritatively, so it passes it down rather than having the
+hook guess: `extraEnv.CLAUDE_ASYNC_JOB_EFFORT = eff` is set on the launched CLI process's own
+environment (same mechanism as `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` above), and the hook reads
+`process.env.CLAUDE_ASYNC_JOB_EFFORT` directly. Empirically confirmed on 2026-10-19 (via a
+throwaway `spawnSync` carrying a test env var through to a logging-only probe hook) that env vars
+set on the CLI's own `spawn()` env propagate down to the hook subprocesses the CLI spawns per tool
+call — the same inheritance chain the catch-all-matcher probe relied on.
 
 **Verifying it's live:** run a job (`claude_start`) whose prompt asks it to use `run_in_background:
-true` on `Bash`/`PowerShell`/`Agent` — `claude_check`'s `stdout`/`stderr` should show a
-`PreToolUse:<Tool> hook error: no-background-hook: ...` line, and the job should still finish
-normally (the denial does not fail the job, it just blocks that one tool call so the model has to
-redo it in the foreground). `test/no-background-hook.test.mjs` (`node --test
-test/no-background-hook.test.mjs`) unit-tests the script directly, feeding it crafted stdin; `test/
+true` on `Bash`/`PowerShell`/`Agent`, or to invoke `Workflow` at a non-`ultracode` effort —
+`claude_check`'s `stdout`/`stderr` should show a `PreToolUse:<Tool> hook error: no-background-hook:
+...` line, and the job should still finish normally (the denial does not fail the job, it just
+blocks that one tool call so the model has to redo it, or do the work directly, instead).
+`test/no-background-hook.test.mjs` (`node --test test/no-background-hook.test.mjs`) unit-tests the
+script directly, feeding it crafted stdin (and `CLAUDE_ASYNC_JOB_EFFORT` where relevant); `test/
 no-background-hook.e2e.mjs` (opt-in, `CLAUDE_ASYNC_RUN_LIVE_HOOK_E2E=1`, costs real model calls)
-launches two real jobs end to end and asserts the denial/allow behavior through the full
+launches real jobs end to end and asserts the denial/allow behavior through the full
 `startJob()`/`checkJob()` path.
 
 **Rollback:** delete the `settingsObj`/`buildNoBackgroundHookSettings()` wiring from `startJob()`
 in `job-core.mjs` (or just stop calling `buildNoBackgroundHookSettings()` and push
 `--settings` with only the `ultracode` object, as before), and no job will carry the hook anymore.
 `hooks/no-background-hook.mjs` can be left in place inert (nothing reaches it once no job's
-`--settings` points a matcher at it) or deleted. No scheduled task, bridge restart, or other shared
-state is involved — see "Mechanism" above.
+`--settings` points a matcher at it) or deleted. To roll back ONLY the Workflow gating while
+keeping everything else, delete the `WORKFLOW_TOOL` branch in `decide()` (hooks/no-background-
+hook.mjs) so `Workflow` falls through to the final `allow` again, and optionally stop setting
+`CLAUDE_ASYNC_JOB_EFFORT` in `job-core.mjs` (harmless to leave — nothing else reads it). No
+scheduled task, bridge restart, or other shared state is involved — see "Mechanism" above.
 
-**Maintenance note / known gap:** the matcher hardcodes today's known background-capable tool
-names. A future CLI version renaming one of these tools, or adding a new background-capable tool,
-would silently stop being covered (not fail closed, since the hook is simply never invoked for an
-unmatched tool name) until this matcher list is updated to match. There is no automated check for
-this drift; revisit the tool schema (the live CLI session's own tool definitions, or `claude
---help`) periodically, or if a future incident looks like this one.
+**Maintenance note / known gap (reduced, not eliminated, by the catch-all matcher):**
+`BACKGROUND_BY_DEFAULT_TOOLS` and `ALWAYS_BACKGROUND_TOOLS` in `hooks/no-background-hook.mjs` are
+still a maintained list of tool NAMES this script treats specially. The catch-all matcher
+guarantees the script is invoked for every tool, so a future subagent-launcher tool that sets
+`run_in_background: true` is still caught by the generic rule above even if this script has never
+heard of it — but a tool that defaults to background when the field is simply OMITTED (the way
+`Agent`/`Task` do today) needs this list updated by hand, since "what does an absent field mean
+for this specific tool" is a documented-default judgment call the script can't infer from the
+catch-all matcher alone. There is no automated check for this drift; revisit this list (and the
+tool schema — the live CLI session's own tool definitions, or `claude --help`) periodically, or if
+a future incident looks like this one.
 
 ## Gotchas
 

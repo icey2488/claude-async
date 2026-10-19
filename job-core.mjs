@@ -136,8 +136,17 @@ const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty
 // per-job --settings object below (buildNoBackgroundHookSettings()); never written to Erick's
 // own ~/.claude/settings.json, so interactive sessions are unaffected. See hooks/no-background-
 // hook.mjs's own header for the full contract and RUNBOOK.md for rollback.
+//
+// Matcher is catch-all ("*"), not a hardcoded tool-name list: empirically confirmed on this
+// machine's claude.exe 2.1.303 on 2026-10-19 (a wildcard-matched probe hook fired for Read and
+// Glob -- tools with no background-capable fields at all) that "*" invokes the hook for every
+// tool call. A hardcoded list meant a renamed/new background-capable tool would silently bypass
+// the hook entirely (unmatched calls never reach the script); the catch-all moves every
+// tool-specific decision into the script itself (see its header) and keeps it fail-closed for
+// malformed input while staying cheap for the common case (~31.6ms/call average over 300 direct
+// invocations, almost all node startup -- see RUNBOOK.md's benchmark note).
 const NO_BACKGROUND_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "no-background-hook.mjs");
-const NO_BACKGROUND_HOOK_MATCHER = "Bash|PowerShell|Agent|Task|Monitor";
+const NO_BACKGROUND_HOOK_MATCHER = "*";
 
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
@@ -760,6 +769,13 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   argv.push("--settings", JSON.stringify(settingsObj));
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
+  // CLAUDE_ASYNC_JOB_EFFORT: tells hooks/no-background-hook.mjs this job's effort level, so it
+  // can gate the Workflow tool to ultracode-effort jobs without guessing (job-core.mjs is the
+  // only place that knows `eff` authoritatively). Set on the launched CLI process's own
+  // environment, not embedded in the --settings hook command -- empirically confirmed on
+  // 2026-10-19 that env vars set here propagate down to the hook subprocess the CLI spawns per
+  // tool call (same inheritance chain as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS below).
+  extraEnv.CLAUDE_ASYNC_JOB_EFFORT = eff;
   // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: default the CLI's own background-task
   // wait ceiling to a finite BG_WAIT_CEILING_MS (see its definition above for why not 0) so a
   // job's background work (subagents handed off and the turn ended) finishes instead of being

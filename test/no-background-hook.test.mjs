@@ -10,19 +10,23 @@ import { fileURLToPath } from "node:url";
 
 const HOOK_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "hooks", "no-background-hook.mjs");
 
-function runHook(stdin) {
+function runHook(stdin, { jobEffort } = {}) {
+  const env = { ...process.env };
+  if (jobEffort === undefined) delete env.CLAUDE_ASYNC_JOB_EFFORT;
+  else env.CLAUDE_ASYNC_JOB_EFFORT = jobEffort;
   const res = spawnSync(process.execPath, [HOOK_SCRIPT], {
     input: typeof stdin === "string" ? stdin : JSON.stringify(stdin),
     encoding: "utf8",
     timeout: 5000,
+    env,
   });
   let parsed = null;
   try { parsed = JSON.parse(res.stdout); } catch { /* left null for malformed-output assertions */ }
   return { status: res.status, stdout: res.stdout, parsed };
 }
 
-function assertDenied(stdin) {
-  const { status, parsed } = runHook(stdin);
+function assertDenied(stdin, opts) {
+  const { status, parsed } = runHook(stdin, opts);
   assert.equal(status, 2, `expected exit 2 (deny), got ${status}; stdout=${JSON.stringify(parsed)}`);
   assert.ok(parsed, "deny response must be valid JSON");
   assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny");
@@ -30,8 +34,8 @@ function assertDenied(stdin) {
   assert.ok(parsed.hookSpecificOutput.permissionDecisionReason.length > 0);
 }
 
-function assertAllowed(stdin) {
-  const { status, parsed } = runHook(stdin);
+function assertAllowed(stdin, opts) {
+  const { status, parsed } = runHook(stdin, opts);
   assert.equal(status, 0, `expected exit 0 (allow), got ${status}; stdout=${JSON.stringify(parsed)}`);
   assert.ok(parsed, "allow response must be valid JSON");
   assert.equal(parsed.hookSpecificOutput.permissionDecision, "allow");
@@ -79,14 +83,42 @@ test("Monitor: denied even if caller tries run_in_background:false", () => {
   assertDenied({ tool_name: "Monitor", tool_input: { command: "tail -f x.log", description: "watch x", run_in_background: false } });
 });
 
-// --- Tools this hook doesn't police: allowed regardless of shape ---
+// --- Workflow: gated by job effort (CLAUDE_ASYNC_JOB_EFFORT), not by run_in_background ---
+
+test("Workflow: effort=ultracode -> allow", () => {
+  assertAllowed({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } }, { jobEffort: "ultracode" });
+});
+
+for (const eff of ["low", "medium", "high", "xhigh", "max"]) {
+  test(`Workflow: effort=${eff} -> deny`, () => {
+    assertDenied({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } }, { jobEffort: eff });
+  });
+}
+
+test("Workflow: CLAUDE_ASYNC_JOB_EFFORT unset -> deny (fail closed, not guessed)", () => {
+  assertDenied({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } });
+});
+
+test("Workflow: run_in_background:true still denies even at effort=ultracode (generic rule wins)", () => {
+  assertDenied({ tool_name: "Workflow", tool_input: { script: "x", run_in_background: true } }, { jobEffort: "ultracode" });
+});
+
+// --- Tools this hook doesn't specifically recognize: allowed, unless they ask for background ---
 
 test("unrelated tool (Read) -> allow", () => {
   assertAllowed({ tool_name: "Read", tool_input: { file_path: "C:/x" } });
 });
 
-test("unrelated tool (Workflow) -> allow (sanctioned background mechanism, out of scope)", () => {
-  assertAllowed({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } });
+test("unknown tool with run_in_background:true -> deny (generic rule, not a name lookup)", () => {
+  assertDenied({ tool_name: "SomeFutureTool", tool_input: { foo: "bar", run_in_background: true } });
+});
+
+test("unknown tool without run_in_background -> allow", () => {
+  assertAllowed({ tool_name: "SomeFutureTool", tool_input: { foo: "bar" } });
+});
+
+test("unknown tool with run_in_background:false -> allow", () => {
+  assertAllowed({ tool_name: "SomeFutureTool", tool_input: { foo: "bar", run_in_background: false } });
 });
 
 // --- Fail closed: malformed input must never fall through to allow ---
