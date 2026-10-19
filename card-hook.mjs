@@ -15,6 +15,7 @@
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
+import { classifyFinalStatus } from "./job-status.mjs";
 
 // Resolved at call time (os.homedir() honours USERPROFILE/HOME) so tests can point it at a
 // temp home.
@@ -185,13 +186,34 @@ export function failCard(cardId) {
 
 /**
  * Close the card on job finish. Fail-open: all errors are swallowed.
- * On exit 0 with HEAD moved from startHead, attaches a delivery artifact.
+ *
+ * Status comes from classifyFinalStatus(exitCode, exitRecord) -- the SAME rule job-core.mjs's
+ * checkJob() uses for claude_check's `status` field (see job-status.mjs), so a card's
+ * disposition can never disagree with what claude_check reports for the same run. exitRecord is
+ * job-runner.mjs's exit.json record (or undefined for callers that only have a raw exit code,
+ * e.g. existing tests predating exit.json -- classifyFinalStatus treats that the same as a
+ * record with no bg_tasks_terminated/reportComplete signal, i.e. exit 0 reads as "completed").
+ *
+ * jobcard.py (the only card API this hook has: create/done/fail/artifact, see the file header)
+ * exposes no third "needs attention" disposition, so "incomplete" maps to the same `fail` command
+ * as a real failure -- there is nothing else on the board to put it in. The one addition is a
+ * best-effort note (via the existing generic `artifact` command, kind "note") so the card at
+ * least distinguishes "never finished reporting" from "actually failed"; this is UNVERIFIED
+ * against the real jobcard.py (not available in this checkout) and fails open like everything
+ * else here, so a jobcard.py that rejects an unknown kind loses only the note, never the
+ * disposition itself (fail already ran first).
+ *
+ * On a completed exit with HEAD moved from startHead, attaches a delivery artifact.
  */
-export function closeCard(cardId, exitCode, workFolder, startHead) {
+export function closeCard(cardId, exitCode, workFolder, startHead, exitRecord) {
   if (!cardId) return;
-  const r = runJobcard([exitCode === 0 ? "done" : "fail", cardId]);
+  const status = classifyFinalStatus(exitCode, exitRecord);
+  const r = runJobcard([status === "completed" ? "done" : "fail", cardId]);
   if (!r.ok) return; // fail-open; nothing to do without a successful done/fail
-  if (exitCode === 0 && startHead) {
+  if (status === "incomplete") {
+    runJobcard(["artifact", cardId, "--kind", "note", "--ref", "incomplete: job exited without a final report"]);
+  }
+  if (status === "completed" && startHead) {
     const head = getGitHead(workFolder);
     if (head && head !== startHead) {
       runJobcard(["artifact", cardId, "--kind", "delivery", "--ref", head]);

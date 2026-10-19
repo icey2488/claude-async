@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { mintCard, failCard, boundIntent } from "./card-hook.mjs";
+import { classifyFinalStatus } from "./job-status.mjs";
 import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
@@ -768,20 +769,12 @@ export function checkJob(id, tailBytes = 8000) {
   if (fs.existsSync(p.exit)) {
     exitCode = parseInt(fs.readFileSync(p.exit, "utf8").trim(), 10);
     finishedAt = fs.statSync(p.exit).mtime.toISOString();
-    // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: an exit-0 run whose CLI was killed by
-    // its own background-task wait ceiling must never read as "completed" -- job-runner.mjs's
-    // recordExit() tags this case exitReason "bg_tasks_terminated" (see its BG_TASKS_TERMINATED_RE)
-    // regardless of exitCode; that overrides "completed" here the same way a nonzero exitCode always has.
-    // Failed always takes precedence over incomplete.
-    if (exitCode === 0 && exitRecord?.exitReason !== "bg_tasks_terminated") {
-      // 2026-10-18 claunker.bg-wait-agent-test-20261018-se7vmzea: an exit-0 run that never wrote
-      // its final-report marker (reportComplete:false) must not read as "completed" either -- it
-      // may have handed off to a background agent/task and ended its turn with the work still
-      // unfinished, and the CLI's own wait ceiling can exit it without ever coming back to report.
-      state = exitRecord?.reportComplete === false ? "incomplete" : "completed";
-    } else {
-      state = "failed";
-    }
+    // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f / claunker.bg-wait-agent-test-20261018-se7vmzea:
+    // an exit-0 run must not read as "completed" when the CLI was killed by its own background-task
+    // wait ceiling (exitReason "bg_tasks_terminated") or never wrote its final-report marker
+    // (reportComplete:false) -- see classifyFinalStatus's own header. card-hook.mjs's closeCard()
+    // reuses this exact rule so a card's done/fail disposition never disagrees with this status.
+    state = classifyFinalStatus(exitCode, exitRecord);
   } else {
     const lastAlive = readLastAlive(p.heartbeat);
     if (lastAlive === null) {

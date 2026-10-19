@@ -252,7 +252,7 @@ async function finish(code) {
     startedAt = m.startedAt || null;
     intent = m.intent || null;
   } catch {}
-  try { closeCard(cardId, code, cwd, startHead); } catch {}
+  try { closeCard(cardId, code, cwd, startHead, exitRecord); } catch {}
   // Discord ping: strictly best-effort and bounded (see discord-notify.mjs). Runs AFTER exit.json
   // and exit_code are both on disk, and is awaited (its own timeout bounds the wait) so the
   // process does not exit mid-request -- but nothing here can change `code` or any file already
