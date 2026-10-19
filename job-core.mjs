@@ -98,6 +98,29 @@ export const JOB_TIMEOUT_MS = Number(process.env.CLAUDE_ASYNC_JOB_TIMEOUT_MS) ||
 // while still well under JOB_TIMEOUT_MS's 4h, leaving headroom for the heartbeat ceiling to act
 // as the real outer backstop.
 export const BG_WAIT_CEILING_MS = Number(process.env.CLAUDE_ASYNC_BG_WAIT_CEILING_MS) || 2 * 60 * 60 * 1000; // 2h
+// 2026-10-19 auto-background gap (claunker.agents-md-seat-isolation-20261019-fbkk7h1a): the
+// no-background-hook (hooks/no-background-hook.mjs) only sees tool calls as the model writes
+// them -- it cannot stop the CLI's OWN behavior of moving a foreground Bash/PowerShell command
+// to the background on its own once that command outruns its timeout. That job's full-filesystem
+// `find` did exactly this: ran past its timeout, got auto-backgrounded, kept running unsupervised,
+// and was eventually killed "after reaching its background time limit" (confirmed string in
+// claude.exe 2.1.303's bundle, keyed "deadline" next to the sibling "memory_pressure" kill reason)
+// -- all while the job still exited 0 and read as "completed". CLAUDE_CODE_DISABLE_BACKGROUND_TASKS
+// (confirmed present in that same bundle, gating both explicit run_in_background and the
+// auto-background timeout clamp via the same internal check) removes the auto-background
+// pathway entirely: a command that outruns its timeout is then killed/interrupted directly,
+// a visible failure instead of a silent handoff. Set per-job below, NOT here as a default,
+// because it cannot be applied to ultracode-effort jobs -- the Workflow tool those jobs use
+// always runs via the same background mechanism by design (returns a task id immediately), and
+// this flag has no finer-grained "disable Bash auto-background but not Workflow" mode.
+// BASH_MAX_TIMEOUT_MS (also confirmed present in that bundle, feeding the Bash tool's own hard
+// timeout ceiling): raised here so disabling auto-backgrounding doesn't also mean genuinely slow
+// foreground commands get killed at the CLI's un-raised default ceiling. 20 minutes is well
+// under both BG_WAIT_CEILING_MS (2h) and JOB_TIMEOUT_MS (4h) above, leaving headroom for
+// everything else a job does, while covering most legitimately slow one-off commands (installs,
+// large scans) that used to silently auto-background instead of just running longer.
+export const JOB_BASH_MAX_TIMEOUT_MS =
+  Number(process.env.CLAUDE_ASYNC_BASH_MAX_TIMEOUT_MS) || 20 * 60 * 1000; // 20m
 const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(REPO_DIR, "job-runner.mjs");
 // win32-only: shells out through CreateProcessW(CREATE_BREAKAWAY_FROM_JOB) so job-runner.mjs
@@ -788,6 +811,24 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === undefined) {
     extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = String(BG_WAIT_CEILING_MS);
   }
+  // 2026-10-19 auto-background gap (see JOB_BASH_MAX_TIMEOUT_MS's definition above for the full
+  // story and citations). Every non-ultracode job gets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: a
+  // foreground Bash/PowerShell command that outruns its timeout is killed/interrupted visibly
+  // instead of silently handed to the CLI's own auto-background pathway. Skipped for ultracode
+  // because its Workflow tool is always-background by design (same flag would disable that too,
+  // and there is no finer-grained switch) -- the PreToolUse hook (hooks/no-background-hook.mjs)
+  // remains the only enforcement for ultracode jobs' own tool calls; the CLI-internal
+  // auto-background gap for bare shell commands stays open there, as a documented tradeoff.
+  // BASH_MAX_TIMEOUT_MS is raised for every job regardless of effort, so removing the
+  // auto-background clamp doesn't also mean slow-but-legitimate commands get killed sooner than
+  // before. Same ambient-override guard as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS above.
+  if (eff !== "ultracode" && process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS === undefined) {
+    extraEnv.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "1";
+  }
+  // BASH_MAX_TIMEOUT_MS isn't CLAUDE_*/ANTHROPIC_*-prefixed, so collectEnvOverrides() below never
+  // forwards an ambient value on its own -- set it explicitly here either way (ambient value wins
+  // when present) rather than only skipping like the CLAUDE_CODE_* vars above.
+  extraEnv.BASH_MAX_TIMEOUT_MS = process.env.BASH_MAX_TIMEOUT_MS ?? String(JOB_BASH_MAX_TIMEOUT_MS);
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
 

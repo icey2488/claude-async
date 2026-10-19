@@ -172,6 +172,31 @@ test("boundary: a log line straddles the 64 KiB tail cut point; tail has no part
   for (const l of exitRecord.stderrTail) assert.match(l, /^line \d{6}x*$/, `line must be clean, not a partial/garbled fragment: ${JSON.stringify(l)}`);
 });
 
+// 2026-10-19 auto-background gap (claunker.agents-md-seat-isolation-20261019-fbkk7h1a): a shell
+// command that outruns its timeout can be auto-backgrounded by the CLI itself, then later killed
+// for exceeding its background time limit, while the job still exits 0 as "exit"/"completed".
+// recordExit() must surface this as exit.json's additive `warnings` field (never change
+// exitReason/exitCode for it -- see job-runner.mjs's BASH_AUTO_BACKGROUND_KILLED_RE comment).
+test("auto-backgrounded command killed for exceeding its background time limit: exit.json gets a warning, exitReason/exitCode untouched", () => {
+  const { exitRecord } = fake("--stdout-raw",
+    "stopped after reaching its background time limit", "--exit", 0);
+  assert.equal(exitRecord.exitCode, 0);
+  assert.equal(exitRecord.exitReason, "exit");
+  assert.equal(exitRecord.warnings.length, 1);
+  assert.match(exitRecord.warnings[0], /auto-backgrounded/);
+});
+
+test("the same background-time-limit text in stderr is also caught", () => {
+  const { exitRecord } = fake("--stderr-raw",
+    "stopped after reaching its background time limit", "--exit", 0);
+  assert.equal(exitRecord.warnings.length, 1);
+});
+
+test("control: no warnings key at all when nothing matches", () => {
+  const { exitRecord } = fake("--exit", 0);
+  assert.equal("warnings" in exitRecord, false);
+});
+
 // card-hook.mjs's closeCard() only ever shells out to the jobcard command (CLAUNKER_JOBCARD_CMD,
 // pointed by _setup.mjs at "__no_such_jobcard_binary__" so this never reaches a real board/network)
 // and never writes meta.json itself -- job-core.mjs is meta.json's only writer. This test exercises
