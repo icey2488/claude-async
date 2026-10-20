@@ -158,12 +158,55 @@ const NO_BACKGROUND_HOOK_MATCHER = "*";
 const JOB_TOOL_GATE_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "job-tool-gate-hook.mjs");
 const JOB_TOOL_GATE_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_TOOL_GATE === "1";
 
+// Permission-mode change (design: D:\code\reviews\job-tool-gate-design-20261020.md, DO item 2):
+// --dangerously-skip-permissions (below) is Erick's own standing rule to never use, but every
+// claude-async job has hardcoded it anyway since unattended -p runs have no one to answer a
+// permission prompt. "--permission-mode dontAsk" is Claude Code's OWN designed headless mode --
+// it auto-denies anything that would otherwise prompt, while still honoring permissions.allow
+// matches, read-only Bash, and a PreToolUse hook's "allow" (confirmed against the current
+// Claude Code docs, 2026-10-20: https://code.claude.com/docs/en/permission-modes). INDEPENDENT
+// flag from JOB_TOOL_GATE_ENV_DEFAULT above -- Erick can flip either one without the other; this
+// one defaults OFF (jobs keep --dangerously-skip-permissions) until he decides otherwise.
+const SAFE_PERMISSIONS_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS === "1";
+
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
 // accepts forward-slash paths natively, so this never needs real backslashes at all.
 function quotedPosixPath(p) {
   return `"${p.replace(/\\/g, "/")}"`;
+}
+
+// Job-scoped permissions.allow/deny for --permission-mode dontAsk (SAFE_PERMISSIONS_ENV_DEFAULT
+// above). Sized to what tonight's jobs actually did (git, pytest, uv, node, PowerShell reads,
+// worktree ops, file edits) per the design doc's DO item 2 -- NOT a substitute for the
+// job-tool-gate hook's per-call review; the two are complementary layers (see the design doc's
+// rollout section). The deny list is deliberately the belt to the gate hook's suspenders: a
+// static deny rule can never be overridden by a PreToolUse hook's "allow" (confirmed against the
+// current permissions docs -- "deny rules... evaluated regardless of what a PreToolUse hook
+// returns"), so these hold even if the gate hook is disabled, missing, or buggy. `//` anchors at
+// the filesystem root so the rule holds regardless of which workFolder/worktree a job runs in.
+function buildSafePermissionsSettings() {
+  return {
+    permissions: {
+      allow: [
+        "Read", "Glob", "Grep", "WebSearch",
+        "Edit", "Write", "MultiEdit", "NotebookEdit",
+        "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
+        "Bash(git branch*)", "Bash(git rev-parse*)", "Bash(git remote*)", "Bash(git describe*)",
+        "Bash(git add *)", "Bash(git commit *)", "Bash(git checkout *)", "Bash(git worktree *)",
+        "Bash(pytest *)", "Bash(uv *)", "Bash(npm *)", "Bash(node *)", "Bash(python *)",
+        "PowerShell(Get-ChildItem *)", "PowerShell(Get-Content *)", "PowerShell(Get-Item *)",
+      ],
+      deny: [
+        "Bash(git push *)", "Bash(git merge *)", "Bash(git rebase *)", "Bash(git reset --hard *)",
+        "Bash(git clean -f*)",
+        "Edit(//**/CLAUDE.md)", "Edit(//**/hooks/**)", "Edit(//**/.claude/settings*.json)",
+        "Edit(//**/config.yaml)", "Edit(//**/scheduled-tasks/**)",
+        "Read(//**/.env)", "Read(//**/.ssh/**)",
+      ],
+    },
+  };
 }
 
 // Builds the --settings object every claude-async job launch gets (merged with any other
@@ -765,7 +808,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   });
   if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
 
-  const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
+  const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
+  const argv = ["-p", prompt, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
+  argv.push(...(safePermissionsEnabled ? ["--permission-mode", "dontAsk"] : ["--dangerously-skip-permissions"]));
   const resolvedModel = model || DEFAULT_MODEL;
   argv.push("--model", resolvedModel);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
@@ -776,6 +821,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // whichever of ultracode/hooks lost that race).
   const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
   const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled });
+  if (safePermissionsEnabled) Object.assign(settingsObj, buildSafePermissionsSettings());
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
     // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the

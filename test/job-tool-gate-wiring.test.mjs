@@ -43,7 +43,7 @@ test("toolGate omitted (default off): no second hook, no gate env vars", async (
   const capture = [];
   const res = await startJob(
     { prompt: "hi", workFolder: WORK_FOLDER, jobId: `wiring-off-${crypto.randomBytes(3).toString("hex")}` },
-    { claudeBin: process.execPath, launch: fakeLaunch(capture) },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 } },
   );
   assert.ok(!res.error, JSON.stringify(res));
   assert.equal(capture.length, 1);
@@ -56,7 +56,7 @@ test("toolGate: true adds the second hook and forwards CLAUDE_ASYNC_GATE_REPO", 
   const capture = [];
   const res = await startJob(
     { prompt: "hi", workFolder: WORK_FOLDER, jobId: `wiring-on-${crypto.randomBytes(3).toString("hex")}` },
-    { claudeBin: process.execPath, launch: fakeLaunch(capture), toolGate: true, gateRepo: "D:\\fake\\claunker-hermes" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, toolGate: true, gateRepo: "D:\\fake\\claunker-hermes" },
   );
   assert.ok(!res.error, JSON.stringify(res));
   const settings = settingsFromArgv(capture[0].argv);
@@ -72,7 +72,7 @@ test("toolGate: true with no gateRepo available still wires the hook (fail-close
   try {
     const res = await startJob(
       { prompt: "hi", workFolder: WORK_FOLDER, jobId: `wiring-on-norepo-${crypto.randomBytes(3).toString("hex")}` },
-      { claudeBin: process.execPath, launch: fakeLaunch(capture), toolGate: true },
+      { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, toolGate: true },
     );
     assert.ok(!res.error, JSON.stringify(res));
     const settings = settingsFromArgv(capture[0].argv);
@@ -87,9 +87,52 @@ test("toolGate: false explicitly behaves the same as omitted", async () => {
   const capture = [];
   const res = await startJob(
     { prompt: "hi", workFolder: WORK_FOLDER, jobId: `wiring-false-${crypto.randomBytes(3).toString("hex")}` },
-    { claudeBin: process.execPath, launch: fakeLaunch(capture), toolGate: false },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, toolGate: false },
   );
   assert.ok(!res.error, JSON.stringify(res));
   const settings = settingsFromArgv(capture[0].argv);
   assert.equal(settings.hooks.PreToolUse[0].hooks.length, 1);
+});
+
+// --- Permission-mode flag: independent of toolGate, default off ---
+
+test("safePermissions omitted (default off): keeps --dangerously-skip-permissions, no permissions block", async () => {
+  const capture = [];
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: `perm-off-${crypto.randomBytes(3).toString("hex")}` },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 } },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  assert.ok(capture[0].argv.includes("--dangerously-skip-permissions"));
+  assert.ok(!capture[0].argv.includes("--permission-mode"));
+  const settings = settingsFromArgv(capture[0].argv);
+  assert.ok(!("permissions" in settings));
+});
+
+test("safePermissions: true switches to --permission-mode dontAsk with an allow/deny list", async () => {
+  const capture = [];
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: `perm-on-${crypto.randomBytes(3).toString("hex")}` },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: true },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  assert.ok(!capture[0].argv.includes("--dangerously-skip-permissions"));
+  const i = capture[0].argv.indexOf("--permission-mode");
+  assert.ok(i !== -1);
+  assert.equal(capture[0].argv[i + 1], "dontAsk");
+  const settings = settingsFromArgv(capture[0].argv);
+  assert.ok(Array.isArray(settings.permissions.allow) && settings.permissions.allow.length > 0);
+  assert.ok(settings.permissions.deny.includes("Bash(git push *)"));
+});
+
+test("safePermissions and toolGate are independent: either can be on without the other", async () => {
+  const capture = [];
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: `perm-only-${crypto.randomBytes(3).toString("hex")}` },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: true, toolGate: false },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  const settings = settingsFromArgv(capture[0].argv);
+  assert.ok("permissions" in settings, "permission-mode change applied");
+  assert.equal(settings.hooks.PreToolUse[0].hooks.length, 1, "gate hook stayed off");
 });
