@@ -356,6 +356,12 @@ The host list is no longer hard-coded: `hosts.json` is the registry (schema and 
   through host-api came back `cardId: null` with `UNCARDED: spawnSync ... ENOENT` (through 2026-09-28): host-api
   fell back to the default `~/code/claunker-hermes`, which does not exist on Claunker (the code is at
   `D:\code\claunker-hermes`).
+- **Default repointed to the prod checkout (2026-10-19, spine prod-checkout cutover).** `jobcard.py` now lives at
+  `D:\claunker\spine` (the prod checkout, branch `prod/spine`), not the dev checkout `D:\code\claunker-hermes` — the
+  dev checkout's `spine.db`/`.env.spine-token` were moved out and renamed during the cutover, so running `jobcard.py`
+  from there would silently miss the live board. `card-hook.mjs`'s default now resolves `$CLAUNKER_HERMES_HOME` if
+  set, else `D:\claunker\spine`. `CLAUNKER_JOBCARD_CMD` (below) still works as an explicit override of the whole
+  command and takes priority over the default either way.
 - **Set it at USER scope on a receiver**, so both `ClaudeAsyncHostApi` (mint) and `ClaudeAsyncRunner` (close)
   inherit it. `CLAUNKER_*` is not in the env the bridge forwards to the runner (only `CLAUDE_*`/`ANTHROPIC_*`), so
   the runner has to get it from the user environment too. Use the JSON-array form and set it from PowerShell, not
