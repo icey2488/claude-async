@@ -4,7 +4,9 @@
  * Fail-open by design: jobcard errors are returned as { error }, never thrown.
  *
  * Env: CLAUNKER_JOBCARD_CMD — space-split command override; default resolves
- * to the known claunker-hermes venv at ~/code/claunker-hermes.
+ * to the known jobcard checkout, $CLAUNKER_HERMES_HOME if set, else the prod
+ * checkout at D:\claunker\spine (prod-checkout cutover, 2026-10-19 -- jobcard.py
+ * now lives there, not the dev checkout at D:\code\claunker-hermes).
  *
  * Quiet mode: when CLAUNKER_JOBCARD_CMD is NOT set and the default executable does not
  * exist (spawn ENOENT), this host simply has no card command. Minting is skipped with one
@@ -13,14 +15,15 @@
  * non-zero exit; timeout) is a real misconfiguration and still surfaces as an error.
  */
 import { spawnSync } from "node:child_process";
-import os from "node:os";
 import path from "node:path";
 import { classifyFinalStatus } from "./job-status.mjs";
 
-// Resolved at call time (os.homedir() honours USERPROFILE/HOME) so tests can point it at a
-// temp home.
+const DEFAULT_HERMES_HOME = "D:\\claunker\\spine";
+
+// Resolved at call time (CLAUNKER_HERMES_HOME overrides the prod checkout path) so
+// tests can point it at a temp directory.
 function defaultJobcard() {
-  const hermes = path.join(os.homedir(), "code", "claunker-hermes");
+  const hermes = process.env.CLAUNKER_HERMES_HOME || DEFAULT_HERMES_HOME;
   const python = process.platform === "win32"
     ? path.join(hermes, ".venv", "Scripts", "python.exe")
     : path.join(hermes, ".venv", "bin", "python");

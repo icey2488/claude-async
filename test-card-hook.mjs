@@ -332,8 +332,8 @@ await test("UNCARDED: startJob still dispatches when jobcard errors (note prefix
 });
 
 // ─── Test 6: quiet mode, default command absent vs. explicit misconfiguration ─
-// The default command lives under os.homedir(), so point USERPROFILE/HOME at an empty temp
-// home to guarantee it is missing regardless of the machine running the tests.
+// The default command lives under $CLAUNKER_HERMES_HOME, so point it at an empty
+// temp dir to guarantee it is missing regardless of the machine running the tests.
 
 // This file starts more jobs than the default 6-per-minute cap allows; lift it for these.
 const TEST_CAPS = { maxConcurrent: 100, maxStartsPerMinute: 100 };
@@ -341,15 +341,13 @@ const EMPTY_HOME = path.join(TMP, "empty-home");
 fs.mkdirSync(EMPTY_HOME, { recursive: true });
 
 async function withJobcardEnv(cmd, fn) {
-  const saved = { cmd: process.env.CLAUNKER_JOBCARD_CMD, up: process.env.USERPROFILE, home: process.env.HOME };
+  const saved = { cmd: process.env.CLAUNKER_JOBCARD_CMD, home: process.env.CLAUNKER_HERMES_HOME };
   if (cmd === undefined) delete process.env.CLAUNKER_JOBCARD_CMD; else process.env.CLAUNKER_JOBCARD_CMD = cmd;
-  process.env.USERPROFILE = EMPTY_HOME;
-  process.env.HOME = EMPTY_HOME;
+  process.env.CLAUNKER_HERMES_HOME = EMPTY_HOME;
   try { return await fn(); }
   finally {
     process.env.CLAUNKER_JOBCARD_CMD = saved.cmd;
-    if (saved.up === undefined) delete process.env.USERPROFILE; else process.env.USERPROFILE = saved.up;
-    if (saved.home === undefined) delete process.env.HOME; else process.env.HOME = saved.home;
+    if (saved.home === undefined) delete process.env.CLAUNKER_HERMES_HOME; else process.env.CLAUNKER_HERMES_HOME = saved.home;
   }
 }
 
