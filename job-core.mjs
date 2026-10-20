@@ -148,6 +148,16 @@ const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty
 const NO_BACKGROUND_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "no-background-hook.mjs");
 const NO_BACKGROUND_HOOK_MATCHER = "*";
 
+// job-tool-gate (design: D:\code\reviews\job-tool-gate-design-20261020.md): routes a job's
+// Claude Code tool calls through claunker-hermes's classifier/dispatcher. DEFAULT OFF --
+// CLAUDE_ASYNC_JOB_TOOL_GATE must be exactly "1" (or opts.toolGate passed explicitly, for tests)
+// to wire this hook in at all; the no-background-hook above is unaffected either way, since this
+// is an ADDITIONAL hook command appended to the SAME catch-all matcher, never a replacement.
+// Same matcher ("*") as the no-background-hook for the same reason documented there: a
+// hardcoded tool-name list would let a renamed/new tool bypass the hook unnoticed.
+const JOB_TOOL_GATE_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "job-tool-gate-hook.mjs");
+const JOB_TOOL_GATE_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_TOOL_GATE === "1";
+
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
@@ -160,15 +170,25 @@ function quotedPosixPath(p) {
 // settings a job needs, e.g. ultracode below, into ONE --settings flag -- passing --settings
 // twice was observed to let the later flag silently win, which would otherwise drop whichever
 // of ultracode/hooks lost that race).
-function buildNoBackgroundHookSettings() {
+function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT } = {}) {
+  const preToolUseHooks = [
+    { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
+  ];
+  if (toolGate) {
+    // Additive, not a replacement: both hooks run for every PreToolUse call. A gate subprocess
+    // timeout (CLAUDE_ASYNC_GATE_TIMEOUT_MS, default 8s in the hook itself) is generous relative
+    // to this 10s outer hook timeout, which exists only to stop a truly wedged subprocess from
+    // hanging the job forever -- the hook's own timeout is expected to fire first in that case.
+    preToolUseHooks.push(
+      { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(JOB_TOOL_GATE_HOOK_SCRIPT)}`, timeout: 10 },
+    );
+  }
   return {
     hooks: {
       PreToolUse: [
         {
           matcher: NO_BACKGROUND_HOOK_MATCHER,
-          hooks: [
-            { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
-          ],
+          hooks: preToolUseHooks,
         },
       ],
     },
@@ -754,7 +774,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // `ultracode: true` into the SAME object below rather than pushing a second --settings flag
   // (two --settings flags were observed to let the later one win outright, silently dropping
   // whichever of ultracode/hooks lost that race).
-  const settingsObj = buildNoBackgroundHookSettings();
+  const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
+  const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled });
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
     // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the
@@ -776,6 +797,20 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // 2026-10-19 that env vars set here propagate down to the hook subprocess the CLI spawns per
   // tool call (same inheritance chain as CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS below).
   extraEnv.CLAUDE_ASYNC_JOB_EFFORT = eff;
+  // job-tool-gate env passthrough (only set when the gate is actually wired in above, so a
+  // disabled gate leaves the launched process's env byte-identical to today's): the hook
+  // (hooks/job-tool-gate-hook.mjs) reads these to find and call the claunker-hermes gate
+  // subprocess. CLAUDE_ASYNC_GATE_REPO has no safe default -- there is no claunker-hermes
+  // checkout path this repo can assume exists -- so it must come from opts.gateRepo or the
+  // env var; an operator enabling CLAUDE_ASYNC_JOB_TOOL_GATE without also setting
+  // CLAUDE_ASYNC_GATE_REPO gets a hook that denies every tool call (fail-closed, loudly, not a
+  // silent no-op) rather than one that never engages at all.
+  if (toolGateEnabled) {
+    const gateRepo = opts.gateRepo || process.env.CLAUDE_ASYNC_GATE_REPO;
+    if (gateRepo) extraEnv.CLAUDE_ASYNC_GATE_REPO = gateRepo;
+    if (process.env.CLAUDE_ASYNC_GATE_PYTHON) extraEnv.CLAUDE_ASYNC_GATE_PYTHON = process.env.CLAUDE_ASYNC_GATE_PYTHON;
+    if (process.env.CLAUDE_ASYNC_GATE_TIMEOUT_MS) extraEnv.CLAUDE_ASYNC_GATE_TIMEOUT_MS = process.env.CLAUDE_ASYNC_GATE_TIMEOUT_MS;
+  }
   // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: default the CLI's own background-task
   // wait ceiling to a finite BG_WAIT_CEILING_MS (see its definition above for why not 0) so a
   // job's background work (subagents handed off and the turn ended) finishes instead of being
