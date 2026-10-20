@@ -193,6 +193,20 @@ let exitInfo = { exitCode: null, exitSignal: null, exitReason: "exit" };
 // exitReason value it produces ("bg_tasks_terminated") rather than re-matching the string.
 const BG_TASKS_TERMINATED_RE = /Background tasks still running after \d+s; terminating/;
 
+// 2026-10-19 auto-background gap (claunker.agents-md-seat-isolation-20261019-fbkk7h1a, see
+// job-core.mjs's JOB_BASH_MAX_TIMEOUT_MS comment for the full story). job-core.mjs now sets
+// CLAUDE_CODE_DISABLE_BACKGROUND_TASKS for non-ultracode jobs so this should no longer happen
+// going forward, but ultracode jobs are exempted (Workflow needs background) and an operator
+// could still override the ambient env back on -- so this stays as a visible trip-wire rather
+// than silent. Matches the one CLI-emitted string confirmed in claude.exe 2.1.303's bundle for a
+// backgrounded command being killed for running too long: a small "friendly messages" dictionary
+// keyed by kill reason, with "deadline" (as opposed to the sibling "memory_pressure" reason)
+// mapped to exactly this text. Checked against BOTH tails: this job's argv runs `-p` in plain-text
+// mode (no --output-format stream-json), so the only way this string could reach disk at all is
+// if the model's own reply quotes/paraphrases a tool result that carried it -- there is no
+// guarantee it does, which is why this is a best-effort warning, not a status change.
+const BASH_AUTO_BACKGROUND_KILLED_RE = /stopped after reaching its background time limit/;
+
 // Best-effort: a runner that cannot record must still finish normally.
 function recordExit() {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
@@ -206,6 +220,13 @@ function recordExit() {
   const exitReason = exitInfo.exitReason === "exit" && BG_TASKS_TERMINATED_RE.test(stderrTail.join("\n"))
     ? "bg_tasks_terminated"
     : exitInfo.exitReason;
+  const combinedTail = `${stdoutTail.join("\n")}\n${stderrTail.join("\n")}`;
+  const warnings = [];
+  if (BASH_AUTO_BACKGROUND_KILLED_RE.test(combinedTail)) {
+    warnings.push("a shell command appears to have been auto-backgrounded by the CLI and then " +
+      "killed for exceeding its background time limit; any result it was meant to produce may be " +
+      "missing even though the job exited normally");
+  }
   const record = {
     exitCode: exitInfo.exitCode,
     exitSignal: exitInfo.exitSignal,
@@ -217,6 +238,7 @@ function recordExit() {
     // one), so this is deliberately unknown rather than a guessed regex.
     usageLimitSuspected: null,
     reportComplete: hasCompletenessMarker(stdoutTail, completeness.markerRegex),
+    ...(warnings.length ? { warnings } : {}),
   };
   if (exitInfo.spawnError !== undefined) record.spawnError = exitInfo.spawnError;
   try { writeJsonAtomic(exitPath, record); }

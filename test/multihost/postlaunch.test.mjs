@@ -129,6 +129,83 @@ test("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS: an existing ambient value is preserv
 });
 
 // ---------------------------------------------------------------------------------------------
+// 2026-10-19 auto-background gap (claunker.agents-md-seat-isolation-20261019-fbkk7h1a): the
+// no-background-hook only sees tool calls as written -- it cannot stop the CLI's own behavior of
+// auto-backgrounding a foreground Bash/PowerShell command once it outruns its timeout. Every
+// non-ultracode job's env gets CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 (removes the auto-background
+// pathway entirely -- a timed-out command is killed/interrupted visibly instead) and a raised
+// BASH_MAX_TIMEOUT_MS (JOB_BASH_MAX_TIMEOUT_MS, 20m) so that removal doesn't also mean slow-but-
+// legitimate commands get killed sooner than before. ultracode is exempted from the first because
+// its Workflow tool is always-background by design and shares the same flag.
+// ---------------------------------------------------------------------------------------------
+
+test("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1 is set in the launch ticket's env by default", async () => {
+  const prior = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  try {
+    const r = await startWith("no-bg-default", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("no-bg-default").envOverrides.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, "1");
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = prior;
+  }
+});
+
+test("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: an existing ambient value is preserved, not overridden", async () => {
+  const prior = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = "0";
+  try {
+    const r = await startWith("no-bg-preset", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("no-bg-preset").envOverrides.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, "0");
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = prior;
+  }
+});
+
+test("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: NOT set for an ultracode-effort job (Workflow needs background)", async () => {
+  const prior = process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+  try {
+    const r = await core.startJob({ prompt: "p", jobId: "no-bg-ultracode", effort: "ultracode" },
+      { launch: fakeLaunch, caps: BIG_CAPS });
+    assert.equal(r.error, undefined);
+    assert.equal("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" in readTicket("no-bg-ultracode").envOverrides, false);
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS;
+    else process.env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = prior;
+  }
+});
+
+test("BASH_MAX_TIMEOUT_MS=1200000 is set in the launch ticket's env by default", async () => {
+  const prior = process.env.BASH_MAX_TIMEOUT_MS;
+  delete process.env.BASH_MAX_TIMEOUT_MS;
+  try {
+    const r = await startWith("bash-timeout-default", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("bash-timeout-default").envOverrides.BASH_MAX_TIMEOUT_MS, "1200000");
+  } finally {
+    if (prior === undefined) delete process.env.BASH_MAX_TIMEOUT_MS;
+    else process.env.BASH_MAX_TIMEOUT_MS = prior;
+  }
+});
+
+test("BASH_MAX_TIMEOUT_MS: an existing ambient value is preserved, not overridden", async () => {
+  const prior = process.env.BASH_MAX_TIMEOUT_MS;
+  process.env.BASH_MAX_TIMEOUT_MS = "300000";
+  try {
+    const r = await startWith("bash-timeout-preset", undefined);
+    assert.equal(r.error, undefined);
+    assert.equal(readTicket("bash-timeout-preset").envOverrides.BASH_MAX_TIMEOUT_MS, "300000");
+  } finally {
+    if (prior === undefined) delete process.env.BASH_MAX_TIMEOUT_MS;
+    else process.env.BASH_MAX_TIMEOUT_MS = prior;
+  }
+});
+
+// ---------------------------------------------------------------------------------------------
 // Launch ticket write failure -> breakaway fallback (never schtasks: every task step is stubbed)
 // ---------------------------------------------------------------------------------------------
 

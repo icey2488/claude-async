@@ -10,6 +10,9 @@
 // reproduce the real CLI's own diagnostic lines (e.g. its background-task wait ceiling message)
 // exactly, rather than approximating them with the synthetic "err line N" format above.
 //
+// --stdout-raw TEXT is the same, but for stdout -- used to reproduce text that would reach the
+// job's transcript (stdout in -p plain-text mode) rather than the runner's own diagnostics.
+//
 // --stderr-numbered N writes N FIXED-WIDTH lines "line 000001\n" .. "line NNNNNN\n" (each exactly
 // 12 bytes) to stderr instead. Fixed width makes the total byte count exactly predictable, which
 // lets a test generate a large log cheaply/deterministically (see the "large stderr" test).
@@ -38,6 +41,7 @@ const numbered = Number(opt("stderr-numbered", 0));
 const fixedCount = Number(opt("stderr-fixed", 0));
 const fixedWidth = Number(optAt("stderr-fixed", 1, 0));
 const raw = opt("stderr-raw", null);
+const stdoutRaw = opt("stdout-raw", null);
 const code = Number(opt("exit", 0));
 const signal = opt("signal", null);
 
@@ -51,6 +55,7 @@ for (let i = 1; i <= fixedCount; i++) {
 if (raw !== null) err += `${raw}\n`;
 let out = "";
 for (let i = 1; i <= m; i++) out += `out line ${i}\n`;
+if (stdoutRaw !== null) out += `${stdoutRaw}\n`;
 process.stdout.write(out, () => process.stderr.write(err, () => {
   if (signal) {
     setInterval(() => {}, 1000); // stay alive until the signal lands
