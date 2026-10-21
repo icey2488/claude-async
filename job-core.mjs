@@ -192,6 +192,24 @@ const JOB_TOOL_GATE_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_TOOL_GATE === "1"
 // one defaults OFF (jobs keep --dangerously-skip-permissions) until he decides otherwise.
 const SAFE_PERMISSIONS_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS === "1";
 
+// Per-job HERMES_HOME isolation (D:\code\reviews\ledger-timeout-hermeshome-provlog-20261020.md).
+// claunker-hermes's seat_common.provenance.provenance_log_path() resolves its log path off
+// HERMES_HOME (falling back to LOCALAPPDATA, then a path next to seat_common/ itself) with no
+// override parameter at any of its three call sites. This workstation's bridge process inherits
+// HERMES_HOME=D:\claunker\hermes -- the LIVE chassis -- so a job whose prompt imports judge_seat
+// or arbiter_seat code outside pytest (pytest has its own fixture-based isolation; a bare script/
+// REPL import does not) would inherit that live value and write straight into the live
+// judge_provenance.jsonl. Jobs are never allowed to modify the live chassis (CLAUDE.md), so a job
+// must not inherit HERMES_HOME at all by default. DEFAULT ON; CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION
+// must be exactly "0" to opt out (same "0" is literally off, anything else is on" convention
+// as the job-tool-gate and no-auto-background flags use elsewhere in this file).
+//
+// LOCALAPPDATA is deliberately left untouched: provenance_log_path()'s fallback builds
+// "<LOCALAPPDATA>\hermes\logs\judge_provenance.jsonl", a path distinct from the live chassis
+// (D:\claunker\hermes\logs\judge_provenance.jsonl) on this workstation -- inheriting the real
+// LOCALAPPDATA is not itself a live-chassis hazard, only HERMES_HOME pointing there directly is.
+const JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION !== "0";
+
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
@@ -236,7 +254,7 @@ function buildSafePermissionsSettings() {
 // settings a job needs, e.g. ultracode below, into ONE --settings flag -- passing --settings
 // twice was observed to let the later flag silently win, which would otherwise drop whichever
 // of ultracode/hooks lost that race).
-function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT } = {}) {
+function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT, liveHermesHome = null } = {}) {
   const preToolUseHooks = [
     { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
   ];
@@ -245,9 +263,21 @@ function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT } 
     // timeout (CLAUDE_ASYNC_GATE_TIMEOUT_MS, default 8s in the hook itself) is generous relative
     // to this 10s outer hook timeout, which exists only to stop a truly wedged subprocess from
     // hanging the job forever -- the hook's own timeout is expected to fire first in that case.
-    preToolUseHooks.push(
-      { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(JOB_TOOL_GATE_HOOK_SCRIPT)}`, timeout: 10 },
-    );
+    //
+    // HERMES_HOME override: job-tool-gate-hook.mjs's own env (and the gate subprocess it spawns,
+    // which inherits process.env verbatim -- see that file's runGate()) would otherwise inherit
+    // whatever HERMES_HOME the launched job process has, which per JOB_HERMES_HOME_ISOLATION_
+    // ENV_DEFAULT above defaults to the job's own tmp dir, NOT the live chassis. This hook is real
+    // enforcement (routes tool calls through claunker-hermes's classifier/dispatcher), so its
+    // provenance SHOULD land in the live log, same as any other live dispatch decision -- the
+    // `set` prefix below forces HERMES_HOME back to the live value for this ONE hook's own
+    // subprocess, baked in as a literal value (not a %VAR% expansion) so it is correct even if
+    // CLAUNKER_LIVE_HERMES_HOME is unset in a given job's env. A no-op (prefix omitted entirely)
+    // when there is no live value to restore.
+    const gateCommand = liveHermesHome
+      ? `set "HERMES_HOME=${liveHermesHome}" && ${quotedPosixPath(process.execPath)} ${quotedPosixPath(JOB_TOOL_GATE_HOOK_SCRIPT)}`
+      : `${quotedPosixPath(process.execPath)} ${quotedPosixPath(JOB_TOOL_GATE_HOOK_SCRIPT)}`;
+    preToolUseHooks.push({ type: "command", command: gateCommand, timeout: 10 });
   }
   return {
     hooks: {
@@ -831,6 +861,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   });
   if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
 
+  // Per-job HERMES_HOME isolation (see JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT above). Computed
+  // here, before --settings is built below, because the job-tool-gate hook's command string
+  // needs the LIVE value baked in at build time (see buildNoBackgroundHookSettings).
+  const liveHermesHome = process.env.HERMES_HOME || null;
+  const hermesHomeIsolationEnabled = opts.hermesHomeIsolation !== undefined
+    ? Boolean(opts.hermesHomeIsolation) : JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT;
+  const jobHermesHome = hermesHomeIsolationEnabled ? path.join(p.d, "hermes_home") : null;
+  if (jobHermesHome) fs.mkdirSync(jobHermesHome, { recursive: true });
+
   const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
   const argv = ["-p", prompt, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   argv.push(...(safePermissionsEnabled ? ["--permission-mode", "dontAsk"] : ["--dangerously-skip-permissions"]));
@@ -843,7 +882,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // (two --settings flags were observed to let the later one win outright, silently dropping
   // whichever of ultracode/hooks lost that race).
   const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
-  const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled });
+  const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled, liveHermesHome });
   if (safePermissionsEnabled) Object.assign(settingsObj, buildSafePermissionsSettings());
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
@@ -910,6 +949,16 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // forwards an ambient value on its own -- set it explicitly here either way (ambient value wins
   // when present) rather than only skipping like the CLAUDE_CODE_* vars above.
   extraEnv.BASH_MAX_TIMEOUT_MS = process.env.BASH_MAX_TIMEOUT_MS ?? String(JOB_BASH_MAX_TIMEOUT_MS);
+  // Per-job HERMES_HOME isolation (see JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT above). The live
+  // value is always forwarded (when one exists) as CLAUNKER_LIVE_HERMES_HOME regardless of
+  // whether isolation itself is on, so a job can still find the real chassis read-only if its
+  // prompt legitimately needs to, and so "opt-out leaves it unchanged" is externally observable.
+  // HERMES_HOME itself is only overridden to the job's own tmp dir when isolation is enabled;
+  // opting out (CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION=0) leaves the launched process's env
+  // byte-identical to pre-isolation behavior (inherits the ambient HERMES_HOME via baseEnv's
+  // ...process.env spread in launch(), same as every var this function doesn't touch).
+  if (liveHermesHome) extraEnv.CLAUNKER_LIVE_HERMES_HOME = liveHermesHome;
+  if (jobHermesHome) extraEnv.HERMES_HOME = jobHermesHome;
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
 
@@ -924,7 +973,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null,
-                 ...(persistedIntent ? { intent: persistedIntent } : {}) };
+                 ...(persistedIntent ? { intent: persistedIntent } : {}),
+                 ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
