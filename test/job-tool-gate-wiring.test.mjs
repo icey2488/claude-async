@@ -107,6 +107,10 @@ test("safePermissions omitted (default off): keeps --dangerously-skip-permission
   assert.ok(!capture[0].argv.includes("--permission-mode"));
   const settings = settingsFromArgv(capture[0].argv);
   assert.ok(!("permissions" in settings));
+  // Inertness (2026-10-21 safe-perms-finish task 4): ollama-guard-hook must stay off too when
+  // safePermissions is unset -- only the always-on no-background-hook is wired.
+  assert.equal(settings.hooks.PreToolUse[0].hooks.length, 1);
+  assert.ok(!/ollama-guard-hook\.mjs/.test(settings.hooks.PreToolUse[0].hooks[0].command));
 });
 
 test("safePermissions: true switches to --permission-mode dontAsk with an allow/deny list", async () => {
@@ -136,12 +140,31 @@ test("safePermissions: true switches to --permission-mode dontAsk with an allow/
     assert.ok(settings.permissions.deny.includes(`PowerShell(${prefix})`),
       `PowerShell(${prefix}) must be denied to match its Bash equivalent`);
   }
-  // 2026-10-21 safe-permissions rehearsal (D:\code\reviews\safe-permissions-rehearsal-20261021.md):
-  // the live chassis (D:\claunker\**) must stay out of reach of every mutating tool this allow
-  // list grants, not just the control-plane files already covered above.
-  for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
-    assert.ok(settings.permissions.deny.includes(`${tool}(//**/claunker/**)`),
-      `${tool} must deny //**/claunker/** (live chassis)`);
+  // Task 3 (2026-10-21 safe-perms-finish): destructive git forms denied even though their
+  // non-destructive siblings (`git branch <name>`, `git checkout <branch>`, `git checkout -b`,
+  // `git switch <branch>`) are allowed above.
+  assert.ok(settings.permissions.allow.includes("Bash(git switch *)"));
+  assert.ok(settings.permissions.allow.includes("PowerShell(git switch *)"));
+  for (const prefix of ["git branch -D*", "git branch --delete --force*", "git branch --force --delete*",
+    "git checkout -- *", "git checkout .*", "git checkout -f*",
+    "git switch -f*", "git switch --force*", "git switch --discard-changes*"]) {
+    assert.ok(settings.permissions.deny.includes(`Bash(${prefix})`), `Bash(${prefix}) must be denied`);
+    assert.ok(settings.permissions.deny.includes(`PowerShell(${prefix})`), `PowerShell(${prefix}) must be denied`);
+  }
+  assert.ok(!settings.permissions.allow.includes("Bash(git restore *)"),
+    "git restore was never allow-listed and must stay that way (no --staged carve-out expressible by prefix matching)");
+  // 2026-10-21 safe-permissions rehearsal (D:\code\reviews\safe-permissions-rehearsal-20261021.md),
+  // tightened 2026-10-21 safe-perms-finish: the live chassis (D:\claunker\**) must stay out of
+  // reach of every file-editing tool this allow list grants. A single Edit(path) deny rule is
+  // what claude.exe 2.1.303 actually applies to Edit/Write/MultiEdit/NotebookEdit alike --
+  // path-scoped Write(path)/MultiEdit(path)/NotebookEdit(path) rules are silently ignored by the
+  // real CLI (confirmed live; see job-core.mjs's comment), so asserting those three NOT be present
+  // guards against reintroducing dead-weight rules that look like coverage but aren't.
+  assert.ok(settings.permissions.deny.includes("Edit(//**/claunker/**)"),
+    "Edit must deny //**/claunker/** (live chassis)");
+  for (const tool of ["Write", "MultiEdit", "NotebookEdit"]) {
+    assert.ok(!settings.permissions.deny.includes(`${tool}(//**/claunker/**)`),
+      `${tool}(//**/claunker/**) is a no-op on real claude.exe and must not be relied on`);
   }
 });
 
@@ -154,5 +177,27 @@ test("safePermissions and toolGate are independent: either can be on without the
   assert.ok(!res.error, JSON.stringify(res));
   const settings = settingsFromArgv(capture[0].argv);
   assert.ok("permissions" in settings, "permission-mode change applied");
-  assert.equal(settings.hooks.PreToolUse[0].hooks.length, 1, "gate hook stayed off");
+  // safePermissions also wires the ollama-guard-hook (see job-core.mjs's OLLAMA_GUARD_HOOK_SCRIPT
+  // comment and hooks/ollama-guard-hook.mjs), so the count is 2 here, not 1 -- but the job-tool-
+  // gate-hook itself (toolGate: false) must still be absent.
+  assert.equal(settings.hooks.PreToolUse[0].hooks.length, 2, "ollama-guard-hook on, job-tool-gate-hook stayed off");
+  assert.ok(settings.hooks.PreToolUse[0].hooks.every((h) => !/job-tool-gate-hook\.mjs/.test(h.command)),
+    "job-tool-gate-hook must not be wired when toolGate is false");
+  assert.ok(settings.hooks.PreToolUse[0].hooks.some((h) => /ollama-guard-hook\.mjs/.test(h.command)),
+    "ollama-guard-hook must be wired when safePermissions is true");
+});
+
+test("safePermissions and toolGate both true: all three hooks wired", async () => {
+  const capture = [];
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: `perm-and-gate-${crypto.randomBytes(3).toString("hex")}` },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: true, toolGate: true, gateRepo: "D:\\fake\\claunker-hermes" },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  const settings = settingsFromArgv(capture[0].argv);
+  assert.equal(settings.hooks.PreToolUse[0].hooks.length, 3);
+  const commands = settings.hooks.PreToolUse[0].hooks.map((h) => h.command);
+  assert.ok(commands.some((c) => /no-background-hook\.mjs/.test(c)));
+  assert.ok(commands.some((c) => /ollama-guard-hook\.mjs/.test(c)));
+  assert.ok(commands.some((c) => /job-tool-gate-hook\.mjs/.test(c)));
 });

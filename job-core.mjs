@@ -171,6 +171,21 @@ const EMPTY_MCP = path.join(path.dirname(fileURLToPath(import.meta.url)), "empty
 const NO_BACKGROUND_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "no-background-hook.mjs");
 const NO_BACKGROUND_HOOK_MATCHER = "*";
 
+// Ollama delegation guard (design: this job's own follow-up to the 2026-10-21 safe-permissions
+// rehearsal -- D:\code\reviews\safe-perms-finish-20261021.md): closes a gap the rehearsal found
+// where the local-model-delegation curl call CLAUDE.md requires of every eligible job silently
+// stopped working under --permission-mode dontAsk (curl wasn't allow-listed at all). A bare
+// permissions.allow prefix rule can't safely express "exactly this one URL and nothing appended"
+// (curl accepts a second positional URL in the same call, and a userinfo "@" trick makes a string
+// that starts with the allowed host:port actually target a different host) -- see
+// hooks/ollama-guard-hook.mjs's own header. Wired in ONLY when safePermissions is enabled
+// (ollamaGuard param below), same scope as the new allow rules in buildSafePermissionsSettings():
+// today's --dangerously-skip-permissions jobs already run curl/ollama calls successfully with no
+// allow rule in play at all (skip-permissions bypasses the permission system), so this hook must
+// never fire for them -- it would only add a NEW, stricter shape requirement (explicit "http://"
+// scheme, no chaining) that today's jobs were never written against.
+const OLLAMA_GUARD_HOOK_SCRIPT = path.join(REPO_DIR, "hooks", "ollama-guard-hook.mjs");
+
 // job-tool-gate (design: D:\code\reviews\job-tool-gate-design-20261020.md): routes a job's
 // Claude Code tool calls through claunker-hermes's classifier/dispatcher. DEFAULT OFF --
 // CLAUDE_ASYNC_JOB_TOOL_GATE must be exactly "1" (or opts.toolGate passed explicitly, for tests)
@@ -243,12 +258,53 @@ export function buildSafePermissionsSettings() {
     "git status*", "git diff*", "git log*", "git show*",
     "git branch*", "git rev-parse*", "git remote*", "git describe*",
     "git add *", "git commit *", "git checkout *", "git worktree *",
+    // git switch (2026-10-21 safe-perms-finish task 3): the modern equivalent of
+    // `git checkout <branch>`/`git checkout -b`, same risk class as the checkout rule already
+    // above -- added here rather than left out, since CLAUDE.md names it alongside checkout as a
+    // normal branch operation a job should be able to do.
+    "git switch *",
     "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *",
   ];
   const SHELL_DENY_PREFIXES = [
     "git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*",
+    // 2026-10-21 safe-perms-finish task 3 (known gap named in the rehearsal, D:\code\reviews\
+    // safe-permissions-rehearsal-20261021.md §6): the broad "git branch*"/"git checkout *" allow
+    // rules above also match their destructive forms -- `git branch -D`/`--delete --force` force-
+    // deletes a branch (including unmerged work), and `git checkout -- <path>`/`git checkout .`/
+    // `git checkout -f` discard uncommitted working-tree changes. Deny wins over allow (confirmed
+    // in the original rehearsal), so these narrower prefixes block only the destructive forms --
+    // `git branch <name>` (create), `git checkout <branch>` (switch), and `git checkout -b` (create
+    // + switch) all still match ONLY the allow rules above and are unaffected. Flag-order variants
+    // this prefix matching can't express (e.g. `git branch -fd`, `--force --delete` reversed) are a
+    // known residual gap -- see the job's report. `git restore` is deliberately left off the allow
+    // list entirely (it already was, before this change) rather than given a `--staged`-only carve-
+    // out: no job has ever needed it, and prefix matching can't express "has --staged" as a
+    // positive requirement, only block specific unwanted prefixes.
+    "git branch -D*", "git branch --delete --force*", "git branch --force --delete*",
+    "git checkout -- *", "git checkout .*", "git checkout -f*",
+    "git switch -f*", "git switch --force*", "git switch --discard-changes*",
   ];
   const forShells = (prefixes) => prefixes.flatMap((p) => [`Bash(${p})`, `PowerShell(${p})`]);
+
+  // Local-model delegation (CLAUDE.md's "local model delegation (Ollama)" section): the two exact
+  // URLs CLAUDE.md names for the resident qwen2.5-coder:7b model. Deliberately NOT a broad
+  // "curl *" or "Invoke-RestMethod *" rule -- see OLLAMA_GUARD_HOOK_SCRIPT's comment above and
+  // hooks/ollama-guard-hook.mjs's header for why the trailing wildcard here (needed for -d/-Method/
+  // -Body args, which vary every call) is only safe in combination with that hook, which denies
+  // any call that smuggles a second URL, a userinfo "@" host trick, a file-writing/upload/config
+  // flag, or shell chaining into the same allowed prefix. Invoke-RestMethod/Invoke-WebRequest
+  // rules require the URI as the FIRST positional argument (`Invoke-RestMethod http://... -Method
+  // Post ...`), not a later `-Uri` flag -- a narrower rule than ollama-guard-hook.mjs alone would
+  // require, chosen because allowing the URI in any argument position would mean the static prefix
+  // itself could no longer anchor on the fixed host/port, re-opening the same gap. `ollama run`/
+  // `generate`/`list`/`ps`/`show` cover the CLI alternative CLAUDE.md also names; that path has no
+  // URL of its own for a bypass to hide in.
+  const OLLAMA_ALLOW_PREFIXES = [
+    "curl http://127.0.0.1:11434/api/generate", "curl http://localhost:11434/api/generate",
+    "Invoke-RestMethod http://127.0.0.1:11434/api/generate", "Invoke-RestMethod http://localhost:11434/api/generate",
+    "Invoke-WebRequest http://127.0.0.1:11434/api/generate", "Invoke-WebRequest http://localhost:11434/api/generate",
+    "ollama run ", "ollama generate ", "ollama list", "ollama ps", "ollama show ",
+  ];
 
   return {
     permissions: {
@@ -256,6 +312,7 @@ export function buildSafePermissionsSettings() {
         "Read", "Glob", "Grep", "WebSearch",
         "Edit", "Write", "MultiEdit", "NotebookEdit",
         ...forShells(SHELL_ALLOW_PREFIXES),
+        ...forShells(OLLAMA_ALLOW_PREFIXES.map((p) => `${p}*`)),
         "PowerShell(Get-ChildItem *)", "PowerShell(Get-Content *)", "PowerShell(Get-Item *)",
       ],
       deny: [
@@ -266,14 +323,22 @@ export function buildSafePermissionsSettings() {
         // 2026-10-21 safe-permissions rehearsal gap (D:\code\reviews\safe-permissions-rehearsal-
         // 20261021.md): none of the rules above match a path shaped like the live chassis
         // (D:\claunker\**, e.g. D:\claunker\hermes\plugins.py) -- a decoy probe confirmed Edit was
-        // ALLOWED there. CLAUDE.md requires jobs never modify the live chassis; these four cover
-        // every mutating tool this allow list grants (Edit/Write/MultiEdit/NotebookEdit are all
-        // unscoped "allow" above, so only an explicit deny stops them). "//**/claunker/**" matches
-        // a path SEGMENT literally named "claunker" (e.g. D:\claunker\...), not a repo whose name
-        // merely contains it (D:\code\claunker-ops, D:\code\claunker-hermes), so legitimate repo
-        // work is unaffected.
-        "Edit(//**/claunker/**)", "Write(//**/claunker/**)",
-        "MultiEdit(//**/claunker/**)", "NotebookEdit(//**/claunker/**)",
+        // ALLOWED there. CLAUDE.md requires jobs never modify the live chassis. "//**/claunker/**"
+        // matches a path SEGMENT literally named "claunker" (e.g. D:\claunker\...), not a repo
+        // whose name merely contains it (D:\code\claunker-ops, D:\code\claunker-hermes), so
+        // legitimate repo work is unaffected.
+        //
+        // 2026-10-21 safe-perms-finish follow-up: this used to also list
+        // Write(//**/claunker/**)/MultiEdit(//**/claunker/**)/NotebookEdit(//**/claunker/**).
+        // Live-tested against claude.exe 2.1.303: those three are silently ignored --
+        // "Write(...) is not matched by file permission checks -- only Edit(path) rules are...
+        // Edit rules cover all file-editing tools" (the CLI's own stderr warning) -- so Write/
+        // MultiEdit/NotebookEdit calls to the live chassis were NOT actually denied by them; they
+        // were dead weight that looked like coverage. A single Edit(path) deny rule is what
+        // claude.exe actually applies to every file-editing tool (Edit, Write, MultiEdit,
+        // NotebookEdit alike); confirmed live that a Write to a neutral //**/claunker/** fixture
+        // path is denied by this one rule alone.
+        "Edit(//**/claunker/**)",
       ],
     },
   };
@@ -283,10 +348,13 @@ export function buildSafePermissionsSettings() {
 // settings a job needs, e.g. ultracode below, into ONE --settings flag -- passing --settings
 // twice was observed to let the later flag silently win, which would otherwise drop whichever
 // of ultracode/hooks lost that race).
-export function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT, liveHermesHome = null } = {}) {
+export function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT, liveHermesHome = null, ollamaGuard = false } = {}) {
   const preToolUseHooks = [
     { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
   ];
+  if (ollamaGuard) {
+    preToolUseHooks.push({ type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(OLLAMA_GUARD_HOOK_SCRIPT)}`, timeout: 5 });
+  }
   if (toolGate) {
     // Additive, not a replacement: both hooks run for every PreToolUse call. A gate subprocess
     // timeout (CLAUDE_ASYNC_GATE_TIMEOUT_MS, default 8s in the hook itself) is generous relative
@@ -911,7 +979,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // (two --settings flags were observed to let the later one win outright, silently dropping
   // whichever of ultracode/hooks lost that race).
   const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
-  const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled, liveHermesHome });
+  const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled, liveHermesHome, ollamaGuard: safePermissionsEnabled });
   if (safePermissionsEnabled) Object.assign(settingsObj, buildSafePermissionsSettings());
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.

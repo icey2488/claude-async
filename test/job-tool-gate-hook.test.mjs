@@ -36,17 +36,21 @@ function assertDenied(stdin, envOverrides) {
   return parsed;
 }
 
-function assertAllowed(stdin, envOverrides) {
-  const { status, parsed } = runHook(stdin, envOverrides);
-  assert.equal(status, 0, `expected exit 0 (allow), got ${status}; stdout=${JSON.stringify(parsed)}`);
-  assert.ok(parsed, "allow response must be valid JSON");
-  assert.equal(parsed.hookSpecificOutput.permissionDecision, "allow");
+// "pass" (not an explicit allow): per Claude Code's hooks contract, exit 0 with no stdout means
+// the hook has no decision and the normal permission flow applies. This hook translates the gate
+// subprocess's "allow" to "pass" (2026-10-21 fix, see hooks/job-tool-gate-hook.mjs's header) --
+// it must never emit an explicit allow on another tool's behalf, the same discipline
+// no-background-hook.mjs already follows.
+function assertPass(stdin, envOverrides) {
+  const { status, stdout } = runHook(stdin, envOverrides);
+  assert.equal(status, 0, `expected exit 0 (pass), got ${status}; stdout=${JSON.stringify(stdout)}`);
+  assert.equal(stdout, "", "pass must print nothing, so it is never mistaken for an explicit allow");
 }
 
-// --- Happy path: the hook forwards the fake gate's own decision verbatim ---
+// --- Happy path: the hook translates the fake gate's "allow" into a silent pass ---
 
-test("tool the fake gate allows -> allow", () => {
-  assertAllowed({ tool_name: "AllowMe", tool_input: { x: 1 } });
+test("tool the fake gate allows -> pass (no explicit allow emitted)", () => {
+  assertPass({ tool_name: "AllowMe", tool_input: { x: 1 } });
 });
 
 test("tool the fake gate denies -> deny, with its reason forwarded", () => {

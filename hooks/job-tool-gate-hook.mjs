@@ -27,6 +27,18 @@
  *           "exit 0 wins regardless of stdout": the Python side promises 0-or-2 and nothing else,
  *           so a different code means the subprocess crashed before it could decide anything.
  *
+ * 2026-10-21 fix (D:\code\reviews\safe-perms-finish-20261021.md, hook-"allow" audit): this script
+ * used to forward the Python side's "allow" verbatim as an explicit permissionDecision:"allow" on
+ * ITS OWN stdout. Per the same rehearsal finding that fixed no-background-hook.mjs (see that
+ * file's header and RUNBOOK.md), a PreToolUse hook's explicit "allow" is honored as a real
+ * permission grant that bypasses permissions.allow/deny entirely -- so a gate that only CLASSIFIES
+ * (Tier 1-4) and was never meant to be the sole authority for every tool call was silently acting
+ * as one. This hook now only ever emits "deny" on its own stdout; an "allow" from the Python side
+ * is translated to "pass" (print nothing, exit 0 -- no decision, defer to the static
+ * permissions.allow/deny floor and any other hook). The Python gate's own internal tiering logic
+ * is unchanged; only this script's OUTER translation of "allow" to the claude.exe hook contract
+ * changed.
+ *
  * Configuration (env vars set on the claude CLI's own spawn() env by job-core.mjs's startJob(),
  * inherited by this hook subprocess the same way CLAUDE_ASYNC_JOB_EFFORT is -- see
  * no-background-hook.mjs's header for why that inheritance is confirmed to work):
@@ -49,6 +61,9 @@ import fs from "node:fs";
 import path from "node:path";
 
 function respond(decision, reason) {
+  // "pass" (not an explicit allow): see the 2026-10-21 fix note in this file's header. Must never
+  // print an explicit permissionDecision:"allow" on this hook's own behalf.
+  if (decision === "pass") { process.exitCode = 0; return; }
   const out = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: decision } };
   if (reason) {
     out.hookSpecificOutput.permissionDecisionReason = reason;
@@ -107,7 +122,11 @@ try {
       "denying to fail closed.");
   } else {
     const [decision, reason] = runGate(input, process.env);
-    respond(decision, reason);
+    // Translate the gate's "allow" to "pass" here, at the very last step, so runGate()'s own
+    // fail-closed validation above (exactly "allow" or "deny" from the subprocess, nothing else)
+    // stays unchanged and easy to reason about -- only this outer translation to the claude.exe
+    // hook contract changed. See respond()'s and this file's header comment for why.
+    respond(decision === "allow" ? "pass" : decision, reason);
   }
 } catch (e) {
   respond("deny", `job-tool-gate-hook: hook script error (${e && e.message}); denying to fail closed.`);
