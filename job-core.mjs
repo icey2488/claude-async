@@ -227,24 +227,53 @@ function quotedPosixPath(p) {
 // current permissions docs -- "deny rules... evaluated regardless of what a PreToolUse hook
 // returns"), so these hold even if the gate hook is disabled, missing, or buggy. `//` anchors at
 // the filesystem root so the rule holds regardless of which workFolder/worktree a job runs in.
-function buildSafePermissionsSettings() {
+export function buildSafePermissionsSettings() {
+  // Shared between Bash and PowerShell so the two shells can't drift (2026-10-21 rehearsal,
+  // D:\code\reviews\safe-permissions-rehearsal-20261021.md: PowerShell originally had only its
+  // own read-only allow rules while Bash got the full dev-tool set below, hand-written separately
+  // -- so the SAME logical command, e.g. `uv run pytest`, was allowed or denied purely depending
+  // on which shell tool Claude Code happened to invoke that turn, which is not something a job's
+  // own prompt controls or can predict). Covers git, the dev-tool runners, and mkdir (added in the
+  // same rehearsal: a scaffolding job's first compound Bash command, `cd ... && mkdir -p src tests
+  // docs && git status`, was denied outright because `mkdir` matched no allow rule at all --
+  // Claude Code decomposes a `&&`-joined command into its sub-commands and denies the whole call
+  // if ANY one isn't covered, so the allowed `git status` alongside it didn't save the call
+  // either. Directory creation is routine scaffolding, not a destructive verb).
+  const SHELL_ALLOW_PREFIXES = [
+    "git status*", "git diff*", "git log*", "git show*",
+    "git branch*", "git rev-parse*", "git remote*", "git describe*",
+    "git add *", "git commit *", "git checkout *", "git worktree *",
+    "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *",
+  ];
+  const SHELL_DENY_PREFIXES = [
+    "git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*",
+  ];
+  const forShells = (prefixes) => prefixes.flatMap((p) => [`Bash(${p})`, `PowerShell(${p})`]);
+
   return {
     permissions: {
       allow: [
         "Read", "Glob", "Grep", "WebSearch",
         "Edit", "Write", "MultiEdit", "NotebookEdit",
-        "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)",
-        "Bash(git branch*)", "Bash(git rev-parse*)", "Bash(git remote*)", "Bash(git describe*)",
-        "Bash(git add *)", "Bash(git commit *)", "Bash(git checkout *)", "Bash(git worktree *)",
-        "Bash(pytest *)", "Bash(uv *)", "Bash(npm *)", "Bash(node *)", "Bash(python *)",
+        ...forShells(SHELL_ALLOW_PREFIXES),
         "PowerShell(Get-ChildItem *)", "PowerShell(Get-Content *)", "PowerShell(Get-Item *)",
       ],
       deny: [
-        "Bash(git push *)", "Bash(git merge *)", "Bash(git rebase *)", "Bash(git reset --hard *)",
-        "Bash(git clean -f*)",
+        ...forShells(SHELL_DENY_PREFIXES),
         "Edit(//**/CLAUDE.md)", "Edit(//**/hooks/**)", "Edit(//**/.claude/settings*.json)",
         "Edit(//**/config.yaml)", "Edit(//**/scheduled-tasks/**)",
         "Read(//**/.env)", "Read(//**/.ssh/**)",
+        // 2026-10-21 safe-permissions rehearsal gap (D:\code\reviews\safe-permissions-rehearsal-
+        // 20261021.md): none of the rules above match a path shaped like the live chassis
+        // (D:\claunker\**, e.g. D:\claunker\hermes\plugins.py) -- a decoy probe confirmed Edit was
+        // ALLOWED there. CLAUDE.md requires jobs never modify the live chassis; these four cover
+        // every mutating tool this allow list grants (Edit/Write/MultiEdit/NotebookEdit are all
+        // unscoped "allow" above, so only an explicit deny stops them). "//**/claunker/**" matches
+        // a path SEGMENT literally named "claunker" (e.g. D:\claunker\...), not a repo whose name
+        // merely contains it (D:\code\claunker-ops, D:\code\claunker-hermes), so legitimate repo
+        // work is unaffected.
+        "Edit(//**/claunker/**)", "Write(//**/claunker/**)",
+        "MultiEdit(//**/claunker/**)", "NotebookEdit(//**/claunker/**)",
       ],
     },
   };
@@ -254,7 +283,7 @@ function buildSafePermissionsSettings() {
 // settings a job needs, e.g. ultracode below, into ONE --settings flag -- passing --settings
 // twice was observed to let the later flag silently win, which would otherwise drop whichever
 // of ultracode/hooks lost that race).
-function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT, liveHermesHome = null } = {}) {
+export function buildNoBackgroundHookSettings({ toolGate = JOB_TOOL_GATE_ENV_DEFAULT, liveHermesHome = null } = {}) {
   const preToolUseHooks = [
     { type: "command", command: `${quotedPosixPath(process.execPath)} ${quotedPosixPath(NO_BACKGROUND_HOOK_SCRIPT)}`, timeout: 5 },
   ];

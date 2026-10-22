@@ -123,6 +123,26 @@ test("safePermissions: true switches to --permission-mode dontAsk with an allow/
   const settings = settingsFromArgv(capture[0].argv);
   assert.ok(Array.isArray(settings.permissions.allow) && settings.permissions.allow.length > 0);
   assert.ok(settings.permissions.deny.includes("Bash(git push *)"));
+  assert.ok(settings.permissions.allow.includes("Bash(mkdir *)"),
+    "mkdir must be allowed -- a false-deny found in the rehearsal blocked routine scaffolding");
+  // Bash and PowerShell must carry the same dev-tool allow/deny set (rehearsal: PowerShell-only
+  // `uv run pytest` was denied while the identical Bash invocation was allowed).
+  for (const prefix of ["git status*", "git add *", "git commit *", "git checkout *",
+    "git worktree *", "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"]) {
+    assert.ok(settings.permissions.allow.includes(`PowerShell(${prefix})`),
+      `PowerShell(${prefix}) must be allowed to match its Bash equivalent`);
+  }
+  for (const prefix of ["git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*"]) {
+    assert.ok(settings.permissions.deny.includes(`PowerShell(${prefix})`),
+      `PowerShell(${prefix}) must be denied to match its Bash equivalent`);
+  }
+  // 2026-10-21 safe-permissions rehearsal (D:\code\reviews\safe-permissions-rehearsal-20261021.md):
+  // the live chassis (D:\claunker\**) must stay out of reach of every mutating tool this allow
+  // list grants, not just the control-plane files already covered above.
+  for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) {
+    assert.ok(settings.permissions.deny.includes(`${tool}(//**/claunker/**)`),
+      `${tool} must deny //**/claunker/** (live chassis)`);
+  }
 });
 
 test("safePermissions and toolGate are independent: either can be on without the other", async () => {

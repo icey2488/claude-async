@@ -34,22 +34,26 @@ function assertDenied(stdin, opts) {
   assert.ok(parsed.hookSpecificOutput.permissionDecisionReason.length > 0);
 }
 
-function assertAllowed(stdin, opts) {
-  const { status, parsed } = runHook(stdin, opts);
-  assert.equal(status, 0, `expected exit 0 (allow), got ${status}; stdout=${JSON.stringify(parsed)}`);
-  assert.ok(parsed, "allow response must be valid JSON");
-  assert.equal(parsed.hookSpecificOutput.permissionDecision, "allow");
+// "pass" (not an explicit allow): per Claude Code's hooks contract, exit 0 with no stdout means
+// the hook has no decision and the normal permission flow applies -- this hook must never emit an
+// explicit allow on another tool's behalf (see respond()'s header comment; confirmed live in the
+// 2026-10-21 safe-permissions rehearsal that an explicit allow here bypassed permissions.allow/
+// deny entirely for calls this hook has no actual opinion about).
+function assertPass(stdin, opts) {
+  const { status, stdout } = runHook(stdin, opts);
+  assert.equal(status, 0, `expected exit 0 (pass), got ${status}; stdout=${JSON.stringify(stdout)}`);
+  assert.equal(stdout, "", "pass must print nothing, so it is never mistaken for an explicit allow");
 }
 
 // --- Bash / PowerShell: foreground is the default, run_in_background:true is denied ---
 
 for (const toolName of ["Bash", "PowerShell"]) {
-  test(`${toolName}: run_in_background omitted -> allow`, () => {
-    assertAllowed({ tool_name: toolName, tool_input: { command: "echo hi" } });
+  test(`${toolName}: run_in_background omitted -> pass (no decision)`, () => {
+    assertPass({ tool_name: toolName, tool_input: { command: "echo hi" } });
   });
 
-  test(`${toolName}: run_in_background:false -> allow`, () => {
-    assertAllowed({ tool_name: toolName, tool_input: { command: "echo hi", run_in_background: false } });
+  test(`${toolName}: run_in_background:false -> pass (no decision)`, () => {
+    assertPass({ tool_name: toolName, tool_input: { command: "echo hi", run_in_background: false } });
   });
 
   test(`${toolName}: run_in_background:true -> deny`, () => {
@@ -68,8 +72,8 @@ for (const toolName of ["Agent", "Task"]) {
     assertDenied({ tool_name: toolName, tool_input: { prompt: "do something", run_in_background: true } });
   });
 
-  test(`${toolName}: run_in_background:false -> allow`, () => {
-    assertAllowed({ tool_name: toolName, tool_input: { prompt: "do something", run_in_background: false } });
+  test(`${toolName}: run_in_background:false -> pass (no decision)`, () => {
+    assertPass({ tool_name: toolName, tool_input: { prompt: "do something", run_in_background: false } });
   });
 }
 
@@ -85,8 +89,8 @@ test("Monitor: denied even if caller tries run_in_background:false", () => {
 
 // --- Workflow: gated by job effort (CLAUDE_ASYNC_JOB_EFFORT), not by run_in_background ---
 
-test("Workflow: effort=ultracode -> allow", () => {
-  assertAllowed({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } }, { jobEffort: "ultracode" });
+test("Workflow: effort=ultracode -> pass (no decision)", () => {
+  assertPass({ tool_name: "Workflow", tool_input: { script: "export const meta = {}" } }, { jobEffort: "ultracode" });
 });
 
 for (const eff of ["low", "medium", "high", "xhigh", "max"]) {
@@ -105,20 +109,20 @@ test("Workflow: run_in_background:true still denies even at effort=ultracode (ge
 
 // --- Tools this hook doesn't specifically recognize: allowed, unless they ask for background ---
 
-test("unrelated tool (Read) -> allow", () => {
-  assertAllowed({ tool_name: "Read", tool_input: { file_path: "C:/x" } });
+test("unrelated tool (Read) -> pass (no decision)", () => {
+  assertPass({ tool_name: "Read", tool_input: { file_path: "C:/x" } });
 });
 
 test("unknown tool with run_in_background:true -> deny (generic rule, not a name lookup)", () => {
   assertDenied({ tool_name: "SomeFutureTool", tool_input: { foo: "bar", run_in_background: true } });
 });
 
-test("unknown tool without run_in_background -> allow", () => {
-  assertAllowed({ tool_name: "SomeFutureTool", tool_input: { foo: "bar" } });
+test("unknown tool without run_in_background -> pass (no decision)", () => {
+  assertPass({ tool_name: "SomeFutureTool", tool_input: { foo: "bar" } });
 });
 
-test("unknown tool with run_in_background:false -> allow", () => {
-  assertAllowed({ tool_name: "SomeFutureTool", tool_input: { foo: "bar", run_in_background: false } });
+test("unknown tool with run_in_background:false -> pass (no decision)", () => {
+  assertPass({ tool_name: "SomeFutureTool", tool_input: { foo: "bar", run_in_background: false } });
 });
 
 // --- Fail closed: malformed input must never fall through to allow ---
