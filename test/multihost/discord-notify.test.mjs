@@ -1,7 +1,8 @@
 // discord-notify.mjs: best-effort Discord webhook ping fired from job-runner.mjs's finish(),
 // strictly AFTER exit.json and exit_code are written. Two layers of coverage:
-//   - unit tests directly against discord-notify.mjs's pure helpers (headline rule, truncation,
-//     escaping, content shape) -- no process spawn, no network;
+//   - unit tests directly against discord-notify.mjs's pure helpers (RESULT marker parsing,
+//     marker precedence, excerpt selection/truncation/escaping, content shape) -- no process
+//     spawn, no network;
 //   - integration tests that run the REAL job-runner.mjs against a local 127.0.0.1 HTTP server,
 //     covering config on/off, success, non-2xx, a server that never responds, ordering, and that
 //     the webhook URL never leaks into any job-dir file.
@@ -14,12 +15,12 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP, hosts } from "./_setup.mjs";
 import {
-  NOTIFY_TIMEOUT_MS, loadNotifyConfig, extractHeadline, escapeDiscordText, boundHeadline,
-  formatDuration, markerFor, buildDiscordContent, readHead, chooseHeadlineLines,
-  isLabelLine, containsPath, truncateHeadline, closeMarkdownSpans, HEADLINE_MAX_CHARS,
-  loadCompletenessConfig, hasCompletenessMarker, DEFAULT_COMPLETENESS_MARKER_SOURCE,
-  INCOMPLETE_REASON, notifyJobFinished, isTestMode, getRealSendBlockedCount,
-  stripMarkdownWrapping, isJunkHeadlineLine,
+  NOTIFY_TIMEOUT_MS, loadNotifyConfig, escapeDiscordText, formatDuration, markerFor,
+  buildDiscordContent, loadCompletenessConfig, hasCompletenessMarker,
+  DEFAULT_COMPLETENESS_MARKER_SOURCE, INCOMPLETE_REASON, notifyJobFinished, isTestMode,
+  getRealSendBlockedCount, stripMarkdownWrapping, parseResultMarker, isSummaryHeadingLine,
+  buildExcerpt, EXCERPT_MAX_CHARS, closeMarkdownSpansAtStart, stripBackticksAroundUrls,
+  ensureSpaceAfterUrlBeforeBacktick,
 } from "../../discord-notify.mjs";
 
 after(cleanupTmp);
@@ -28,143 +29,9 @@ after(cleanupTmp);
 // Unit tests: pure helpers, no I/O.
 // ---------------------------------------------------------------------------
 
-test("extractHeadline: skips markdown headings, code fences, and blank lines", () => {
-  assert.equal(extractHeadline(["# heading", "```", "", "  ", "real headline", "next line"]), "real headline");
-  assert.equal(extractHeadline([]), null);
-  assert.equal(extractHeadline(["# only a heading", "```js"]), null);
-  assert.equal(extractHeadline(undefined), null);
-});
-
 test("escapeDiscordText: backslash-escapes @, `, <, > and nothing else", () => {
   assert.equal(escapeDiscordText("hi @everyone `code` <tag> plain"), "hi \\@everyone \\`code\\` \\<tag\\> plain");
   assert.equal(escapeDiscordText("no special chars here"), "no special chars here");
-});
-
-test("boundHeadline: truncates to HEADLINE_MAX_CHARS BEFORE escaping, then escapes", () => {
-  const long = "@".repeat(HEADLINE_MAX_CHARS + 50); // an escape-heavy line with no word/sentence boundary at all
-  const result = boundHeadline([long]);
-  // no whitespace anywhere -> truncateHeadline falls back to the raw slice, THEN escape doubles it, plus the ellipsis
-  assert.equal(result, "\\@".repeat(HEADLINE_MAX_CHARS) + "…");
-  assert.equal(result.length, HEADLINE_MAX_CHARS * 2 + 1);
-});
-
-test("boundHeadline: returns null when no usable line exists", () => {
-  assert.equal(boundHeadline(["# heading only"]), null);
-});
-
-test("boundHeadline: empty stdout yields no headline", () => {
-  assert.equal(boundHeadline([]), null);
-  assert.equal(boundHeadline([""]), null);
-});
-
-test("boundHeadline: a short headline needing no truncation passes through unchanged (plus escaping)", () => {
-  assert.equal(boundHeadline(["Everything checks out."]), "Everything checks out.");
-});
-
-test("extractHeadline: a Verdict line wins over an earlier qualifying preamble line", () => {
-  const stdout = "A quick note before the result.\n**Verdict: PASS, all clear.**\nmore detail".split("\n");
-  assert.equal(extractHeadline(stdout), "**Verdict: PASS, all clear.**");
-});
-
-test("truncateHeadline: cuts at the last sentence boundary within budget, never mid-word", () => {
-  const line = "First sentence here. Second sentence that runs long enough to push the whole thing well past the limit we are testing against today for sure. " + "padding ".repeat(40);
-  const result = truncateHeadline(line, 150);
-  assert.ok(result.endsWith("…"));
-  assert.equal(result, "First sentence here. Second sentence that runs long enough to push the whole thing well past the limit we are testing against today for sure.…");
-});
-
-test("truncateHeadline: a long single sentence with no period falls back to the last word boundary", () => {
-  const line = "this is one long sentence with absolutely no period anywhere in it at all " + "word ".repeat(40);
-  const result = truncateHeadline(line, 80);
-  assert.ok(result.endsWith("…"));
-  const withoutEllipsis = result.slice(0, -1);
-  assert.ok(line.startsWith(withoutEllipsis));
-  assert.ok(!withoutEllipsis.endsWith(" "), "trailing whitespace before the ellipsis is trimmed");
-  assert.equal(line[withoutEllipsis.length], " ", "the cut must land exactly on a word boundary, not mid-word");
-});
-
-test("truncateHeadline: a line already within budget is returned unchanged", () => {
-  assert.equal(truncateHeadline("short line", 80), "short line");
-});
-
-test("closeMarkdownSpans: strips a dangling unmatched **, *, _, and ` left open by truncation", () => {
-  assert.equal(closeMarkdownSpans("**bold never closed"), "bold never closed");
-  assert.equal(closeMarkdownSpans("plain **closed** and fine"), "plain **closed** and fine");
-  assert.equal(closeMarkdownSpans("some *italic never closed"), "some italic never closed");
-  assert.equal(closeMarkdownSpans("some _italic never closed"), "some italic never closed");
-  assert.equal(closeMarkdownSpans("a (`drift-check`, then an unclosed `span"), "a (`drift-check`, then an unclosed span");
-});
-
-test("closeMarkdownSpans: strips an unterminated code fence's lone marker instead of letting it swallow the rest", () => {
-  assert.equal(closeMarkdownSpans("before ```js console.log(1)"), "before js console.log(1)");
-  assert.equal(closeMarkdownSpans("before ```js\ncode\n``` after, fine"), "before ```js\ncode\n``` after, fine");
-});
-
-test("closeMarkdownSpans: strips a dangling [link]( with no closing paren, and a bare unmatched [", () => {
-  assert.equal(closeMarkdownSpans("see [the report](https://example.com/very/long/pa"), "see ");
-  assert.equal(closeMarkdownSpans("see [the report for more"), "see ");
-  assert.equal(closeMarkdownSpans("see [closed](https://example.com) fine"), "see [closed](https://example.com) fine");
-});
-
-test("boundHeadline: real example 1 (Verdict cut mid-word, unclosed **) is now sentence-bounded and markdown-safe", () => {
-  const ex1 = "**Verdict: Cause class A/B hybrid — host-api was not running (no process, port free) because its logon-triggered start lost a boot-ordering race against Tailscale. Tailscale is up and the IP is unchanged, so the fix belongs in host-api's own startup ordering, not networking, and no further investigation of the network path is warranted at this time, pending a follow-up ticket for a startup dependency check.**";
-  const result = boundHeadline([ex1]);
-  assert.ok(result.length <= HEADLINE_MAX_CHARS + 1, "ellipsis adds at most one char over budget");
-  assert.equal((result.match(/\*\*/g) || []).length % 2, 0, "** markers must balance");
-  assert.ok(!result.includes("\\*"), "escaping never touches *, so any stray * would mean unbalanced markup");
-});
-
-test("boundHeadline: real example 2 (cut inside an inline-code span) is now sentence-bounded with backticks balanced", () => {
-  const ex2 = "Push is blocked — not by anything in my change, but by a repo-wide pre-push liveness gate (`drift-check`, wired via `core.hooksPath=githooks`). It fails closed if any of three sibling repos (`claunker-ops`, `claunker-web`, `claunker-infra`) look unreachable, even though none of them are touched by this branch at all, which needs fixing upstream before anyone can land anything here again without bypassing the gate every time.";
-  const result = boundHeadline([ex2]);
-  assert.ok(result.length <= HEADLINE_MAX_CHARS + 1, "ellipsis adds at most one char over budget");
-  const rawBackticks = (result.match(/\\`/g) || []).length; // escaping turns every surviving ` into \`
-  assert.equal(rawBackticks % 2, 0, "backtick spans must balance");
-});
-
-// Regression: a report opening "## Report" / "**1. Git -- `C:\...`**" used to put the bold,
-// path-bearing section label on the phone as the headline.
-test("extractHeadline: skips a bold numbered section label carrying a Windows path (real regression)", () => {
-  const stdout = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`";
-  const headline = extractHeadline(stdout.split("\n"));
-  assert.equal(headline, "- Branch: `main`");
-  assert.ok(!containsPath(headline), "headline must not carry a path");
-  assert.equal(boundHeadline(stdout.split("\n")), "- Branch: \\`main\\`");
-});
-
-test("extractHeadline: a plain verdict line before a heading wins", () => {
-  assert.equal(extractHeadline("Verdict: all good.\n## Details".split("\n")), "Verdict: all good.");
-});
-
-test("extractHeadline: skips marker-only and short emphasis-label lines", () => {
-  for (const label of ["1.", "- **Report**", "**Report**", "**Summary:**", "1. **Findings**", "---", "* * *"]) {
-    assert.equal(extractHeadline([label, "real headline"]), "real headline", `should skip ${JSON.stringify(label)}`);
-    assert.ok(isLabelLine(label), `isLabelLine(${JSON.stringify(label)})`);
-  }
-});
-
-test("extractHeadline: emphasis around content (sentence or key: value) is still a headline", () => {
-  assert.equal(extractHeadline(["**All checks passed.**", "x"]), "**All checks passed.**");
-  assert.equal(extractHeadline(["**Verdict: PASS**", "x"]), "**Verdict: PASS**");
-  assert.equal(extractHeadline(["- Branch pushed to origin", "x"]), "- Branch pushed to origin");
-});
-
-test("containsPath: Windows drive, UNC, and absolute POSIX paths; not URLs or ordinary slashes", () => {
-  for (const p of ["see C:\\Users\\x", "wrote D:/code/repo", "at \\\\server\\share", "cwd /home/raide/x",
-                   "in `/c/Users/Raide`", "bin /usr/local/bin", "(/tmp/job/out.log)"]) {
-    assert.ok(containsPath(p), `should detect a path in ${JSON.stringify(p)}`);
-  }
-  for (const s of ["https://example.com/a/b", "and/or", "3/4 tests passed", "ratio 1:2", "Verdict: all good.",
-                   "~ is home", "http://x/y/z"]) {
-    assert.ok(!containsPath(s), `should not flag ${JSON.stringify(s)}`);
-  }
-});
-
-test("extractHeadline: path-bearing lines are skipped in the tail too; none qualifying means no headline", () => {
-  const tail = ["Wrote C:\\Users\\Raide\\out.txt", "done in /home/raide/work/", "**Report**"];
-  assert.equal(extractHeadline(tail), null);
-  assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], tail)), null);
-  assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], [...tail, "Tail verdict ok"])), "Tail verdict ok");
 });
 
 test("formatDuration: seconds, minutes, hours, and the unknown fallback", () => {
@@ -175,58 +42,266 @@ test("formatDuration: seconds, minutes, hours, and the unknown fallback", () => 
   assert.equal(formatDuration(-1), "unknown");
 });
 
-test("markerFor: emoji-free status markers", () => {
-  assert.equal(markerFor("exit", 0), "[OK]");
-  assert.equal(markerFor("exit", 1), "[FAIL]");
-  assert.equal(markerFor("signal", null), "[SIGNAL]");
-  assert.equal(markerFor("spawn-error", null), "[SPAWN-ERROR]");
+test("stripMarkdownWrapping: strips wrapper chars without touching the hyphen inside DELEGATION-METRICS", () => {
+  assert.equal(stripMarkdownWrapping("`DELEGATION-METRICS: x`"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("**DELEGATION-METRICS: x**"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("> DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
+  assert.equal(stripMarkdownWrapping("    DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
 });
 
-// claunker.gemini-mcp-v2-20261018-pfvzx44f: an exit-0 run killed by the CLI's own background-task
-// wait ceiling must never ping [OK] -- regardless of exitCode or reportComplete, it always gets
-// its own marker so the ping unambiguously says the run failed.
-test("markerFor: bg_tasks_terminated always reads as failed, exitCode 0 and reportComplete notwithstanding", () => {
-  assert.equal(markerFor("bg_tasks_terminated", 0), "[BG-TASKS-TERMINATED]");
-  assert.equal(markerFor("bg_tasks_terminated", 0, { reportComplete: true }), "[BG-TASKS-TERMINATED]");
-  assert.equal(markerFor("bg_tasks_terminated", 1), "[BG-TASKS-TERMINATED]");
+// ---------------------------------------------------------------------------
+// RESULT: marker parsing (requirement A).
+// ---------------------------------------------------------------------------
+
+test("parseResultMarker: each value, case-insensitive, tolerant of markdown wrapping and a trailing period", () => {
+  assert.equal(parseResultMarker(["RESULT: pass"]), "pass");
+  assert.equal(parseResultMarker(["result: PARTIAL"]), "partial");
+  assert.equal(parseResultMarker(["Result: Blocked."]), "blocked");
+  assert.equal(parseResultMarker(["RESULT: fail"]), "fail");
+  assert.equal(parseResultMarker(["`RESULT: blocked`"]), "blocked");
+  assert.equal(parseResultMarker(["**RESULT: partial**"]), "partial");
+  assert.equal(parseResultMarker(["> RESULT: pass"]), "pass");
 });
+
+test("parseResultMarker: last occurrence wins; missing marker, empty, and non-array input all yield null", () => {
+  assert.equal(parseResultMarker(["RESULT: pass", "more text", "RESULT: fail"]), "fail");
+  assert.equal(parseResultMarker(["no marker in this report"]), null);
+  assert.equal(parseResultMarker([]), null);
+  assert.equal(parseResultMarker(undefined), null);
+  assert.equal(parseResultMarker(["note: RESULT: pass is mentioned here"]), null, "mid-sentence mention must not count");
+});
+
+// ---------------------------------------------------------------------------
+// markerFor: full label precedence (requirement A).
+// ---------------------------------------------------------------------------
+
+test("markerFor: runner-reported failure always wins over any RESULT marker claiming success", () => {
+  assert.equal(markerFor("spawn-error", null, { resultMarker: "pass" }), "[SPAWN-ERROR]");
+  assert.equal(markerFor("signal", null, { resultMarker: "pass" }), "[SIGNAL]");
+  assert.equal(markerFor("bg_tasks_terminated", 0, { resultMarker: "pass", reportComplete: true }), "[BG-TASKS-TERMINATED]");
+  assert.equal(markerFor("exit", 1, { resultMarker: "pass" }), "[FAIL]");
+});
+
+test("markerFor: [INCOMPLETE] outranks a RESULT marker -- no report means nothing to trust a marker from", () => {
+  assert.equal(markerFor("exit", 0, { reportComplete: false, resultMarker: "pass" }), "[INCOMPLETE]");
+  assert.equal(markerFor("exit", 0, { reportComplete: false, resultMarker: "blocked" }), "[INCOMPLETE]");
+  assert.equal(markerFor("exit", 0, { reportComplete: false, enforce: false, resultMarker: "pass" }), "[OK]", "enforcement off skips straight to the RESULT marker");
+});
+
+test("markerFor: RESULT marker maps to its own label when the run exited 0 with a complete report", () => {
+  assert.equal(markerFor("exit", 0, { reportComplete: true, resultMarker: "pass" }), "[OK]");
+  assert.equal(markerFor("exit", 0, { reportComplete: true, resultMarker: "partial" }), "[PARTIAL]");
+  assert.equal(markerFor("exit", 0, { reportComplete: true, resultMarker: "blocked" }), "[BLOCKED]");
+  assert.equal(markerFor("exit", 0, { reportComplete: true, resultMarker: "fail" }), "[FAIL]");
+});
+
+// 2026-10-31 claunker.cloud-dispatch-test-20261031-j8or6rg2: exited 0 with a complete
+// (DELEGATION-METRICS-carrying) report but NO RESULT: marker -- the job's own report said
+// BLOCKED, but the old rule read exit 0 + complete as [OK]. [DONE] (not [OK]) makes an
+// unverified outcome visually distinct from a confirmed pass.
+test("markerFor: exit 0, complete report, no RESULT marker -> [DONE], never [OK]", () => {
+  assert.equal(markerFor("exit", 0), "[DONE]", "no 3rd arg at all");
+  assert.equal(markerFor("exit", 0, { reportComplete: true }), "[DONE]");
+  assert.equal(markerFor("exit", 0, { reportComplete: true, resultMarker: null }), "[DONE]");
+  assert.equal(markerFor("exit", 0, { reportComplete: false, enforce: false, resultMarker: null }), "[DONE]", "enforcement off, exit 0, no marker at all");
+});
+
+// ---------------------------------------------------------------------------
+// isSummaryHeadingLine / buildExcerpt (requirement B).
+// ---------------------------------------------------------------------------
+
+test("isSummaryHeadingLine: markdown heading/emphasis/list variants match; mid-sentence mentions of \"summary\" do not", () => {
+  for (const line of ["## Summary", "**Summary:**", "**Summary / blocker:**", "- Summary", "Summary", "### SUMMARY"]) {
+    assert.ok(isSummaryHeadingLine(line), `expected a summary heading: ${JSON.stringify(line)}`);
+  }
+  for (const line of ["In summary, this works.", "The summary report follows.", "no heading here", ""]) {
+    assert.ok(!isSummaryHeadingLine(line), `expected NOT a summary heading: ${JSON.stringify(line)}`);
+  }
+});
+
+test("buildExcerpt: null on empty/missing stdout", () => {
+  assert.equal(buildExcerpt([]), null);
+  assert.equal(buildExcerpt(undefined), null);
+});
+
+test("buildExcerpt: prefers the text after the LAST Summary-style heading", () => {
+  const lines = [
+    "intro paragraph, not the point of the report",
+    "## Summary of findings along the way",
+    "an earlier, non-final summary section",
+    "## Summary",
+    "the real final conclusion",
+    "DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none",
+  ];
+  assert.equal(buildExcerpt(lines), "the real final conclusion");
+});
+
+test("buildExcerpt: excludes the DELEGATION-METRICS line (plain or markdown-wrapped) but keeps everything else", () => {
+  assert.equal(
+    buildExcerpt(["## Summary", "All good.", "DELEGATION-METRICS: calls=1 accepted=1 accepted_after_edits=0 rejected=0 lines_delegated=5 lines_total=10 model=x"]),
+    "All good.",
+  );
+  assert.equal(
+    buildExcerpt(["## Summary", "All good.", "`DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none`"]),
+    "All good.",
+  );
+});
+
+test("buildExcerpt: no Summary heading -> falls back to the last EXCERPT_MAX_CHARS, cut at a line boundary", () => {
+  const lines = Array.from({ length: 60 }, (_, i) => `report line ${i} with some padding text to add length`);
+  const result = buildExcerpt(lines);
+  assert.ok(result.length <= EXCERPT_MAX_CHARS);
+  assert.ok(result.endsWith("report line 59 with some padding text to add length"), "the very last line must survive the cut");
+  assert.ok(!result.startsWith("report line 0 "), "the cut must have dropped the earliest lines");
+  assert.equal(result[0], result.trimStart()[0], "the kept text must start exactly on a line boundary, not mid-line");
+});
+
+test("buildExcerpt: a Summary heading with nothing meaningful after it falls back to the whole (filtered) tail", () => {
+  const lines = ["the actual content", "## Summary", "DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none"];
+  assert.equal(buildExcerpt(lines), "the actual content\n## Summary");
+});
+
+// ---------------------------------------------------------------------------
+// Discord-safety post-processing (requirement C): URLs never left adjacent to a markdown
+// character, and a cut never leaves a dangling code span/fence open.
+// ---------------------------------------------------------------------------
+
+test("stripBackticksAroundUrls: removes backticks that wrap a URL exactly, leaves everything else alone", () => {
+  assert.equal(stripBackticksAroundUrls("see `https://example.com/a`, done"), "see https://example.com/a, done");
+  assert.equal(stripBackticksAroundUrls("no backticks https://example.com here"), "no backticks https://example.com here");
+  assert.equal(stripBackticksAroundUrls("`git remote -v`"), "`git remote -v`", "a non-URL code span is untouched");
+});
+
+test("ensureSpaceAfterUrlBeforeBacktick: inserts a space between a URL and an immediately following (escaped or raw) backtick", () => {
+  assert.equal(ensureSpaceAfterUrlBeforeBacktick("see https://example.com`next"), "see https://example.com `next");
+  assert.equal(ensureSpaceAfterUrlBeforeBacktick("see https://example.com\\`next"), "see https://example.com \\`next");
+  assert.equal(ensureSpaceAfterUrlBeforeBacktick("see https://example.com next"), "see https://example.com next");
+});
+
+// Real-world regression: job claunker.cloud-dispatch-test-20261031-j8or6rg2's ping rendered
+// "https://github.com/icey2488/gallagioloot.git/%60" -- its report wrapped the URL in a code span
+// immediately followed by a comma, and escaping the backticks left a literal backtick glued to
+// the URL with no separating whitespace, which Discord's autolinker absorbed into the link.
+test("buildExcerpt: a URL immediately followed by a backtick is never left adjacent to it after escaping", () => {
+  const lines = ["## Summary", "Clone it from `https://github.com/example/repo.git`, then build."];
+  const result = buildExcerpt(lines);
+  assert.ok(!/https?:\/\/\S*\\?`/.test(result), `URL must not be glued to a backtick, got: ${result}`);
+  assert.ok(result.includes("https://github.com/example/repo.git"), "the URL itself must survive intact");
+});
+
+test("closeMarkdownSpansAtStart: strips an orphaned closing marker left at the START of a front-cut excerpt", () => {
+  assert.equal(closeMarkdownSpansAtStart("bold never opened**"), "bold never opened");
+  assert.equal(closeMarkdownSpansAtStart("plain **closed** and fine"), "plain **closed** and fine");
+  assert.equal(closeMarkdownSpansAtStart("italic never opened* continues"), "italic never opened continues");
+  assert.equal(closeMarkdownSpansAtStart("italic never opened_ continues"), "italic never opened continues");
+  assert.equal(closeMarkdownSpansAtStart("a lone closer` with nothing before it"), "a lone closer with nothing before it");
+  assert.equal(closeMarkdownSpansAtStart("orphaned fence content\n``` after, fine"), "orphaned fence content\n after, fine");
+});
+
+test("buildExcerpt: a cut landing mid inline-code span closes it instead of leaving an orphaned backtick", () => {
+  const prefix = "A".repeat(100);
+  const code = "`CODE`"; // opens right after the prefix, closes 5 characters later
+  const suffix = "X".repeat(EXCERPT_MAX_CHARS - 1);
+  const line = prefix + code + suffix;
+  // The cut keeps the last EXCERPT_MAX_CHARS characters; by construction that window starts
+  // exactly on the closing backtick, dropping the opening one along with the rest of the prefix.
+  const result = buildExcerpt([line]);
+  assert.equal(result, "X".repeat(EXCERPT_MAX_CHARS - 1));
+  assert.ok(!result.includes("`"), "the orphaned backtick left by the cut must be closed, not left dangling");
+});
+
+test("buildExcerpt: a cut landing mid fenced code block never leaves an unbalanced ``` marker", () => {
+  const prefix = "A".repeat(EXCERPT_MAX_CHARS + 500);
+  const fenceOpen = "```js\n";
+  const codeBody = "x".repeat(50) + "\n";
+  const fenceClose = "```\n";
+  const suffix = "tail text after the fence, long enough to pad this out nicely for the window. ".repeat(5);
+  const line = prefix + fenceOpen + codeBody + fenceClose + suffix;
+  const result = buildExcerpt([line]);
+  const fenceCount = (result.match(/```/g) || []).length;
+  assert.equal(fenceCount % 2, 0, `fence markers must balance (0 or a complete pair), never an orphan; got: ${result}`);
+});
+
+// ---------------------------------------------------------------------------
+// Real job regression (requirement D): the exact stdout of
+// claunker.cloud-dispatch-test-20261031-j8or6rg2 (read from
+// C:\Users\Raide\.claude-async-jobs\claunker.cloud-dispatch-test-20261031-j8or6rg2\out.log on
+// 2026-10-31). Stopped because a permission denial blocked the `claude` CLI from launching
+// anything, exited 0 anyway, and ended with a complete DELEGATION-METRICS report but no RESULT:
+// line -- exactly the case the old rule misread as [OK].
+// ---------------------------------------------------------------------------
+
+const REAL_JOB_STDOUT = [
+  "I was able to run `git remote -v` successfully — it confirms `origin` points to `https://github.com/icey2488/gallagioloot.git`, matching icey2488/gallagioloot. Good so far.",
+  "",
+  "However, every attempt to invoke `claude` itself (via PowerShell or Bash) is being denied by the permission system, specifically because this session is running in \"don't ask\" mode, which blocks it. This isn't a transient error — it's a deliberate permission wall, and the tool's own guidance says not to try to route around a denial in disguised ways (different shell, wrapper script, etc.), since that would defeat the intent of the restriction.",
+  "",
+  "I'm stopping here rather than trying workarounds, since:",
+  "- The task explicitly requires launching another `claude` process (`claude --cloud`), and this environment's permission mode is blocking any invocation of the `claude` binary.",
+  "- Attempting to bypass that (e.g., via a wrapper script, `cmd /c`, Python `subprocess`, or editing permission settings) would be circumventing a safety boundary rather than reasonably working within it.",
+  "",
+  "**Summary / blocker:**",
+  "- Git remote check: ✅ pass — `origin` = `https://github.com/icey2488/gallagioloot.git`",
+  "- `claude --version`, `claude --help`, `claude --cloud --help`, auth status: ❌ blocked — permission denied in don't-ask mode for any `claude` invocation",
+  "- No cloud session was launched. No repo files, branches, or remotes were touched.",
+  "- Options for you: either grant explicit permission to run the `claude` CLI command in this session (e.g., approve a one-off Bash/PowerShell permission for `claude ...`), or run the launch step yourself from a terminal where that restriction doesn't apply.",
+  "",
+  "**Delegation report:** Zero Ollama calls — this launcher job is pure CLI/process orchestration (no formatting, boilerplate, or conversion work eligible for local-model delegation), and it stopped before reaching any work that would have been.",
+  "",
+  "`DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none`",
+];
+
+test("regression: claunker.cloud-dispatch-test-20261031-j8or6rg2 never reads as [OK] and its excerpt surfaces the blocker", () => {
+  const resultMarker = parseResultMarker(REAL_JOB_STDOUT);
+  assert.equal(resultMarker, null, "this job predates the RESULT: convention");
+  const reportComplete = hasCompletenessMarker(REAL_JOB_STDOUT);
+  assert.equal(reportComplete, true, "the DELEGATION-METRICS line IS present");
+  const marker = markerFor("exit", 0, { reportComplete, resultMarker });
+  assert.notEqual(marker, "[OK]", "an unverified exit-0 report must never read as confirmed success");
+  assert.equal(marker, "[DONE]");
+
+  const excerpt = buildExcerpt(REAL_JOB_STDOUT);
+  assert.ok(!excerpt.includes("DELEGATION-METRICS"), "the contract line itself must not appear in the excerpt");
+  assert.match(excerpt, /permission denied|blocked|don.t.ask mode/i, "the excerpt must surface the blocker, not the opening paragraph");
+  assert.ok(!/https?:\/\/\S*`/.test(excerpt), "the real URL/backtick bug must not reproduce");
+});
+
+// ---------------------------------------------------------------------------
+// buildDiscordContent / loadNotifyConfig / loadCompletenessConfig.
+// ---------------------------------------------------------------------------
 
 test("buildDiscordContent: shape, and a 1800-char hard cap", () => {
   const content = buildDiscordContent({
-    marker: "[OK]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 5000, headline: "did the thing",
+    marker: "[OK]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 5000, excerpt: "did the thing",
   });
   assert.match(content, /^\[OK\] host=claunker job=job-1 exit=0 duration=5s\ndid the thing$/);
 
   const huge = buildDiscordContent({
-    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: "x".repeat(5000),
+    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, excerpt: "x".repeat(5000),
   });
   assert.equal(huge.length, 1800);
 });
 
-test("readHead: file at or under maxBytes is read whole, no line dropped", () => {
-  const p = path.join(TMP, `readhead-small-${Date.now()}.txt`);
-  fs.writeFileSync(p, "line one\nline two\nline three\n");
-  assert.deepEqual(readHead(p, 8192), ["line one", "line two", "line three"]);
+test("buildDiscordContent: incompleteReason is appended as its own line after the excerpt", () => {
+  const content = buildDiscordContent({
+    marker: "[INCOMPLETE]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 1000,
+    excerpt: "did the thing", incompleteReason: INCOMPLETE_REASON,
+  });
+  const lines = content.split("\n");
+  assert.equal(lines.length, 3);
+  assert.equal(lines[1], "did the thing");
+  assert.equal(lines[2], INCOMPLETE_REASON);
 });
 
-test("readHead: a file bigger than maxBytes drops the last (likely partial) line of the read window", () => {
-  const p = path.join(TMP, `readhead-big-${Date.now()}.txt`);
-  // Each line is exactly 10 bytes ("0123456789\n" is 11) so a maxBytes of 55 lands mid-line-6.
-  const lines = Array.from({ length: 10 }, (_, i) => String(i).repeat(9));
-  fs.writeFileSync(p, lines.join("\n") + "\n");
-  const head = readHead(p, 55); // covers lines 0-4 whole plus a partial line 5
-  assert.deepEqual(head, lines.slice(0, 5), "the partial 6th line must be dropped, not truncated");
-});
-
-test("readHead: missing file yields []", () => {
-  assert.deepEqual(readHead(path.join(TMP, "does-not-exist-at-all.txt")), []);
-});
-
-test("chooseHeadlineLines: head wins when it has a qualifying line; tail is the fallback otherwise", () => {
-  const tail = ["tail line"];
-  assert.deepEqual(chooseHeadlineLines(["head line"], tail), ["head line"]);
-  assert.deepEqual(chooseHeadlineLines(["# only a heading"], tail), tail, "no qualifying line in head -> fallback");
-  assert.deepEqual(chooseHeadlineLines([], tail), tail, "empty head (missing/unreadable out.log) -> fallback");
+test("buildDiscordContent: an absent/falsy incompleteReason adds no extra line", () => {
+  const withExcerpt = buildDiscordContent({
+    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, excerpt: "hi", incompleteReason: undefined,
+  });
+  assert.equal(withExcerpt.split("\n").length, 2);
+  const noExcerpt = buildDiscordContent({
+    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, excerpt: null, incompleteReason: "",
+  });
+  assert.equal(noExcerpt.split("\n").length, 1);
 });
 
 test("loadNotifyConfig: absent file, unparseable JSON, and missing/blank webhookUrl all mean off", () => {
@@ -247,11 +322,6 @@ test("loadNotifyConfig: absent file, unparseable JSON, and missing/blank webhook
   fs.unlinkSync(p);
 });
 
-// ---------------------------------------------------------------------------
-// Completeness rule: hasCompletenessMarker, loadCompletenessConfig, markerFor's new
-// reportComplete/enforce behavior, buildDiscordContent's incompleteReason line.
-// ---------------------------------------------------------------------------
-
 test("hasCompletenessMarker: a line starting with the marker counts, mid-line does not", () => {
   assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: calls=1 accepted=1"]), true);
   assert.equal(hasCompletenessMarker(["note: DELEGATION-METRICS: calls=1"]), false, "marker not at line start must not count");
@@ -266,11 +336,6 @@ test("hasCompletenessMarker: a custom markerRegex is used instead of the default
   assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: hi"], /^CUSTOM-MARKER:/), false);
 });
 
-// 2026-10-18 claunker.test-discord-isolation-20261018-582t1o1k: finished its work fully but ended
-// with its final report line wrapped in inline code (`` `DELEGATION-METRICS: ...` ``), so the
-// plain ^DELEGATION-METRICS: regex didn't match, the job was marked "incomplete", and Discord
-// posted [INCOMPLETE] for a job that actually completed. hasCompletenessMarker must tolerate
-// common markdown wrapping while still rejecting a mid-sentence mention.
 test("hasCompletenessMarker: tolerates common markdown wrapping around the marker line", () => {
   assert.equal(hasCompletenessMarker(["`DELEGATION-METRICS: calls=0 accepted=0`"]), true, "inline backtick");
   assert.equal(hasCompletenessMarker(["```", "DELEGATION-METRICS: calls=0 accepted=0", "```"]), true, "fenced block");
@@ -279,68 +344,6 @@ test("hasCompletenessMarker: tolerates common markdown wrapping around the marke
   assert.equal(hasCompletenessMarker(["    DELEGATION-METRICS: calls=0 accepted=0"]), true, "indented");
   assert.equal(hasCompletenessMarker(["DELEGATION-METRICS: calls=0 accepted=0"]), true, "plain line still works");
   assert.equal(hasCompletenessMarker(["note: DELEGATION-METRICS: calls=1 is mentioned here"]), false, "mid-sentence mention must not match");
-});
-
-test("stripMarkdownWrapping: strips wrapper chars without touching the hyphen inside DELEGATION-METRICS", () => {
-  assert.equal(stripMarkdownWrapping("`DELEGATION-METRICS: x`"), "DELEGATION-METRICS: x");
-  assert.equal(stripMarkdownWrapping("**DELEGATION-METRICS: x**"), "DELEGATION-METRICS: x");
-  assert.equal(stripMarkdownWrapping("> DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
-  assert.equal(stripMarkdownWrapping("    DELEGATION-METRICS: x"), "DELEGATION-METRICS: x");
-});
-
-// Regression: the exact final stdoutTail array recorded in claunker.test-discord-isolation-
-// 20261018-582t1o1k's exit.json, whose last line is the DELEGATION-METRICS report wrapped in
-// inline backticks. Must now read as complete.
-test("hasCompletenessMarker: regression -- exact stdoutTail from claunker.test-discord-isolation-20261018-582t1o1k", () => {
-  const stdoutTail = [
-    "In `notifyJobFinished`: when test mode (`CLAUDE_ASYNC_TEST=1` or `NODE_TEST_CONTEXT`) is on **and** the resolved webhook host is a genuine `discord.com`/`discordapp.com` domain **and** the caller is using the default (real, network-capable) `fetch` — the send is blocked, logged, and counted via `getRealSendBlockedCount()`. A test-injected fake `fetchImpl`, or a non-Discord URL (the existing integration tests' local HTTP servers), passes through unaffected — so the existing `discord-notify.test.mjs` integration tests still work.",
-    "",
-    "### Verify — real results",
-    "- `npm run test:multihost`: **354 pass, 1 skip** (pre-existing, platform-specific — Windows has no self-kill signal), **0 fail**.",
-    "- `node test/survival.mjs`: all 4 scenarios **PASS**.",
-    "- `node test-card-hook.mjs`: **24/24 PASS**.",
-    "",
-    "**Real-send count: 0** across the full run, proven by instrumentation (not by eye):",
-    "- New regression test monkey-patches `globalThis.fetch` as a zero-call spy, configures a real-looking `discord.com` webhook (simulating the exact incident), and asserts `realFetchCalls === 0` while `getRealSendBlockedCount()` increments by exactly 1.",
-    "- Same test then uses an injected fake sender against the identical Discord-host URL and confirms it still receives the call (1 fake send recorded) — proving the guard doesn't break intentional instrumentation.",
-    "- A third test confirms a non-Discord (local-server) URL is unaffected — the existing integration tests' real local-server POSTs still land (`requests.length === 1`), and the blocked-counter doesn't move.",
-    "- `test-card-hook.mjs`/`test/survival.mjs` runs now have an isolated, notify.json-free `CLAUDE_ASYNC_CONFIG_DIR`, so `loadNotifyConfig()` returns `null` immediately — zero network attempts of any kind.",
-    "",
-    "### Restart: **No**",
-    "`claude-async-server.mjs` (the long-lived bridge) never imports `discord-notify.mjs` — only `job-runner.mjs` does, and that's a fresh detached process spawned per job, never cached by the bridge. The change takes effect on the next job run with no bridge restart needed.",
-    "",
-    "### Ollama delegation report",
-    "**Zero Ollama calls.** No eligible work existed: this job was entirely test-harness/notify-logic/git work (all explicitly excluded from delegation), and there was no README/RUNBOOK prose task with exact instructions to delegate.",
-    "",
-    "`DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=148 model=none`",
-  ];
-  assert.equal(hasCompletenessMarker(stdoutTail), true);
-});
-
-// 2026-10-18 claunker.card-hook-incomplete-20261018-0rn2fuur: the [OK] ping's headline was
-// "129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none." -- leftover arithmetic from
-// the job's own report, not a meaningful summary. extractHeadline must skip arithmetic-leftover
-// and DELEGATION-* lines so a real content line wins instead.
-test("isJunkHeadlineLine: flags arithmetic leftovers and DELEGATION-* lines, not real content", () => {
-  assert.equal(isJunkHeadlineLine("129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none."), true);
-  assert.equal(isJunkHeadlineLine("DELEGATION-METRICS: calls=0 accepted=0"), true);
-  assert.equal(isJunkHeadlineLine("DELEGATION-CALL: task_type=doc outcome=accepted"), true);
-  assert.equal(isJunkHeadlineLine("**Branch/commit:** `fix/x` fast-forwarded into `main`."), false);
-  assert.equal(isJunkHeadlineLine("129 files changed in this release."), false, "a number followed by prose is not arithmetic");
-});
-
-test("extractHeadline: regression -- real head lines from claunker.card-hook-incomplete-20261018-0rn2fuur pick real content over the arithmetic leftover", () => {
-  const headLines = [
-    "129+19 = 148 lines_total, lines_delegated=0, calls=0, model=none.",
-    "",
-    "## Final Summary",
-    "",
-    "**Branch/commit:** `fix/card-hook-status` → fast-forwarded into `main`, new HEAD `538d24b` (was `a582cbf`).",
-  ];
-  assert.equal(
-    extractHeadline(headLines),
-    "**Branch/commit:** `fix/card-hook-status` → fast-forwarded into `main`, new HEAD `538d24b` (was `a582cbf`).",
-  );
 });
 
 test("loadCompletenessConfig: absent file, no completeness key, and unparseable JSON all default to enforce=true with the DELEGATION-METRICS marker", () => {
@@ -390,42 +393,6 @@ test("loadCompletenessConfig: an invalid markerRegex string falls back to the de
   fs.unlinkSync(p);
 });
 
-test("markerFor: exit-0 completeness gating -- [INCOMPLETE] only when enforced and reportComplete is false", () => {
-  assert.equal(markerFor("exit", 0), "[OK]", "no 3rd arg at all preserves old behavior");
-  assert.equal(markerFor("exit", 0, { reportComplete: true }), "[OK]");
-  assert.equal(markerFor("exit", 0, { reportComplete: false }), "[INCOMPLETE]");
-  assert.equal(markerFor("exit", 0, { reportComplete: false, enforce: false }), "[OK]", "enforcement off always OK on exit 0");
-});
-
-test("markerFor: a non-zero exit, signal, or spawn-error is never relabeled by reportComplete/enforce", () => {
-  assert.equal(markerFor("exit", 1, { reportComplete: false }), "[FAIL]");
-  assert.equal(markerFor("exit", 1, { reportComplete: true, enforce: false }), "[FAIL]");
-  assert.equal(markerFor("signal", null, { reportComplete: false }), "[SIGNAL]");
-  assert.equal(markerFor("spawn-error", null, { reportComplete: false }), "[SPAWN-ERROR]");
-});
-
-test("buildDiscordContent: incompleteReason is appended as its own line after the headline", () => {
-  const content = buildDiscordContent({
-    marker: "[INCOMPLETE]", host: "claunker", jobId: "job-1", exitCode: 0, durationMs: 1000,
-    headline: "did the thing", incompleteReason: INCOMPLETE_REASON,
-  });
-  const lines = content.split("\n");
-  assert.equal(lines.length, 3);
-  assert.equal(lines[1], "did the thing");
-  assert.equal(lines[2], INCOMPLETE_REASON);
-});
-
-test("buildDiscordContent: an absent/falsy incompleteReason adds no extra line", () => {
-  const withHeadline = buildDiscordContent({
-    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: "hi", incompleteReason: undefined,
-  });
-  assert.equal(withHeadline.split("\n").length, 2);
-  const noHeadline = buildDiscordContent({
-    marker: "[OK]", host: "h", jobId: "j", exitCode: 0, durationMs: 0, headline: null, incompleteReason: "",
-  });
-  assert.equal(noHeadline.split("\n").length, 1);
-});
-
 // ---------------------------------------------------------------------------
 // Integration tests: the real job-runner.mjs, a real (loopback) HTTP server, no fakes.
 // ---------------------------------------------------------------------------
@@ -439,8 +406,8 @@ const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
 
 // A real final report's last line (see CLAUDE.md's delegation contract). Appended to a fixture's
 // stdoutText wherever a test's point is unrelated to the completeness rule, so the exit-0 job
-// still reads as "complete" ([OK], no trailing reason line) under the new default enforcement --
-// see the dedicated "[INCOMPLETE]" tests further down for the marker-missing path itself.
+// still reads as "complete" under the new default enforcement -- see the dedicated
+// "[INCOMPLETE]" tests further down for the marker-missing path itself.
 const METRICS_LINE = "DELEGATION-METRICS: calls=0 accepted=0 accepted_after_edits=0 rejected=0 lines_delegated=0 lines_total=0 model=none";
 
 function writeNotify(cfg) {
@@ -538,7 +505,7 @@ test("unparseable notify.json: no request, no throw, job still completes", async
   void url; // never used by notify.json in this test; kept only to hold the listener open until close()
 });
 
-test("success: correct payload shape, allowed_mentions parse [], JSON content-type", async () => {
+test("success: correct payload shape, allowed_mentions parse [], JSON content-type, [DONE] with no RESULT marker", async () => {
   const dir = prepareJob({ exitCode: 0, stdoutText: `plain first line\n${METRICS_LINE}\n` });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
@@ -550,31 +517,52 @@ test("success: correct payload shape, allowed_mentions parse [], JSON content-ty
   const { body, headers } = requests[0];
   assert.equal(headers["content-type"], "application/json");
   assert.deepEqual(body.allowed_mentions, { parse: [] });
-  assert.match(body.content, /^\[OK\] host=\S+ job=notify-job-\d+ exit=0 duration=\d/);
+  assert.match(body.content, /^\[DONE\] host=\S+ job=notify-job-\d+ exit=0 duration=\d/);
 });
 
-test("headline rule: first non-heading/non-fence line, truncated to HEADLINE_MAX_CHARS on a word boundary, then escaped", async () => {
-  const longLine = "Result ready @everyone check the output file now, no further action needed " + "x ".repeat(250);
-  const stdoutText = ["# a heading, skipped", "```", "", longLine, "trailing line, never reached", METRICS_LINE].join("\n");
+test("success: a RESULT: pass marker in the final report pings [OK]", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: `## Summary\nEverything checks out.\nRESULT: pass\n${METRICS_LINE}\n` });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  const lines = requests[0].body.content.split("\n");
+  assert.match(lines[0], /^\[OK\] /);
+  assert.equal(lines[1], "Everything checks out.");
+});
+
+test("a RESULT: blocked marker in the final report pings [BLOCKED] with the blocker in the excerpt", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: `## Summary\nRan into a wall and stopped.\nRESULT: blocked\n${METRICS_LINE}\n` });
+  const { server, requests } = startServer(dir);
+  const url = await listen(server);
+  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
+  await spawnRunner(dir);
+  server.close();
+  const lines = requests[0].body.content.split("\n");
+  assert.match(lines[0], /^\[BLOCKED\] /);
+  assert.equal(lines[1], "Ran into a wall and stopped.");
+});
+
+test("excerpt source: the end of the report (final Summary section) wins over a misleading opening paragraph", async () => {
+  const stdoutText = [
+    "Good so far, everything is on track.",
+    "## Summary",
+    "Actually it failed at the very last step.",
+    METRICS_LINE,
+  ].join("\n") + "\n";
   const dir = prepareJob({ exitCode: 0, stdoutText });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
   writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
   await spawnRunner(dir);
   server.close();
-  assert.equal(requests.length, 1);
   const lines = requests[0].body.content.split("\n");
-  assert.equal(lines.length, 2, "status line + one headline line");
-  const headline = lines[1];
-  const expectedTruncated = truncateHeadline(longLine);
-  assert.equal(headline, escapeDiscordText(expectedTruncated));
-  assert.ok(!/(?<!\\)@everyone/.test(headline), "@everyone must never appear un-escaped");
-  assert.ok(headline.includes("\\@everyone"), "escaped form must be present");
-  assert.ok(headline.endsWith("…"), "a truncated headline ends with an ellipsis");
+  assert.equal(lines[1], "Actually it failed at the very last step.");
 });
 
-test("includeHeadline=false: headline line is omitted even when stdout has one", async () => {
-  const dir = prepareJob({ exitCode: 0, stdoutText: `a perfectly good headline line\n${METRICS_LINE}\n` });
+test("includeHeadline=false: excerpt line is omitted even when stdout has a Summary section", async () => {
+  const dir = prepareJob({ exitCode: 0, stdoutText: `## Summary\na perfectly good excerpt line\n${METRICS_LINE}\n` });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
   writeNotify({ discord: { webhookUrl: url, includeHeadline: false } });
@@ -584,69 +572,10 @@ test("includeHeadline=false: headline line is omitted even when stdout has one",
   assert.equal(requests[0].body.content.split("\n").length, 1);
 });
 
-// Fix: the headline used to come from stdoutTail (the LAST 20 lines of stdout), which for a long
-// job report lands mid-report -- job reports put their verdict on the FIRST line instead ("GATE
-// FAILED...", "Everything checks out.", "Branch pushed..."). These tests exercise the new
-// HEAD-of-out.log source and its fallback to the old tail rule.
-test("headline source: the verdict on the FIRST line wins even though the last 20 lines are pure boilerplate", async () => {
-  const verdict = "GATE FAILED — stopping immediately";
-  const boilerplate = Array.from({ length: 25 }, (_, i) => `delegation report line ${i}`);
-  const stdoutText = [verdict, ...boilerplate].join("\n") + "\n";
-  const dir = prepareJob({ exitCode: 1, stdoutText });
-  const { server, requests } = startServer(dir);
-  const url = await listen(server);
-  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
-  await spawnRunner(dir);
-  server.close();
-  assert.equal(requests.length, 1);
-  const lines = requests[0].body.content.split("\n");
-  assert.equal(lines[1], verdict, "headline must be the first line, not something from the last-20-lines tail");
-});
-
-test("headline source: a markdown heading as the first line of out.log is skipped to the next qualifying line", async () => {
-  const stdoutText = ["# Job Report", "Everything checks out.", "trailing detail, never the headline"].join("\n") + "\n";
-  const dir = prepareJob({ exitCode: 0, stdoutText });
-  const { server, requests } = startServer(dir);
-  const url = await listen(server);
-  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
-  await spawnRunner(dir);
-  server.close();
-  assert.equal(requests[0].body.content.split("\n")[1], "Everything checks out.");
-});
-
-test("headline source: a report opening with a bold path-bearing section label never puts the path on the ping", async () => {
-  const stdoutText = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`\n";
-  const dir = prepareJob({ exitCode: 0, stdoutText });
-  const { server, requests } = startServer(dir);
-  const url = await listen(server);
-  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
-  await spawnRunner(dir);
-  server.close();
-  const content = requests[0].body.content;
-  assert.ok(!content.includes("Users"), `no path may reach the ping, got: ${content}`);
-  assert.equal(content.split("\n")[1], "- Branch: \\`main\\`");
-});
-
-test("headline source: out.log over 8 KiB whose only qualifying line is past the 8 KiB mark falls back to the stdoutTail rule", async () => {
-  // ~600 heading lines comfortably exceeds the 8 KiB head-read bound; every one of them is skipped
-  // by extractHeadline() (both in the head window and in the tail fallback), so the real line at
-  // the very end is the only line either rule could possibly surface.
-  const padding = Array.from({ length: 600 }, (_, i) => `# padding heading line ${i}`);
-  const stdoutText = [...padding, "Verdict from the tail"].join("\n") + "\n";
-  assert.ok(Buffer.byteLength(padding.join("\n"), "utf8") > 8192, "test setup: padding must exceed the 8 KiB head bound");
-  const dir = prepareJob({ exitCode: 0, stdoutText });
-  const { server, requests } = startServer(dir);
-  const url = await listen(server);
-  writeNotify({ discord: { webhookUrl: url, includeHeadline: true } });
-  await spawnRunner(dir);
-  server.close();
-  assert.equal(requests[0].body.content.split("\n")[1], "Verdict from the tail");
-});
-
 // Fix: `intent` (claude_start's optional one-line summary) is now persisted to meta.json by
 // job-core.mjs's startJob() (see postlaunch.test.mjs), so job-runner.mjs's finish() -- which only
 // ever reads meta.json -- can pass it through as the notification's title.
-test("title: meta.json's intent is used as the title, escaped the same way headline text is", async () => {
+test("title: meta.json's intent is used as the title, escaped the same way excerpt text is", async () => {
   const dir = prepareJob({ exitCode: 0 });
   const metaPath = path.join(dir, "meta.json");
   const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
@@ -743,16 +672,16 @@ test("webhook URL never appears anywhere in the job dir, including after a netwo
 });
 
 // ---------------------------------------------------------------------------
-// [INCOMPLETE] end-to-end: the real job-runner.mjs writing exit.json's reportComplete field and
-// (when a webhook is configured) labeling the ping, via the real completeness config read from
-// notify.json's "completeness" key.
+// [INCOMPLETE] / [DONE] / [FAIL] end-to-end: the real job-runner.mjs writing exit.json's
+// reportComplete field and (when a webhook is configured) labeling the ping, via the real
+// completeness config read from notify.json's "completeness" key.
 // ---------------------------------------------------------------------------
 
 function readExitJson(dir) {
   return JSON.parse(fs.readFileSync(path.join(dir, "exit.json"), "utf8"));
 }
 
-test("exit 0 with the DELEGATION-METRICS marker: reportComplete=true in exit.json, ping stays [OK]", async () => {
+test("exit 0 with the DELEGATION-METRICS marker but no RESULT marker: reportComplete=true, ping is [DONE]", async () => {
   const dir = prepareJob({ exitCode: 0, stdoutText: `Everything checks out.\n${METRICS_LINE}\n` });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
@@ -761,7 +690,7 @@ test("exit 0 with the DELEGATION-METRICS marker: reportComplete=true in exit.jso
   server.close();
   assert.equal(readExitJson(dir).reportComplete, true);
   assert.equal(requests.length, 1);
-  assert.match(requests[0].body.content, /^\[OK\] /);
+  assert.match(requests[0].body.content, /^\[DONE\] /);
 });
 
 test("exit 0 without the marker (default config, enforced): reportComplete=false in exit.json, ping is [INCOMPLETE] with a reason line", async () => {
@@ -775,7 +704,7 @@ test("exit 0 without the marker (default config, enforced): reportComplete=false
   assert.equal(requests.length, 1);
   const lines = requests[0].body.content.split("\n");
   assert.match(lines[0], /^\[INCOMPLETE\] /);
-  assert.equal(lines[1], "Everything checks out, allegedly.", "headline is kept");
+  assert.equal(lines[1], "Everything checks out, allegedly.", "excerpt is kept");
   assert.equal(lines[2], INCOMPLETE_REASON);
 });
 
@@ -791,7 +720,7 @@ test("non-zero exit without the marker: failure label is unchanged ([FAIL], not 
   assert.match(requests[0].body.content, /^\[FAIL\] /);
 });
 
-test("completeness.enforce=false in notify.json: exit 0 without the marker still pings [OK]; reportComplete is still recorded false", async () => {
+test("completeness.enforce=false in notify.json: exit 0 without the marker pings [DONE] (not [INCOMPLETE]); reportComplete is still recorded false", async () => {
   const dir = prepareJob({ exitCode: 0, stdoutText: "No metrics line here.\n" });
   const { server, requests } = startServer(dir);
   const url = await listen(server);
@@ -800,7 +729,7 @@ test("completeness.enforce=false in notify.json: exit 0 without the marker still
   server.close();
   assert.equal(readExitJson(dir).reportComplete, false, "the field reports the objective fact regardless of enforcement");
   assert.equal(requests.length, 1);
-  assert.match(requests[0].body.content, /^\[OK\] /);
+  assert.match(requests[0].body.content, /^\[DONE\] /);
 });
 
 test("reportComplete is computed and written to exit.json even with no notify.json at all (no webhook configured)", async () => {
@@ -851,7 +780,7 @@ test("real-send guard: a Discord-host webhook never reaches the real fetch in te
   try {
     await notifyJobFinished({
       jobId: "test-mode-job", intent: null, host: "test-host", exitCode: 0, exitReason: "exit",
-      startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: [], outLogPath: null,
+      startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: [],
       reportComplete: true, logLine: (m) => logLines.push(m),
     });
   } finally {
@@ -867,7 +796,7 @@ test("real-send guard: a Discord-host webhook never reaches the real fetch in te
   const fakeSends = [];
   await notifyJobFinished({
     jobId: "test-mode-job-2", intent: null, host: "test-host", exitCode: 0, exitReason: "exit",
-    startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: ["Everything checks out."], outLogPath: null,
+    startedAt: new Date(Date.now() - 1000), endedAt: new Date(), stdoutLines: ["## Summary", "Everything checks out.", "RESULT: pass"],
     reportComplete: true, logLine: () => {},
     fetchImpl: async (url, opts) => { fakeSends.push({ url, body: JSON.parse(opts.body) }); return { ok: true }; },
   });

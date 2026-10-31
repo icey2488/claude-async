@@ -141,7 +141,7 @@ with a hard timeout so the runner process can't hang waiting on it. If it's not 
 webhook is unreachable, the job finishes exactly as it would without this feature.
 
 **1. Create a webhook in Discord.** Pick (or make) a channel — a **private** one is recommended,
-since the notification's optional headline line is pulled verbatim from job stdout. Channel
+since the notification's optional excerpt is pulled verbatim from the END of job stdout. Channel
 settings → Integrations → Webhooks → New Webhook → copy its URL.
 
 **2. Write `~/.claude-async/notify.json`** on each host that should notify (`CLAUDE_ASYNC_CONFIG_DIR`
@@ -154,30 +154,36 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
 - Missing file, missing/blank `discord.webhookUrl`, or unparseable JSON all mean the feature is
   off — no error. Config is read fresh at the end of every job, never cached, so editing it takes
   effect on the next job with no restart needed.
-- `includeHeadline` (default `true`): when true, the message's second line is the first non-empty
-  line of the job's own stdout log (`out.log`, read from the top — job reports conventionally put
-  their verdict there) that isn't a markdown heading (`#…`), a code-fence marker (```` ``` ````), a
-  bare markdown label (only list/number/emphasis markers around a short label, such as `1.`,
-  `- **Report**`, `**Summary:**`, or a `---` rule), or a line containing a filesystem path (Windows
-  drive paths like `C:\` or `D:/`, UNC `\\server`, absolute POSIX paths like `/home/` or `/c/Users/`).
-  A qualifying `Verdict:` line wins over an earlier qualifying line, since some reports lead with a
-  preamble paragraph before their verdict. It is truncated to 450 characters (long enough to read as
-  a real sentence on a phone, well short of the message's own 1800-char hard cap) — cutting after
-  the last complete sentence within budget, or failing that the last complete word, never mid-word,
-  with a trailing `…`. Any `**`/`*`/`_`/`` ` ``/`` ``` `` span or `[link](` left unterminated by the
-  cut is stripped (not closed) before `@`, `` ` ``, `<`, `>` are backslash-escaped, so the result
-  can't render as a mention, break message formatting, or leave a dangling code/bold/italic/link
-  span. Falls back to the tail of stdout, under the same rules, when `out.log` is missing/unreadable
-  or has no qualifying line near the top; if the tail has no qualifying line either, the headline is
-  omitted. Set it `false` for a status-only ping.
+- `includeHeadline` (default `true`; the key name predates the switch to an excerpt below and is
+  kept for config compatibility): when true, the message's second line is an **excerpt from the
+  END of the job's own stdout** — job-runner.mjs's own tail of `out.log` (the last ~20
+  lines/64KB). It prefers the text after the LAST `## Summary`-style heading (matched loosely:
+  a markdown heading, a bold/emphasis label, or a list item, whose text starts with "summary" —
+  covers `## Summary`, `**Summary:**`, `**Summary / blocker:**`, ...), since a final report's
+  conclusion conventionally lives there; absent one, it falls back to the last ~1200 characters of
+  the tail. Either way it is cut at a line boundary (never mid-line), the delegation contract's own
+  `DELEGATION-CALL:`/`DELEGATION-METRICS:` line is always excluded (delegation is still reported —
+  see "Completeness check" below — just not echoed into this human-facing text), a code
+  span/fence left open by the cut is closed rather than left dangling, and a URL is never left
+  directly adjacent to a markdown character (a backtick immediately after a URL, with no
+  separating whitespace, is exactly the shape Discord's own autolinker has been observed
+  swallowing into the link) before `@`, `` ` ``, `<`, `>` are backslash-escaped. Set it `false` for
+  a status-only ping.
 - The message is plain text (`content`) with `allowed_mentions: {"parse": []}`, so nothing in job
-  output — including that headline — can ever ping `@everyone`/`@here`/a user/a role. It carries
-  a status marker (`[OK]` / `[INCOMPLETE]` / `[FAIL]` / `[SIGNAL]` / `[SPAWN-ERROR]` /
-  `[BG-TASKS-TERMINATED]`), host, a
-  title, exit code, and duration. It never includes the prompt, stderr, environment, tokens, or
-  file paths.
+  output — including that excerpt — can ever ping `@everyone`/`@here`/a user/a role. It carries a
+  status marker (see "Status marker" below), host, a title, exit code, and duration. It never
+  includes the prompt, stderr, environment, tokens, or file paths.
 - **Title**: the ping's title is `claude_start`'s dispatch `intent` when one was given for the job
   (the same text the dispatch card's title shows), otherwise the jobId.
+- **Status marker**: `[SPAWN-ERROR]` / `[SIGNAL]` / `[BG-TASKS-TERMINATED]` / `[FAIL]` (a
+  non-zero exit) always win, regardless of anything the job's own report claims. For an exit-0 run:
+  `[INCOMPLETE]` if the completeness check below fails; otherwise, the job's own optional
+  `RESULT: pass|partial|blocked|fail` final-report line (case-insensitive, last occurrence wins) —
+  `[OK]` / `[PARTIAL]` / `[BLOCKED]` / `[FAIL]` — if one is present; and `[DONE]` (**not** `[OK]`)
+  if it isn't. `[DONE]` is deliberate: an exit-0, complete report with no explicit `RESULT:` line
+  is an *unverified* outcome (the job may have hit a blocker and said so in prose without the
+  marker) and must never read as confirmed success on the phone. Add a line reading exactly
+  `RESULT: pass` (or `partial`/`blocked`/`fail`) to a job's final report to get the precise label.
 - **Completeness check — `[INCOMPLETE]` pings and `reportComplete`**: every Claunker job's final
   report is required to end with the delegation contract's `DELEGATION-METRICS:` line (see
   CLAUDE.md's delegation policy). An exit-0 job counts as complete only if its stdout has a line
@@ -194,7 +200,8 @@ overrides the directory, same as `hosts.json`) — **this repo never creates thi
     the default.
 
   When an exit-0 job is missing the marker and enforcement is on, the ping's marker is
-  `[INCOMPLETE]` instead of `[OK]`, with a reason line appended after the headline:
+  `[INCOMPLETE]` (outranking any `RESULT:` line, since an incomplete report gives nothing to trust
+  a self-reported result from), with a reason line appended after the excerpt:
   `no final report marker (DELEGATION-METRICS) found; job may have stopped early`. Non-zero exits, signals,
   spawn errors, and `bg_tasks_terminated` (see the `exit.exitReason` table above) are never
   relabeled by this check — `[FAIL]`/`[SIGNAL]`/`[SPAWN-ERROR]`/`[BG-TASKS-TERMINATED]` keep

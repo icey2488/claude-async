@@ -15,12 +15,14 @@
  * no error, no throw. There is no debug-level logger anywhere in this codebase to log a debug
  * line to, so "off" is a plain, silent no-op. Read at finish time (loadNotifyConfig() is called
  * fresh on every job), never cached at startup, so Erick can add/edit/remove notify.json without
- * restarting anything.
+ * restarting anything. `discord.includeHeadline` is the historical key name (predates the switch
+ * from a one-line headline to a multi-line excerpt below); it still governs whether the excerpt is
+ * included at all, just not its shape.
  *
  * `completeness` (see loadCompletenessConfig()/markerFor()) is independent of `discord`: it
  * governs whether an exit-0 job missing its final DELEGATION-METRICS report line is labeled
- * [INCOMPLETE] instead of [OK], and is read (and the job's reportComplete field computed) by
- * job-runner.mjs regardless of whether a webhook is even configured.
+ * [INCOMPLETE] instead of a result-based marker, and is read (and the job's reportComplete field
+ * computed) by job-runner.mjs regardless of whether a webhook is even configured.
  *
  * The webhook URL is a credential (a Discord webhook URL embeds its own auth token in the path)
  * and is treated like one: it is never written to the runner's log, to exit.json/meta.json, or
@@ -33,11 +35,15 @@ import { configDir } from "./hosts.mjs";
 
 export const NOTIFY_TIMEOUT_MS = 5000;
 const MAX_CONTENT_CHARS = 1800;
-// 450 fits 2-3 lines on a phone notification (vs. the old 200, which routinely cut a verdict
-// sentence in half) while leaving comfortable headroom under MAX_CONTENT_CHARS alongside the
-// status line.
-export const HEADLINE_MAX_CHARS = 450;
-const HEAD_BYTES = 8 * 1024;
+// The excerpt's hard cap. Applied to BOTH branches of excerptSource() -- the preferred "text after
+// the last Summary heading" branch and the "no heading" last-N-chars fallback -- so one rule, not
+// two, decides the final length regardless of which branch produced the source text. 1200 (bigger
+// than the "~600 chars" a one-line headline needed) because a real final-report Summary section
+// commonly runs 800-1000 chars on its own (job claunker.cloud-dispatch-test-20261031-j8or6rg2's
+// real Summary section is ~840 chars): a tighter cap would cut the actual blocker detail right
+// back out even though it's the exact text this feature exists to surface. Still comfortably
+// under the message's own 1800-char hard cap alongside the status line.
+export const EXCERPT_MAX_CHARS = 1200;
 
 export function notifyConfigPath() {
   return path.join(configDir(), "notify.json");
@@ -112,188 +118,146 @@ export function hasCompletenessMarker(lines, markerRegex) {
   return lines.some((l) => { re.lastIndex = 0; return re.test(stripMarkdownWrapping(String(l))); });
 }
 
-const LABEL_MAX_CHARS = 80;
 // Leading list/number markers: "-", "*", "+", ">", "1.", "1)", repeated ("> - 1.").
 const LIST_PREFIX = /^(?:(?:[-*+>]|\d+[.)])(?:\s+|$))+/;
-// A line wholly wrapped in one emphasis pair: **x**, __x__, *x*, _x_.
-const EMPHASIS_WRAPPED = /^(\*\*|__|\*|_)(.+)\1$/;
 
-// True for a line that is only markdown markers around a short label: "1.", "- **Report**",
-// "**Report**", "**1. Git -- `...`**", "**Summary:**", or a rule like "---". A wrapped line that
-// reads like content (ends like a sentence, "**All checks passed.**", or carries a value after a
-// colon, "**Verdict: PASS**") or runs past LABEL_MAX_CHARS is not a label.
-export function isLabelLine(line) {
-  if (/^[-*_=~+>\s]+$/.test(line)) return true;
-  const rest = line.replace(LIST_PREFIX, "").trim();
-  if (!rest) return true;
-  const m = rest.match(EMPHASIS_WRAPPED);
-  if (!m) return false;
-  const inner = m[2].replace(LIST_PREFIX, "").trim();
-  return inner.length <= LABEL_MAX_CHARS && !/[.!?]$/.test(inner) && !/:\s+\S/.test(inner);
+// A report line that reads as a "Summary"-style section heading once markdown heading markers
+// ("##"), leading list/blockquote markers, and ONE layer of surrounding emphasis are stripped --
+// matches "## Summary", "**Summary:**", "- Summary", and the real-world
+// "**Summary / blocker:**" (job claunker.cloud-dispatch-test-20261031-j8or6rg2's final report).
+const SUMMARY_HEADING_RE = /^summary\b/i;
+export function isSummaryHeadingLine(line) {
+  let s = String(line).trim();
+  s = s.replace(/^#{1,6}\s*/, "").replace(LIST_PREFIX, "");
+  s = s.replace(/^(\*\*|__|\*|_)/, "").replace(/(\*\*|__|\*|_)$/, "").trim();
+  return SUMMARY_HEADING_RE.test(s);
 }
 
-// Windows drive paths (C:\, D:/), UNC (\\server), and absolute POSIX paths (/home/, /c/Users/,
-// /usr/...). The drive letter and the POSIX leading slash must not follow a word character, so
-// URLs ("https://..."), "and/or", and "1/2" do not count.
-const PATH_PATTERNS = [
-  /(?:^|[^A-Za-z0-9])[A-Za-z]:[\\/]/,
-  /(?:^|[^\\\w])\\\\[\w.$-]+/,
-  /(?:^|[^\w/.~-])\/[\w.$-]+\//,
-];
-
-export function containsPath(line) {
-  return PATH_PATTERNS.some((re) => re.test(line));
+// Index of the LAST line in `lines` that qualifies as a summary heading (isSummaryHeadingLine),
+// or -1. The last occurrence wins: a report can have an earlier "## Summary of findings" followed
+// later by the real final "## Summary" the excerpt should start from.
+function lastSummaryHeadingIndex(lines) {
+  let idx = -1;
+  for (let i = 0; i < lines.length; i++) if (isSummaryHeadingLine(lines[i])) idx = i;
+  return idx;
 }
 
-const VERDICT_LINE = /^\**verdict\s*:/i;
-
-// Leftover arithmetic a model sometimes leaves at the top of its report ("129+19 = 148
-// lines_total, ...") and the delegation-contract lines themselves (DELEGATION-CALL:/
-// DELEGATION-METRICS:) are headline noise, not a verdict a human wrote -- skipping them lets the
-// real content line that follows (often right under a "## Final Summary"-style heading) win
-// instead.
-const ARITHMETIC_LEFTOVER = /^\d+(?:\s*[+\-*/]\s*\d+)+\s*=\s*\d+/;
 const DELEGATION_CONTRACT_LINE = /^(?:DELEGATION-(?:CALL|METRICS):)/;
 
-export function isJunkHeadlineLine(line) {
-  return ARITHMETIC_LEFTOVER.test(line) || DELEGATION_CONTRACT_LINE.test(line);
+// True for a line that IS the delegation contract's DELEGATION-CALL/DELEGATION-METRICS line, even
+// when wrapped in markdown (the real-world case: a model wraps its final report line in inline
+// backticks). Delegation is still reported in full by the job's own report text; this only keeps
+// the terse machine-readable contract line itself out of the human-facing excerpt.
+function isDelegationContractLine(line) {
+  return DELEGATION_CONTRACT_LINE.test(stripMarkdownWrapping(String(line).trim()));
 }
 
-// First non-empty line of `stdoutLines` that isn't a markdown heading ("#..."), a code-fence
-// marker ("```..."), a bare markdown label (isLabelLine), or a line containing a filesystem path
-// (containsPath). Headings, fences and labels are skipped because they read as noise/broken
-// formatting as a one-line phone notification; path lines because a local path says nothing
-// about the outcome and should not leave the host. Escaping (escapeDiscordText) handles safety.
-// A qualifying "Verdict:" line wins over an earlier qualifying line -- job reports conventionally
-// open with one, but some lead with a preamble paragraph first, and the verdict is the one
-// sentence Erick actually needs on his phone.
-export function extractHeadline(stdoutLines) {
-  if (!Array.isArray(stdoutLines)) return null;
-  let fallback = null;
-  for (const raw of stdoutLines) {
-    const line = String(raw).trim();
-    if (!line) continue;
-    if (line.startsWith("#")) continue;
-    if (line.startsWith("```")) continue;
-    if (isJunkHeadlineLine(line)) continue;
-    if (isLabelLine(line)) continue;
-    if (containsPath(line)) continue;
-    if (VERDICT_LINE.test(line)) return line;
-    if (fallback === null) fallback = line;
+// The optional final-report marker line, "RESULT: pass|partial|blocked|fail" (case-insensitive,
+// tolerant of the same markdown wrapping hasCompletenessMarker tolerates, and of a trailing
+// period). The LAST occurrence in `lines` wins, same convention as the completeness marker and
+// the old Verdict-line rule -- a model that restates its result partway through and again at the
+// very end should be read by its final word.
+const RESULT_LINE_RE = /^RESULT:\s*(pass|partial|blocked|fail)[.\s]*$/i;
+export function parseResultMarker(lines) {
+  if (!Array.isArray(lines)) return null;
+  let found = null;
+  for (const raw of lines) {
+    const m = RESULT_LINE_RE.exec(stripMarkdownWrapping(String(raw).trim()));
+    if (m) found = m[1].toLowerCase();
   }
-  return fallback;
+  return found;
 }
 
-// Reads at most the first `maxBytes` of `file` and returns it split into lines. Mirrors job-
-// runner.mjs's readTail() bounded-read shape but anchored at the head instead of the tail: job
-// reports put their verdict on the FIRST line ("GATE FAILED...", "Everything checks out.", ...),
-// not the last, so the headline source needs to be the head of the log, not its tail.
-// When the file is bigger than maxBytes, the read window ends mid-line (or mid-character for
-// multibyte UTF-8), so the last line of the chunk is dropped -- it is likely partial, same
-// reasoning as readTail()'s drop of its FIRST line. Any failure (missing file, read error, decode
-// error, ...) yields [] -- this is best-effort diagnostic data; the caller falls back to the
-// stdoutTail rule.
-export function readHead(file, maxBytes = HEAD_BYTES) {
-  let fd;
-  try {
-    fd = fs.openSync(file, "r");
-    const size = fs.fstatSync(fd).size;
-    const length = Math.min(size, maxBytes);
-    const buf = Buffer.alloc(length);
-    if (length > 0) fs.readSync(fd, buf, 0, length, 0);
-    let text = buf.toString("utf8");
-    if (size > length) {
-      // Truncated: the last "line" in the chunk is almost certainly partial. Drop it.
-      const nl = text.lastIndexOf("\n");
-      text = nl === -1 ? "" : text.slice(0, nl);
-    }
-    if (!text) return [];
-    const lines = text.split("\n");
-    if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the file's last write
-    return lines.map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
-  } catch {
-    return [];
-  } finally {
-    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
-  }
-}
-
-// Picks which line set boundHeadline() should read from: the head of out.log when it has a
-// qualifying line (job reports put their verdict at the top), else the stdoutTail rule this
-// module used before -- covers out.log missing/unreadable (readHead yields []) and out.log
-// present but with no qualifying line in the first HEAD_BYTES (e.g. a long banner/heading block).
-export function chooseHeadlineLines(headLines, tailLines) {
-  return extractHeadline(headLines) ? headLines : tailLines;
-}
-
-// Index of the last sentence-ending ".", "!", or "?" at or before `max - 1` that is followed by
-// whitespace or end-of-line, or -1 if none. "Mr." / "e.g." false positives are not worth guarding
-// against here: landing a cut one clause early is harmless, the thing this exists to prevent is
-// landing it mid-word.
-function lastSentenceEnd(line, max) {
-  const limit = Math.min(max, line.length);
-  let best = -1;
-  for (let i = 0; i < limit; i++) {
-    const c = line[i];
-    if (c === "." || c === "!" || c === "?") {
-      const next = line[i + 1];
-      if (next === undefined || /\s/.test(next)) best = i;
-    }
-  }
-  return best;
-}
-
-function lastWhitespace(text) {
-  for (let i = text.length - 1; i >= 0; i--) {
-    if (/\s/.test(text[i])) return i;
-  }
-  return -1;
-}
-
-// Truncates `line` to at most `max` characters without ever cutting inside a word: prefers the
-// last complete sentence within the budget, falls back to the last complete word, and marks the
-// cut with a trailing ellipsis. Returns `line` unchanged when it already fits.
-export function truncateHeadline(line, max = HEADLINE_MAX_CHARS) {
-  if (line.length <= max) return line;
-  const sentenceEnd = lastSentenceEnd(line, max);
-  if (sentenceEnd !== -1) return line.slice(0, sentenceEnd + 1) + "…";
-  const slice = line.slice(0, max);
-  const wsEnd = lastWhitespace(slice);
-  const cut = wsEnd === -1 ? slice : slice.slice(0, wsEnd);
-  return cut.trimEnd() + "…";
-}
-
-// Strips a dangling "[text](" (with or without a partial URL after it) that truncation left with
-// no closing ")", and a dangling "[text" left with no closing "]" at all. Either would otherwise
-// render as broken, literal link syntax instead of being silently dropped.
-function stripDanglingLink(text) {
-  let s = text.replace(/\[[^\]]*\]\([^)]*$/, "");
-  const openIdx = s.lastIndexOf("[");
-  if (openIdx !== -1 && s.indexOf("]", openIdx) === -1) s = s.slice(0, openIdx);
-  return s;
-}
-
-// Removes the last occurrence of `token` from `text` when it appears an odd number of times (one
-// unmatched opening marker), leaving any complete, balanced pairs alone.
-function stripUnbalancedToken(text, token) {
+// Removes the FIRST occurrence of `token` from `text` when it appears an odd number of times (one
+// unmatched CLOSING marker left dangling by a cut off the FRONT of the text -- its opener was in
+// the dropped prefix), leaving any complete, balanced pairs alone.
+function stripLeadingUnbalancedToken(text, token) {
   const count = text.split(token).length - 1;
   if (count % 2 === 0) return text;
-  const idx = text.lastIndexOf(token);
+  const idx = text.indexOf(token);
   return idx === -1 ? text : text.slice(0, idx) + text.slice(idx + token.length);
 }
 
-// Neutralizes any markdown span (fenced code, bold, italic, inline code, link) left open by
-// truncateHeadline() by removing its lone opening marker, rather than appending a matching closer
-// -- a closer tacked on right after a mid-sentence ellipsis would read even stranger than plain
+// Neutralizes any markdown span (fenced code, bold, italic, inline code) left open at the START of
+// `text` by a cut that dropped everything BEFORE it -- the shape buildExcerpt() produces, since it
+// keeps the END of a report and cuts its front. Strips the orphaned marker (its pair was in the
+// dropped prefix) rather than inserting a synthetic opener, same rationale as the end-oriented
+// stripping below: a fabricated opener right after the cut would read even stranger than plain
 // text. Order matters: longer tokens ("```", "**", "__") are stripped before the shorter tokens
 // that are their building blocks, so a complete "**" pair is never mistaken for two unmatched "*"
 // markers.
-export function closeMarkdownSpans(text) {
-  let s = stripDanglingLink(text);
+export function closeMarkdownSpansAtStart(text) {
+  let s = String(text);
   for (const token of ["```", "**", "__", "*", "_", "`"]) {
-    s = stripUnbalancedToken(s, token);
+    s = stripLeadingUnbalancedToken(s, token);
   }
   return s;
+}
+
+const BACKTICK_WRAPPED_URL_RE = /`(https?:\/\/[^\s`]+)`/g;
+
+// Removes backticks that wrap a URL exactly ("`https://...`" -> "https://..."), so the URL is not
+// left inside an inline-code span. escapeDiscordText() backslash-escapes every backtick
+// regardless of pairing, and an escaped backtick sitting immediately against a URL (no
+// whitespace) is exactly the shape Discord's own autolinker was observed swallowing into the link
+// itself -- job claunker.cloud-dispatch-test-20261031-j8or6rg2's real ping rendered
+// "https://github.com/icey2488/gallagioloot.git/%60" (a URL-encoded trailing backtick) because its
+// report wrote "`https://github.com/icey2488/gallagioloot.git`,".
+export function stripBackticksAroundUrls(text) {
+  return String(text).replace(BACKTICK_WRAPPED_URL_RE, "$1");
+}
+
+// Defense in depth for any OTHER way a backtick (raw or backslash-escaped) ends up immediately
+// after a URL with no separating whitespace -- inserts a space so Discord's autolinker stops at
+// the URL's own last character instead of absorbing the trailing backtick too.
+export function ensureSpaceAfterUrlBeforeBacktick(text) {
+  return String(text).replace(/(https?:\/\/[^\s`\\]+)(\\?`)/g, "$1 $2");
+}
+
+// Cuts `text` to at most `max` characters, KEEPING THE END and moving the cut point forward to the
+// next line boundary so the kept text never opens mid-line (the dropped prefix's partial line is
+// discarded along with the rest of the prefix). Mirrors job-runner.mjs's readTail() dropping a
+// partial first line, same reasoning.
+function cutToLastChars(text, max) {
+  if (text.length <= max) return text;
+  let start = text.length - max;
+  const nl = text.indexOf("\n", start);
+  if (nl !== -1 && nl + 1 < text.length) start = nl + 1;
+  return text.slice(start);
+}
+
+// Picks the excerpt's source text from `lines` (the job's own stdout tail): everything after the
+// LAST "Summary"-style heading if one exists (a report's final conclusion conventionally lives
+// there -- see isSummaryHeadingLine), otherwise the whole tail. The delegation contract's own
+// DELEGATION-CALL/DELEGATION-METRICS line is always excluded first (requirement: delegation is
+// still reported via the contract lines/metrics themselves, just not echoed into this human-facing
+// text). Falls back to the unfiltered tail if the chosen slice is empty (e.g. a summary heading
+// with nothing meaningful after it, such as right before the final metrics line).
+function excerptSource(lines) {
+  const filtered = lines.filter((l) => !isDelegationContractLine(l));
+  if (filtered.length === 0) return "";
+  const idx = lastSummaryHeadingIndex(filtered);
+  const picked = idx === -1 ? filtered : filtered.slice(idx + 1);
+  const text = picked.join("\n").trim();
+  return text || filtered.join("\n").trim();
+}
+
+// Builds the Discord excerpt from the END of a job's report (requirement: the ping must surface
+// the conclusion/blocker a model writes last, not whatever happens to be first). Source selection
+// (excerptSource) prefers the final "## Summary"-style section; absent one, the last
+// EXCERPT_MAX_CHARS characters of the tail, cut at a line boundary. Either way, a cut that landed
+// mid code-span/fence is closed (not left dangling) and a URL is never left directly adjacent to a
+// markdown character, before the text is escaped for Discord. Returns null when there is nothing
+// in `stdoutLines` to work with.
+export function buildExcerpt(stdoutLines) {
+  if (!Array.isArray(stdoutLines) || stdoutLines.length === 0) return null;
+  const source = excerptSource(stdoutLines.map((l) => String(l)));
+  if (!source) return null;
+  let text = cutToLastChars(source, EXCERPT_MAX_CHARS);
+  text = closeMarkdownSpansAtStart(text);
+  text = stripBackticksAroundUrls(text);
+  const escaped = escapeDiscordText(text);
+  return ensureSpaceAfterUrlBeforeBacktick(escaped);
 }
 
 // Neutralizes Discord markdown/mention syntax by backslash-escaping @, `, <, > so job output can
@@ -302,17 +266,6 @@ export function closeMarkdownSpans(text) {
 // which is what actually stops a ping from firing -- this only stops the FORMATTING.
 export function escapeDiscordText(text) {
   return String(text).replace(/[@`<>]/g, (c) => "\\" + c);
-}
-
-// Extracted, truncated (to HEADLINE_MAX_CHARS, on a sentence/word boundary), freed of any markdown
-// span the cut left open, then escaped -- in that order, so the length cap applies to the raw
-// job-output line, not to however many backslashes escaping happens to add.
-export function boundHeadline(stdoutLines) {
-  const line = extractHeadline(stdoutLines);
-  if (!line) return null;
-  const truncated = truncateHeadline(line);
-  const safe = closeMarkdownSpans(truncated);
-  return escapeDiscordText(safe);
 }
 
 export function formatDuration(ms) {
@@ -328,37 +281,48 @@ export function formatDuration(ms) {
 
 // Emoji-free status marker; doubles as the message's status word (no separate emoji is used
 // anywhere in this module, deliberately, so the message renders identically on any client/font).
-// `completeness` ({ reportComplete, enforce }, both defaulting true) only ever matters for an
-// exit-0 "exit" job: an exit 0 job whose stdout never carried the DELEGATION-METRICS final-report
-// marker, with enforcement on, is labeled [INCOMPLETE] instead of [OK] -- it exited cleanly but
-// may have stopped early (asked a question, backgrounded a call it needed, etc.) without ever
-// writing its report. Non-zero exits, signals, spawn errors, and bg_tasks_terminated are
-// unchanged by this (bg_tasks_terminated always reads as its own marker regardless of exitCode
-// or reportComplete -- see the dedicated branch below).
-export function markerFor(exitReason, exitCode, { reportComplete = true, enforce = true } = {}) {
+// Precedence (highest first):
+//   1. Runner-reported failure (spawn-error / signal / bg_tasks_terminated / non-zero exit) --
+//      always wins, regardless of any RESULT: marker the model's own text claims. A job that died
+//      or exited non-zero does not get to self-report success.
+//   2. [INCOMPLETE] -- an exit-0 job whose stdout never carried the DELEGATION-METRICS final-report
+//      marker (enforcement on): it exited cleanly but may have stopped early without ever writing
+//      its report, so there is nothing to trust a RESULT: line from either.
+//   3. The optional RESULT: marker (see parseResultMarker): [OK] for pass, [PARTIAL], [BLOCKED],
+//      [FAIL].
+//   4. [DONE] -- exit 0, a complete report, but NO RESULT: marker. Deliberately not [OK]: an
+//      unverified outcome must never read as confirmed success. (2026-10-31
+//      claunker.cloud-dispatch-test-20261031-j8or6rg2: exited 0 after a permission denial blocked
+//      it from launching anything -- its own final report said BLOCKED, but the old rule read exit
+//      0 + a complete report as [OK].)
+export function markerFor(exitReason, exitCode, { reportComplete = true, enforce = true, resultMarker = null } = {}) {
   if (exitReason === "spawn-error") return "[SPAWN-ERROR]";
   if (exitReason === "signal") return "[SIGNAL]";
   // 2026-10-18 claunker.gemini-mcp-v2-20261018-pfvzx44f: the CLI's own background-task wait
   // ceiling killed background work mid-flight but the CLI still exited 0 -- never let that read
-  // as [OK] just because exitCode is 0 (see job-runner.mjs's BG_TASKS_TERMINATED_RE).
+  // as success just because exitCode is 0 (see job-runner.mjs's BG_TASKS_TERMINATED_RE).
   if (exitReason === "bg_tasks_terminated") return "[BG-TASKS-TERMINATED]";
   if (exitCode !== 0) return "[FAIL]";
   if (enforce && !reportComplete) return "[INCOMPLETE]";
-  return "[OK]";
+  if (resultMarker === "pass") return "[OK]";
+  if (resultMarker === "partial") return "[PARTIAL]";
+  if (resultMarker === "blocked") return "[BLOCKED]";
+  if (resultMarker === "fail") return "[FAIL]";
+  return "[DONE]";
 }
 
-// Shown on the ping when markerFor returns [INCOMPLETE], appended after the headline.
+// Shown on the ping when markerFor returns [INCOMPLETE], appended after the excerpt.
 export const INCOMPLETE_REASON = "no final report marker (DELEGATION-METRICS) found; job may have stopped early";
 
 // Pure builder (no I/O) so tests can check shape/escaping/truncation without a network call.
 // `jobId` here is really "whatever the caller wants shown as the title" -- see notifyJobFinished's
 // header for why the caller (not this function) resolves that to meta.intent-or-jobId.
-export function buildDiscordContent({ marker, host, jobId, exitCode, durationMs, headline, incompleteReason }) {
+export function buildDiscordContent({ marker, host, jobId, exitCode, durationMs, excerpt, incompleteReason }) {
   const lines = [
     `${marker} host=${host} job=${jobId} exit=${exitCode === null || exitCode === undefined ? "null" : exitCode} ` +
     `duration=${formatDuration(durationMs)}`,
   ];
-  if (headline) lines.push(headline);
+  if (excerpt) lines.push(excerpt);
   if (incompleteReason) lines.push(incompleteReason);
   const content = lines.join("\n");
   return content.length > MAX_CONTENT_CHARS ? content.slice(0, MAX_CONTENT_CHARS) : content;
@@ -386,22 +350,20 @@ function sanitizeForLog(msg, webhookUrl) {
  * as the message's title when present; jobId is the fallback, same as mintCard()'s own card-title
  * rule (`boundIntent(intent) || intentSummary(prompt)`, jobId-equivalent being the card's own
  * last resort). intent is free text from the ORIGINAL dispatcher, so it is escaped the same way
- * headline text is (escapeDiscordText) before being used -- allowed_mentions:{parse:[]} already
+ * excerpt text is (escapeDiscordText) before being used -- allowed_mentions:{parse:[]} already
  * stops it from ever pinging, but escaping keeps it from breaking message formatting too.
  *
- * headline: sourced from the HEAD of the job's own stdout log (job reports conventionally put
- * their verdict on the FIRST line -- "GATE FAILED...", "Everything checks out.", ...), read
- * bounded via readHead()/outLogPath. Falls back to the stdoutTail rule (the `stdoutLines` param,
- * exit.json's own stdoutTail) when outLogPath is absent/unreadable or has no qualifying line in
- * its head window -- see chooseHeadlineLines().
+ * excerpt: built from the END of `stdoutLines` (job-runner.mjs's own recordExit() stdoutTail --
+ * the last ~20 lines/64KB of out.log read straight off disk at exit time), via buildExcerpt(). See
+ * buildExcerpt's own header for the summary-section/EXCERPT_MAX_CHARS rule.
  *
  * reportComplete: whether the job's stdout carried the DELEGATION-METRICS final-report marker
  * (job-runner.mjs computes this once, via hasCompletenessMarker(), and both writes it to
  * exit.json and passes it in here, so the completeness check and the field claude_check surfaces
- * always agree). Only changes the marker on an exit-0 "exit" job, and only when
- * completeness.enforce (notify.json, default true) is also on -- see markerFor().
+ * always agree). resultMarker is parsed here (parseResultMarker) from the same stdoutLines, so
+ * there is exactly one place that decides what a job's own text claims about its outcome.
  */
-export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, reportComplete, logLine, fetchImpl = fetch }) {
+export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, includeHeadlineOverride, reportComplete, logLine, fetchImpl = fetch }) {
   let config;
   try { config = loadNotifyConfig(); } catch { return; }
   if (!config) return;
@@ -423,14 +385,15 @@ export async function notifyJobFinished({ jobId, intent, host, exitCode, exitRea
 
   let completeness;
   try { completeness = loadCompletenessConfig(); } catch { completeness = { enforce: true }; }
-  const marker = markerFor(exitReason, exitCode, { reportComplete, enforce: completeness.enforce });
-  const includeHeadline = includeHeadlineOverride !== undefined ? includeHeadlineOverride : config.includeHeadline;
+  const lines = Array.isArray(stdoutLines) ? stdoutLines : [];
+  const resultMarker = parseResultMarker(lines);
+  const marker = markerFor(exitReason, exitCode, { reportComplete, enforce: completeness.enforce, resultMarker });
+  const includeExcerpt = includeHeadlineOverride !== undefined ? includeHeadlineOverride : config.includeHeadline;
   const durationMs = startedAt && endedAt ? (endedAt.getTime() - new Date(startedAt).getTime()) : NaN;
-  const headLines = includeHeadline && outLogPath ? readHead(outLogPath) : [];
-  const headline = includeHeadline ? boundHeadline(chooseHeadlineLines(headLines, stdoutLines)) : null;
+  const excerpt = includeExcerpt ? buildExcerpt(lines) : null;
   const title = intent ? escapeDiscordText(intent) : jobId;
   const incompleteReason = marker === "[INCOMPLETE]" ? INCOMPLETE_REASON : null;
-  const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, headline, incompleteReason });
+  const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, excerpt, incompleteReason });
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), NOTIFY_TIMEOUT_MS);

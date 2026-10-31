@@ -289,7 +289,6 @@ async function finish(code) {
       startedAt,
       endedAt: new Date(exitRecord && exitRecord.endedAt ? exitRecord.endedAt : Date.now()),
       stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
-      outLogPath: out,
       reportComplete: exitRecord ? exitRecord.reportComplete : true,
       logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
     });
