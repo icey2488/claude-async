@@ -745,9 +745,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   });
   if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
 
-  const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
+  // The prompt is the CLI's POSITIONAL argument (-p/--print is a boolean flag), so it goes LAST,
+  // after a "--" end-of-options marker: without it a prompt that merely starts with "-" (a markdown
+  // bullet such as "- fix the bug") fails with "unknown option", and one like "--version" or
+  // "--add-dir /" is parsed as CLI flags -- argument injection from whoever supplies the prompt
+  // (host-api.mjs accepts it from the network). Same reason the model is passed as --model=<value>:
+  // a caller-supplied value can never be read as a separate flag.
+  const argv = ["-p", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   const resolvedModel = model || DEFAULT_MODEL;
-  argv.push("--model", resolvedModel);
+  argv.push(`--model=${resolvedModel}`);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
   // Every claude-async job gets the no-background-hook settings; ultracode merges its own
@@ -767,6 +773,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   argv.push("--settings", JSON.stringify(settingsObj));
+  // End of options: everything after "--" is the prompt, verbatim, never a flag (see above).
+  argv.push("--", prompt);
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
   // CLAUDE_ASYNC_JOB_EFFORT: tells hooks/no-background-hook.mjs this job's effort level, so it
