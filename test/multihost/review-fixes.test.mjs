@@ -75,3 +75,26 @@ test("M1 guard: a break marker that now names another owner is left alone even w
     assert.ok(log.some((l) => /same inode reused/.test(l)), log.join("\n"));
   } finally { fs.rmSync(jobRoot, { recursive: true, force: true }); }
 });
+
+// M2: countActiveJobs() runs under the start lock; it must not spawn the jobcard command to reap a
+// died job's card (up to 10s per job, against a 5s lock timeout). checkJob() itself still reaps.
+test("M2 caps: counting active jobs never reaps a died job's card; claude_check still does", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { TMP, JOBS } = await import("./_setup.mjs");
+  const calls = path.join(TMP, "m2-jobcard-calls.txt");
+  const script = path.join(TMP, "m2-jobcard.mjs");
+  fs.writeFileSync(script, `import fs from "node:fs"; fs.appendFileSync(${JSON.stringify(calls)}, process.argv.slice(2).join(" ") + "\\n");`);
+  const dir = path.join(JOBS, "m2-died");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId: "m2-died", pid: 2_000_000_000, cardId: "card-m2" }));
+  const prev = process.env.CLAUNKER_JOBCARD_CMD;
+  process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify([process.execPath, script]);
+  try {
+    const { count } = core.countActiveJobs(Date.now());
+    assert.equal(count, 0, "a died job is not active");
+    assert.ok(!fs.existsSync(calls), "counting must not run the jobcard command");
+    assert.equal(core.checkJob("m2-died").status, "died");
+    assert.match(fs.readFileSync(calls, "utf8"), /^fail card-m2$/m, "claude_check still reaps the card");
+  } finally { process.env.CLAUNKER_JOBCARD_CMD = prev; }
+});

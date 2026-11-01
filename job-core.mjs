@@ -652,7 +652,12 @@ export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
 export function isPlainObject(x) {
   return x !== null && typeof x === "object" && !Array.isArray(x);
 }
-export function countActiveJobs(nowMs, { check = checkJob } = {}) {
+// The default check passes reap:false: this runs under guard.mjs's start lock (5s acquire
+// timeout), and a died job's card reap spawns the jobcard command synchronously (up to 10s each)
+// -- one dead-carded job, or a broken jobcard, would otherwise stall every concurrent start past
+// its lock timeout. Counting is read-only; claude_check/claude_jobs still reap.
+const checkWithoutReap = (id, tailBytes) => checkJob(id, tailBytes, { reap: false });
+export function countActiveJobs(nowMs, { check = checkWithoutReap } = {}) {
   let count = 0;
   const warnings = [];
   let ids = [];
@@ -821,7 +826,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
            ...(warnings.length ? { warnings } : {}) };
 }
 
-export function checkJob(id, tailBytes = 8000) {
+// opts.reap (default true): fail the dispatch card of a died/timed_out job (a jobcard subprocess).
+// countActiveJobs() turns it off -- see checkWithoutReap.
+export function checkJob(id, tailBytes = 8000, { reap = true } = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
@@ -888,7 +895,7 @@ export function checkJob(id, tailBytes = 8000) {
     }
   }
 
-  if ((state === "died" || state === "timed_out") && meta.cardId && !meta.cardReaped) {
+  if (reap && (state === "died" || state === "timed_out") && meta.cardId && !meta.cardReaped) {
     const reap = failCard(meta.cardId);
     if (reap.ok) {
       meta.cardReaped = true;
