@@ -38,3 +38,40 @@ test("H1 argv: the default model still reaches the CLI", async () => {
   const argv = await argvFor({ prompt: "p" });
   assert.ok(argv.some((a) => /^--model=.+/.test(a)));
 });
+
+// M1: guard.mjs's break-marker cleanup trusted dev+ino alone. Linux filesystems reuse a freed inode
+// number for the next file created, so a rival's replacement marker can carry the very dev+ino we
+// captured. Modeled deterministically by rewriting the marker IN PLACE (guaranteed same inode) with
+// another owner's content: it must never be removed by us.
+test("M1 guard: a break marker that now names another owner is left alone even with the same dev+ino", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const os = (await import("node:os")).default;
+  const { withStartLock } = await import("../../guard.mjs");
+  const jobRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ca-m1-"));
+  try {
+    const lock = path.join(jobRoot, ".start.lock");
+    fs.writeFileSync(lock, JSON.stringify({ pid: 2_000_000_000, at: new Date().toISOString() }));
+    const mtime = fs.statSync(lock).mtimeMs;
+    const marker = lock + ".break";
+    const log = [];
+    const orig = fs.unlinkSync;
+    let rewrote = false;
+    fs.unlinkSync = function (f, ...rest) {
+      if (!rewrote && String(f) === lock) {
+        rewrote = true;
+        const before = fs.statSync(marker, { bigint: true }).ino;
+        fs.writeFileSync(marker, JSON.stringify({ pid: 4242, at: new Date().toISOString() })); // same inode
+        assert.equal(fs.statSync(marker, { bigint: true }).ino, before, "precondition: marker kept its inode");
+      }
+      return orig.call(this, f, ...rest);
+    };
+    let r;
+    try {
+      r = await withStartLock(jobRoot, () => "ran", { staleMs: 1_000, now: () => mtime + 1_000, pidAlive: () => false, log: (l) => log.push(l) });
+    } finally { fs.unlinkSync = orig; }
+    assert.equal(r, "ran");
+    assert.equal(JSON.parse(fs.readFileSync(marker, "utf8")).pid, 4242, "another owner's marker must survive our cleanup");
+    assert.ok(log.some((l) => /same inode reused/.test(l)), log.join("\n"));
+  } finally { fs.rmSync(jobRoot, { recursive: true, force: true }); }
+});
