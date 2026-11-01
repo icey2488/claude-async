@@ -224,6 +224,19 @@ function recordExit() {
   return record;
 }
 
+function writeExitCodeAtomic(file, code) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, String(code));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    // Last resort: a direct write still beats no exit_code at all (the job would read as "died").
+    try { fs.writeFileSync(file, String(code)); }
+    catch { try { fs.writeSync(errFd, `\n[job-runner] could not write exit_code: ${e.message}\n`); } catch {} }
+  }
+}
+
 let done = false;
 let hbInterval;
 
@@ -240,7 +253,10 @@ async function finish(code) {
   // exit_code must be able to rely on exit.json already existing on disk.
   let exitRecord = null;
   try { exitRecord = recordExit(); } catch {}
-  try { fs.writeFileSync(exit, String(code)); } catch {}
+  // exit_code is what every reader polls for "done", so it is replaced atomically (temp + rename,
+  // same as exit.json): a plain writeFileSync truncates first, and a claude_check landing in that
+  // window read an empty file -> parseInt NaN -> a transient, wrong "failed".
+  try { writeExitCodeAtomic(exit, code); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
   let cardId = null, startHead = null, jobId = null, startedAt = null, intent = null;

@@ -120,3 +120,29 @@ test("M3 listJobs: a corrupt meta.json yields one 'unknown' row with the error; 
   assert.equal(by["m3-null"].status, "unknown");
   assert.match(core.checkJob("m3-truncated").error, /unreadable meta\.json/, "checkJob reports it rather than throwing");
 });
+
+// M4: exit_code must appear atomically (temp file + rename), never be truncated-then-written in
+// place, or a concurrent checkJob can read it empty and report a transient "failed".
+test("M4 runner: exit_code is produced by a rename, never written in place", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { TMP } = await import("./_setup.mjs");
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const dir = path.join(TMP, "m4-job");
+  fs.mkdirSync(dir, { recursive: true });
+  const spec = { command: process.execPath, argv: [path.join(here, "fake-cli.mjs"), "--exit", "3"], cwd: dir,
+                 out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code") };
+  fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
+  const trace = path.join(TMP, "m4-trace.jsonl");
+  const res = spawnSync(process.execPath, ["--import", path.join(here, "exitcode-preload.mjs"),
+    path.join(here, "..", "..", "job-runner.mjs"), path.join(dir, "spec.json")],
+    { encoding: "utf8", timeout: 60_000, env: { ...process.env, EXITCODE_TRACE: trace } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(fs.readFileSync(spec.exit, "utf8"), "3");
+  const ops = fs.readFileSync(trace, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.ok(!ops.some(([op, f]) => op === "write" && f === spec.exit), `exit_code written in place: ${JSON.stringify(ops)}`);
+  assert.ok(ops.some(([op, , to]) => op === "rename" && to === spec.exit), JSON.stringify(ops));
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "no temp file left behind");
+});
