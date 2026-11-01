@@ -152,7 +152,12 @@ const NO_BACKGROUND_HOOK_MATCHER = "*";
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
 // accepts forward-slash paths natively, so this never needs real backslashes at all.
-function quotedPosixPath(p) {
+//
+// POSIX: the hook runs under /bin/sh, where double quotes still expand $, backticks and \, so a
+// node or repo path containing one of those was mangled (or executed). There it is single-quoted
+// instead, the one sh quoting with no expansion at all. The win32 form is unchanged.
+export function quotedPosixPath(p, platform = process.platform) {
+  if (platform !== "win32") return `'${p.replace(/'/g, "'\\''")}'`;
   return `"${p.replace(/\\/g, "/")}"`;
 }
 

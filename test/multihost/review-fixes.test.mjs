@@ -269,3 +269,14 @@ test("M8 selftest: the stdio server's --selftest passes", async () => {
   assert.match(res.stdout, /SELFTEST PASS/);
   assert.deepEqual(fs.readdirSync(jobs).filter((f) => f.startsWith("selftest-")), [], "selftest cleans up its job dir");
 });
+
+// L3: the no-background hook command is run by /bin/sh on POSIX, so paths must be single-quoted
+// there (no expansion); the win32 form is unchanged.
+test("L3 hook command quoting: POSIX paths with shell metacharacters survive sh verbatim; win32 form unchanged", { skip: process.platform === "win32" && "needs /bin/sh" }, async () => {
+  const { spawnSync } = await import("node:child_process");
+  for (const p of ["/opt/node 22/bin/node", "/tmp/$HOME/`id`/x", "/tmp/it's \"here\"\\now", "/plain/path"]) {
+    const r = spawnSync("/bin/sh", ["-c", `printf %s ${core.quotedPosixPath(p, "linux")}`], { encoding: "utf8" });
+    assert.equal(r.stdout, p);
+  }
+  assert.equal(core.quotedPosixPath("C:\\Program Files\\nodejs\\node.exe", "win32"), '"C:/Program Files/nodejs/node.exe"');
+});
