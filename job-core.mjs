@@ -719,7 +719,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
 
   const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
   if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
-  const cwd = workFolder || DEFAULT_CWD;
+  // Resolved to an absolute path ONCE, here: preflight, the card's git HEAD, meta.json and the
+  // runner's spawn cwd must all mean the same directory. A relative workFolder was checked against
+  // this process's cwd but run from the runner's -- on the win32 Task Scheduler path that is
+  // job-launcher.mjs's cwd, a different directory entirely.
+  const cwd = path.resolve(workFolder || DEFAULT_CWD);
 
   const pf = preflight({ claudeBin: opts.claudeBin, cwd, hostLabel });
   if (pf.error) return fail("preflight", pf.error);

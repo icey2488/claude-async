@@ -239,3 +239,15 @@ test("M6 runner: log files that cannot be opened are recorded at the spec's exit
   assert.equal(s.status, "failed");
   assert.match(s.exit.spawnError, /could not open the job's log files/);
 });
+
+// M7: a relative workFolder is resolved once, so preflight and the launched runner agree on it.
+test("M7 startJob: a relative workFolder is resolved to an absolute path before preflight and launch", async () => {
+  const path = (await import("node:path")).default;
+  let launchedCwd;
+  const r = await core.startJob({ prompt: "p", jobId: "m7-rel", workFolder: "." }, { caps: BIG_CAPS,
+    launch: async (p, command, argv, cwd) => { launchedCwd = cwd; return { pid: process.pid, pidSource: "test", launchPath: "test" }; } });
+  assert.ok(!r.error, r.error);
+  assert.equal(launchedCwd, process.cwd());
+  assert.ok(path.isAbsolute(r.workFolder));
+  assert.equal(r.workFolder, launchedCwd);
+});
