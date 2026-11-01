@@ -251,3 +251,21 @@ test("M7 startJob: a relative workFolder is resolved to an absolute path before 
   assert.ok(path.isAbsolute(r.workFolder));
   assert.equal(r.workFolder, launchedCwd);
 });
+
+// M8: `node claude-async-server.mjs --selftest` (npm run selftest) must pass on a healthy install.
+// Isolated: temp job dir, temp config dir (no notify.json, so no webhook), test mode on.
+test("M8 selftest: the stdio server's --selftest passes", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { TMP } = await import("./_setup.mjs");
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const jobs = path.join(TMP, "m8-jobs");
+  const res = spawnSync(process.execPath, [path.join(here, "..", "..", "claude-async-server.mjs"), "--selftest"],
+    { encoding: "utf8", timeout: 60_000,
+      env: { ...process.env, CLAUDE_ASYNC_JOB_DIR: jobs, CLAUDE_ASYNC_CONFIG_DIR: path.join(TMP, "m8-config"), CLAUDE_ASYNC_TEST: "1" } });
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.match(res.stdout, /SELFTEST PASS/);
+  assert.deepEqual(fs.readdirSync(jobs).filter((f) => f.startsWith("selftest-")), [], "selftest cleans up its job dir");
+});

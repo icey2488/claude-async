@@ -978,8 +978,11 @@ export async function runSelfTest() {
   const id = `selftest-${Date.now()}`;
   const p = jobPaths(id);
   fs.mkdirSync(p.d, { recursive: true });
+  // The child prints the default completeness marker (discord-notify.mjs's
+  // DEFAULT_COMPLETENESS_MARKER_SOURCE) after SELFTEST_OK: since the "incomplete" status, an exit-0
+  // run without it reads as "incomplete", and this selftest failed on every healthy install.
   const { pid, pidSource } = await launch(p, process.execPath,
-    ["-e", "setTimeout(() => console.log('SELFTEST_OK'), 300)"], JOB_ROOT);
+    ["-e", "setTimeout(() => { console.log('SELFTEST_OK'); console.log('DELEGATION-METRICS: selftest'); }, 300)"], JOB_ROOT);
   writeJsonAtomic(p.meta, { jobId: id, pid, pidSource, startedAt: new Date().toISOString() }, { space: 0 });
 
   const deadline = Date.now() + 5000;
@@ -989,9 +992,14 @@ export async function runSelfTest() {
     s = checkJob(id);
   } while (s.status === "running" && Date.now() < deadline);
 
-  const pass = s.status === "completed" && s.exitCode === 0 && s.stdout.includes("SELFTEST_OK");
+  // "incomplete" still proves the detach/poll/exit plumbing: it only means notify.json configures a
+  // custom completeness markerRegex that the default marker above does not match.
+  const plumbingOk = s.exitCode === 0 && s.stdout.includes("SELFTEST_OK");
+  const pass = plumbingOk && (s.status === "completed" || s.status === "incomplete");
   fs.rmSync(p.d, { recursive: true, force: true });
-  console.log(pass ? "SELFTEST PASS — detach/poll/exit plumbing works"
+  console.log(pass ? "SELFTEST PASS — detach/poll/exit plumbing works" +
+                       (s.status === "incomplete" ? " (status \"incomplete\": notify.json's completeness.markerRegex " +
+                         "does not match the default DELEGATION-METRICS marker)" : "")
                    : `SELFTEST FAIL — status=${s.status} exit=${s.exitCode} stdout=${JSON.stringify(s.stdout)}`);
   process.exit(pass ? 0 : 1);
 }
