@@ -257,13 +257,16 @@ async function finish(code) {
   // same as exit.json): a plain writeFileSync truncates first, and a claude_check landing in that
   // window read an empty file -> parseInt NaN -> a transient, wrong "failed".
   try { writeExitCodeAtomic(exit, code); } catch {}
-  // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
-  // Reading here (after child exits) avoids any startup race with job-core's meta write.
-  let cardId = null, startHead = null, jobId = null, startedAt = null, intent = null;
+  // Card hook: cardId/startHead come from spec.json (job-core mints the card before launching us
+  // and records it there), falling back to meta.json for jobs launched before that. meta.json alone
+  // is not enough: job-core writes it only after launch returns, so a job that ends quickly can
+  // finish before it exists.
+  let cardId = spec.cardId || null, startHead = spec.startHead || null;
+  let jobId = null, startedAt = null, intent = null;
   try {
     const m = JSON.parse(fs.readFileSync(path.join(path.dirname(specPath), "meta.json"), "utf8"));
-    cardId = m.cardId || null;
-    startHead = m.startHead || null;
+    cardId = cardId || m.cardId || null;
+    startHead = startHead || m.startHead || null;
     jobId = m.jobId || null;
     startedAt = m.startedAt || null;
     intent = m.intent || null;

@@ -146,3 +146,57 @@ test("M4 runner: exit_code is produced by a rename, never written in place", asy
   assert.ok(ops.some(([op, , to]) => op === "rename" && to === spec.exit), JSON.stringify(ops));
   assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith(".tmp")), [], "no temp file left behind");
 });
+
+// M5: a job that ends before job-core writes meta.json must still close its card. The card is now
+// minted before launch and its id recorded in spec.json, which the runner reads.
+async function m5JobcardScript(label) {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { TMP } = await import("./_setup.mjs");
+  const calls = path.join(TMP, `${label}-jobcard-calls.txt`);
+  const script = path.join(TMP, `${label}-jobcard.mjs`);
+  fs.writeFileSync(script, `import fs from "node:fs";
+const a = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(calls)}, a.join(" ") + "\\n");
+if (a[0] === "create") process.stdout.write("card-${label}");`);
+  return { calls, cmd: JSON.stringify([process.execPath, script]) };
+}
+
+test("M5 startJob: the card is minted before launch and its id is handed to the launch as spec fields", async () => {
+  const fs = (await import("node:fs")).default;
+  const { calls, cmd } = await m5JobcardScript("m5a");
+  const prev = process.env.CLAUNKER_JOBCARD_CMD;
+  process.env.CLAUNKER_JOBCARD_CMD = cmd;
+  try {
+    let seen;
+    const r = await core.startJob({ prompt: "p", jobId: "m5-start" }, { caps: BIG_CAPS,
+      launch: async (p, command, argv, cwd, extraEnv, specExtra) => {
+        seen = { specExtra, mintedFirst: fs.existsSync(calls) && /^create /m.test(fs.readFileSync(calls, "utf8")) };
+        return { pid: process.pid, pidSource: "test", launchPath: "test" };
+      } });
+    assert.ok(!r.error, r.error);
+    assert.equal(r.cardId, "card-m5a");
+    assert.equal(seen.mintedFirst, true, "card must exist before the runner can start");
+    assert.equal(seen.specExtra.cardId, "card-m5a");
+  } finally { process.env.CLAUNKER_JOBCARD_CMD = prev; }
+});
+
+test("M5 runner: with no meta.json at all, the card named in spec.json is still closed on finish", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { TMP } = await import("./_setup.mjs");
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const { calls, cmd } = await m5JobcardScript("m5b");
+  const dir = path.join(TMP, "m5-job");
+  fs.mkdirSync(dir, { recursive: true });
+  const spec = { cardId: "card-m5b", startHead: null, command: process.execPath,
+                 argv: [path.join(here, "fake-cli.mjs"), "--exit", "1"], cwd: dir,
+                 out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code") };
+  fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
+  const res = spawnSync(process.execPath, [path.join(here, "..", "..", "job-runner.mjs"), path.join(dir, "spec.json")],
+    { encoding: "utf8", timeout: 60_000, env: { ...process.env, CLAUNKER_JOBCARD_CMD: cmd } });
+  assert.equal(res.status, 0, res.stderr);
+  assert.ok(!fs.existsSync(path.join(dir, "meta.json")), "precondition: no meta.json");
+  assert.match(fs.readFileSync(calls, "utf8"), /^fail card-m5b$/m);
+});

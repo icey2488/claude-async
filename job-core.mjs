@@ -583,8 +583,10 @@ function launchPosix(p, extraEnv = {}) {
   return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
-async function launch(p, command, argv, cwd, extraEnv = {}) {
-  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
+// specExtra: extra fields recorded in spec.json for the runner (startJob passes the job's cardId
+// and startHead -- see there for why the runner cannot rely on meta.json for those).
+async function launch(p, command, argv, cwd, extraEnv = {}, specExtra = {}) {
+  writeJsonAtomic(p.spec, { ...specExtra, command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
   return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
@@ -801,10 +803,20 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === undefined) {
     extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = String(BG_WAIT_CEILING_MS);
   }
-  const { pid, pidSource, jobMembership, launchPath } =
-    await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
-
+  // The card is minted BEFORE launch and its id handed to the runner in spec.json. meta.json is
+  // only written after launch returns (it needs the pid), so a job that ends quickly -- the CLI
+  // rejecting a bad --model, a crash on startup -- used to finish before meta.json existed: the
+  // runner's finish() found no cardId and the card stayed "dispatched" forever.
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
+  let launched;
+  try {
+    launched = await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv,
+      { cardId: cardId || null, startHead: startHead || null });
+  } catch (e) {
+    if (cardId) failCard(cardId); // the job never started; don't leave its card dispatched
+    throw e;
+  }
+  const { pid, pidSource, jobMembership, launchPath } = launched;
   // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
   // ping's title (discord-notify.mjs) can use the same value the dispatch card shows -- omitted
   // entirely (no key) when no intent was given, rather than stored as null/empty.
