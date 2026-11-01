@@ -200,3 +200,42 @@ test("M5 runner: with no meta.json at all, the card named in spec.json is still 
   assert.ok(!fs.existsSync(path.join(dir, "meta.json")), "precondition: no meta.json");
   assert.match(fs.readFileSync(calls, "utf8"), /^fail card-m5b$/m);
 });
+
+// M6: runner failures before the CLI starts must leave a diagnosable "failed" record, not a silent
+// exit that claude_check can only call "died"/"unknown".
+async function runRunnerOn(label, specText) {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { JOBS } = await import("./_setup.mjs");
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const dir = path.join(JOBS, label);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId: label, pid: 2_000_000_000 }));
+  fs.writeFileSync(path.join(dir, "spec.json"), typeof specText === "function" ? specText(dir) : specText);
+  const res = spawnSync(process.execPath, [path.join(here, "..", "..", "job-runner.mjs"), path.join(dir, "spec.json")],
+    { encoding: "utf8", timeout: 60_000 });
+  return { dir, res };
+}
+
+test("M6 runner: an unreadable spec.json is recorded (err.log, exit.json, exit_code) and reads as failed", async () => {
+  const { res } = await runRunnerOn("m6-badspec", '{"command": "x", "argv": [');
+  assert.equal(res.status, 2);
+  const s = core.checkJob("m6-badspec");
+  assert.equal(s.status, "failed");
+  assert.equal(s.exitCode, 2);
+  assert.match(s.stderr, /could not read spec\.json/);
+  assert.equal(s.exit.exitReason, "spawn-error");
+});
+
+test("M6 runner: log files that cannot be opened are recorded at the spec's exit path and read as failed", async () => {
+  const path = (await import("node:path")).default;
+  const { res } = await runRunnerOn("m6-badlogs", (dir) => JSON.stringify({ command: process.execPath, argv: [], cwd: dir,
+    out: path.join(dir, "no-such-subdir", "out.log"), err: path.join(dir, "no-such-subdir", "err.log"),
+    exit: path.join(dir, "exit_code") }));
+  assert.equal(res.status, 2);
+  const s = core.checkJob("m6-badlogs");
+  assert.equal(s.status, "failed");
+  assert.match(s.exit.spawnError, /could not open the job's log files/);
+});
