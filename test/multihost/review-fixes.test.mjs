@@ -98,3 +98,25 @@ test("M2 caps: counting active jobs never reaps a died job's card; claude_check 
     assert.match(fs.readFileSync(calls, "utf8"), /^fail card-m2$/m, "claude_check still reaps the card");
   } finally { process.env.CLAUNKER_JOBCARD_CMD = prev; }
 });
+
+// M3: one corrupt meta.json must not take down the whole job listing (claude_jobs, /v1/jobs).
+test("M3 listJobs: a corrupt meta.json yields one 'unknown' row with the error; the other jobs still list", async () => {
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const { JOBS } = await import("./_setup.mjs");
+  const mk = (id, metaText, exitCode) => {
+    fs.mkdirSync(path.join(JOBS, id), { recursive: true });
+    fs.writeFileSync(path.join(JOBS, id, "meta.json"), metaText);
+    if (exitCode !== undefined) fs.writeFileSync(path.join(JOBS, id, "exit_code"), String(exitCode));
+  };
+  mk("m3-good", JSON.stringify({ jobId: "m3-good", pid: 1, startedAt: new Date().toISOString() }), 0);
+  mk("m3-truncated", '{"jobId": "m3-trunc', undefined);
+  mk("m3-null", "null", undefined);
+  const rows = core.listJobs();
+  const by = Object.fromEntries(rows.map((r) => [r.jobId, r]));
+  assert.equal(by["m3-good"].status, "completed");
+  assert.equal(by["m3-truncated"].status, "unknown");
+  assert.match(by["m3-truncated"].error, /unreadable meta\.json/);
+  assert.equal(by["m3-null"].status, "unknown");
+  assert.match(core.checkJob("m3-truncated").error, /unreadable meta\.json/, "checkJob reports it rather than throwing");
+});

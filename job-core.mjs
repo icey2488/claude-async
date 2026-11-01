@@ -833,7 +833,13 @@ export function checkJob(id, tailBytes = 8000, { reap = true } = {}) {
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
   if (!fs.existsSync(p.meta)) return { jobId: id, hostname, status: "unknown", error: "no such job" };
-  const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+  // A truncated/corrupt meta.json (writeNewMeta()'s non-atomic fallback, a full disk, a hand edit)
+  // is reported for THIS job instead of thrown: a throw here used to take down claude_jobs and
+  // host-api's /v1/jobs for every other job too.
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); }
+  catch (e) { return { jobId: id, hostname, status: "unknown", error: `unreadable meta.json: ${e.message}` }; }
+  if (!isPlainObject(meta)) return { jobId: id, hostname, status: "unknown", error: "unreadable meta.json: not a JSON object" };
   let state, exitCode = null, finishedAt = null;
   const extra = {};
   // Read once, up front: both the "completed/incomplete vs failed" classification below and
@@ -930,13 +936,18 @@ export function checkJob(id, tailBytes = 8000, { reap = true } = {}) {
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
+// One bad job dir never hides the rest: an entry that vanishes mid-scan is skipped, and a job whose
+// status check throws (e.g. an unreadable exit_code) gets its own "unknown" row with the error.
 export function listJobs() {
-  const ids = fs.existsSync(JOB_ROOT)
-    ? fs.readdirSync(JOB_ROOT).filter((f) => fs.statSync(path.join(JOB_ROOT, f)).isDirectory())
-    : [];
+  let names = [];
+  try { names = fs.readdirSync(JOB_ROOT); } catch {}
+  const ids = names.filter((f) => { try { return fs.statSync(path.join(JOB_ROOT, f)).isDirectory(); } catch { return false; } });
   return ids.map((id) => {
-    const s = checkJob(id, 0);
+    let s;
+    try { s = checkJob(id, 0); }
+    catch (e) { s = { status: "unknown", error: `status check failed: ${e.message}` }; }
     const row = { jobId: id, status: s.status, exitCode: s.exitCode ?? null, startedAt: s.startedAt ?? null };
+    if (s.error) row.error = s.error;
     if (s.lastAlive) row.lastAlive = s.lastAlive;
     if (s.elapsed) row.elapsed = s.elapsed;
     if (s.stalled) row.stalled = true;
