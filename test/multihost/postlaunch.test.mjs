@@ -197,7 +197,9 @@ function fbSeams(over = {}) {
   return s;
 }
 const queueFiles = () => fs.readdirSync(QUEUE).sort();
-const errLog = (p) => fs.readFileSync(p.err, "utf8");
+// A path that never writes a diagnostic leaves no err.log at all (on win32 queryJobMembershipOnce's
+// NOTE usually creates one; elsewhere nothing does), which is the same as an empty log.
+const errLog = (p) => { try { return fs.readFileSync(p.err, "utf8"); } catch (e) { if (e.code === "ENOENT") return ""; throw e; } };
 const writeRunnerPid = (p, pid) => fs.writeFileSync(path.join(p.d, "runner.pid"), String(pid));
 
 test("fallback fires with the ticket still pending: the ticket is removed first, the job is launched exactly once, and no launcher can claim it later", async () => {

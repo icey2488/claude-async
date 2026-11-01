@@ -72,9 +72,32 @@ try {
   fs.renameSync(tmp, pidPath);
 } catch { /* best-effort; launch() falls back to the wrapper's pid after a short timeout */ }
 
+// A failure before the CLI can even be started (unreadable spec.json, log files that cannot be
+// opened) used to exit silently with no exit_code and no output anywhere -- claude_check then
+// reported "died" with diedCause "unknown" and nothing to go on. Instead it is recorded the way a
+// spawn failure is: a line in err.log, exit.json (exitReason "spawn-error", written first, same
+// ordering rule as finish()), then exit_code 2 -- so the job reads "failed" with the reason in its
+// stderr tail. Paths fall back to the job dir's standard names when spec.json is unusable.
+function failBeforeStart(message, paths = {}) {
+  const dir = path.dirname(specPath);
+  const errPath = paths.err || path.join(dir, "err.log");
+  const exitPath = paths.exit || path.join(dir, "exit_code");
+  try { fs.appendFileSync(errPath, `\n[job-runner] ${message}\n`); } catch {}
+  try {
+    writeJsonAtomic(path.join(dir, "exit.json"), { exitCode: null, exitSignal: null, exitReason: "spawn-error",
+      spawnError: message, endedAt: new Date().toISOString(), stderrTail: [message], stdoutTail: [],
+      usageLimitSuspected: null });
+  } catch {}
+  try { fs.writeFileSync(`${exitPath}.${process.pid}.tmp`, "2"); fs.renameSync(`${exitPath}.${process.pid}.tmp`, exitPath); }
+  catch { try { fs.writeFileSync(exitPath, "2"); } catch {} }
+  process.exit(2);
+}
+
 let spec;
-try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
-catch { process.exit(2); }
+try {
+  spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
+  if (spec === null || typeof spec !== "object" || Array.isArray(spec)) throw new Error("not a JSON object");
+} catch (e) { failBeforeStart(`could not read spec.json (${specPath}): ${e.message}`); }
 
 const { command, argv, cwd, out, err, exit } = spec;
 
@@ -125,8 +148,11 @@ function writeHeartbeat() {
 
 // Append mode: each write goes to end-of-file, so the runner's own diagnostics never clobber
 // the child's captured output.
-const outFd = fs.openSync(out, "a");
-const errFd = fs.openSync(err, "a");
+let outFd, errFd;
+try {
+  outFd = fs.openSync(out, "a");
+  errFd = fs.openSync(err, "a");
+} catch (e) { failBeforeStart(`could not open the job's log files: ${e.message}`, { err, exit }); }
 
 // Exit record: written to its OWN file (exit.json, next to meta.json), never merged into
 // meta.json. meta.json already has a writer (job-core), and a second, independent
@@ -224,6 +250,19 @@ function recordExit() {
   return record;
 }
 
+function writeExitCodeAtomic(file, code) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, String(code));
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    // Last resort: a direct write still beats no exit_code at all (the job would read as "died").
+    try { fs.writeFileSync(file, String(code)); }
+    catch { try { fs.writeSync(errFd, `\n[job-runner] could not write exit_code: ${e.message}\n`); } catch {} }
+  }
+}
+
 let done = false;
 let hbInterval;
 
@@ -240,14 +279,20 @@ async function finish(code) {
   // exit_code must be able to rely on exit.json already existing on disk.
   let exitRecord = null;
   try { exitRecord = recordExit(); } catch {}
-  try { fs.writeFileSync(exit, String(code)); } catch {}
-  // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
-  // Reading here (after child exits) avoids any startup race with job-core's meta write.
-  let cardId = null, startHead = null, jobId = null, startedAt = null, intent = null;
+  // exit_code is what every reader polls for "done", so it is replaced atomically (temp + rename,
+  // same as exit.json): a plain writeFileSync truncates first, and a claude_check landing in that
+  // window read an empty file -> parseInt NaN -> a transient, wrong "failed".
+  try { writeExitCodeAtomic(exit, code); } catch {}
+  // Card hook: cardId/startHead come from spec.json (job-core mints the card before launching us
+  // and records it there), falling back to meta.json for jobs launched before that. meta.json alone
+  // is not enough: job-core writes it only after launch returns, so a job that ends quickly can
+  // finish before it exists.
+  let cardId = spec.cardId || null, startHead = spec.startHead || null;
+  let jobId = null, startedAt = null, intent = null;
   try {
     const m = JSON.parse(fs.readFileSync(path.join(path.dirname(specPath), "meta.json"), "utf8"));
-    cardId = m.cardId || null;
-    startHead = m.startHead || null;
+    cardId = cardId || m.cardId || null;
+    startHead = startHead || m.startHead || null;
     jobId = m.jobId || null;
     startedAt = m.startedAt || null;
     intent = m.intent || null;

@@ -164,9 +164,21 @@ function sameFile(filePath, id) {
 // empty file is not "ours" by content (ownsLock/releaseIfOwned would leave it, permanently blocking
 // or disabling the lock/marker), but it is still identifiably ours by identity as long as no one has
 // unlinked-and-recreated the path in between.
+//
+// dev+ino alone is not proof: Linux filesystems (ext4, tmpfs) routinely hand a just-freed inode
+// number to the very next file created, so a rival that unlinked-and-recreated the path in between
+// can carry the SAME dev+ino as the file we created. So identity is necessary but not sufficient:
+// a file whose content names another owner pid is never ours, whatever its dev+ino says. (Stricter
+// only: this can leave a file behind that the old check would have removed, never the reverse.)
 function releaseIfSameFile(lockPath, id, log, what) {
   if (!sameFile(lockPath, id)) {
     log(`${what} ${path.basename(lockPath)} is no longer the file we created (replaced or gone); leaving it alone`);
+    return;
+  }
+  const { pid } = readLockOwner(lockPath);
+  if (pid !== null && pid !== process.pid) {
+    log(`${what} ${path.basename(lockPath)} is no longer the file we created (it now names owner pid=${pid}, ` +
+        `same inode reused); leaving it alone`);
     return;
   }
   try { fs.unlinkSync(lockPath); }

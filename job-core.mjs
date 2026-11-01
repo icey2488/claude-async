@@ -152,7 +152,12 @@ const NO_BACKGROUND_HOOK_MATCHER = "*";
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
 // accepts forward-slash paths natively, so this never needs real backslashes at all.
-function quotedPosixPath(p) {
+//
+// POSIX: the hook runs under /bin/sh, where double quotes still expand $, backticks and \, so a
+// node or repo path containing one of those was mangled (or executed). There it is single-quoted
+// instead, the one sh quoting with no expansion at all. The win32 form is unchanged.
+export function quotedPosixPath(p, platform = process.platform) {
+  if (platform !== "win32") return `'${p.replace(/'/g, "'\\''")}'`;
   return `"${p.replace(/\\/g, "/")}"`;
 }
 
@@ -583,8 +588,10 @@ function launchPosix(p, extraEnv = {}) {
   return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
-async function launch(p, command, argv, cwd, extraEnv = {}) {
-  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
+// specExtra: extra fields recorded in spec.json for the runner (startJob passes the job's cardId
+// and startHead -- see there for why the runner cannot rely on meta.json for those).
+async function launch(p, command, argv, cwd, extraEnv = {}, specExtra = {}) {
+  writeJsonAtomic(p.spec, { ...specExtra, command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
   return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
@@ -652,7 +659,12 @@ export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
 export function isPlainObject(x) {
   return x !== null && typeof x === "object" && !Array.isArray(x);
 }
-export function countActiveJobs(nowMs, { check = checkJob } = {}) {
+// The default check passes reap:false: this runs under guard.mjs's start lock (5s acquire
+// timeout), and a died job's card reap spawns the jobcard command synchronously (up to 10s each)
+// -- one dead-carded job, or a broken jobcard, would otherwise stall every concurrent start past
+// its lock timeout. Counting is read-only; claude_check/claude_jobs still reap.
+const checkWithoutReap = (id, tailBytes) => checkJob(id, tailBytes, { reap: false });
+export function countActiveJobs(nowMs, { check = checkWithoutReap } = {}) {
   let count = 0;
   const warnings = [];
   let ids = [];
@@ -712,7 +724,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
 
   const id = (jobId || `${Date.now()}-${crypto.randomBytes(3).toString("hex")}`).replace(/[^A-Za-z0-9._-]/g, "_");
   if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
-  const cwd = workFolder || DEFAULT_CWD;
+  // Resolved to an absolute path ONCE, here: preflight, the card's git HEAD, meta.json and the
+  // runner's spawn cwd must all mean the same directory. A relative workFolder was checked against
+  // this process's cwd but run from the runner's -- on the win32 Task Scheduler path that is
+  // job-launcher.mjs's cwd, a different directory entirely.
+  const cwd = path.resolve(workFolder || DEFAULT_CWD);
 
   const pf = preflight({ claudeBin: opts.claudeBin, cwd, hostLabel });
   if (pf.error) return fail("preflight", pf.error);
@@ -745,9 +761,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   });
   if (reserved.error) return reserved.errorCode ? reserved : fail("lock", reserved.error);
 
-  const argv = ["-p", prompt, "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
+  // The prompt is the CLI's POSITIONAL argument (-p/--print is a boolean flag), so it goes LAST,
+  // after a "--" end-of-options marker: without it a prompt that merely starts with "-" (a markdown
+  // bullet such as "- fix the bug") fails with "unknown option", and one like "--version" or
+  // "--add-dir /" is parsed as CLI flags -- argument injection from whoever supplies the prompt
+  // (host-api.mjs accepts it from the network). Same reason the model is passed as --model=<value>:
+  // a caller-supplied value can never be read as a separate flag.
+  const argv = ["-p", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   const resolvedModel = model || DEFAULT_MODEL;
-  argv.push("--model", resolvedModel);
+  argv.push(`--model=${resolvedModel}`);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
   const eff = (effort || DEFAULT_EFFORT).toLowerCase();
   // Every claude-async job gets the no-background-hook settings; ultracode merges its own
@@ -767,6 +789,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     argv.push("--effort", eff);
   } // else: unrecognized → leave unset, inheriting settings.json effortLevel.
   argv.push("--settings", JSON.stringify(settingsObj));
+  // End of options: everything after "--" is the prompt, verbatim, never a flag (see above).
+  argv.push("--", prompt);
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
   // CLAUDE_ASYNC_JOB_EFFORT: tells hooks/no-background-hook.mjs this job's effort level, so it
@@ -788,10 +812,20 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (process.env.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS === undefined) {
     extraEnv.CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS = String(BG_WAIT_CEILING_MS);
   }
-  const { pid, pidSource, jobMembership, launchPath } =
-    await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
-
+  // The card is minted BEFORE launch and its id handed to the runner in spec.json. meta.json is
+  // only written after launch returns (it needs the pid), so a job that ends quickly -- the CLI
+  // rejecting a bad --model, a crash on startup -- used to finish before meta.json existed: the
+  // runner's finish() found no cardId and the card stayed "dispatched" forever.
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
+  let launched;
+  try {
+    launched = await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv,
+      { cardId: cardId || null, startHead: startHead || null });
+  } catch (e) {
+    if (cardId) failCard(cardId); // the job never started; don't leave its card dispatched
+    throw e;
+  }
+  const { pid, pidSource, jobMembership, launchPath } = launched;
   // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
   // ping's title (discord-notify.mjs) can use the same value the dispatch card shows -- omitted
   // entirely (no key) when no intent was given, rather than stored as null/empty.
@@ -813,12 +847,20 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
            ...(warnings.length ? { warnings } : {}) };
 }
 
-export function checkJob(id, tailBytes = 8000) {
+// opts.reap (default true): fail the dispatch card of a died/timed_out job (a jobcard subprocess).
+// countActiveJobs() turns it off -- see checkWithoutReap.
+export function checkJob(id, tailBytes = 8000, { reap = true } = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
   if (!fs.existsSync(p.meta)) return { jobId: id, hostname, status: "unknown", error: "no such job" };
-  const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+  // A truncated/corrupt meta.json (writeNewMeta()'s non-atomic fallback, a full disk, a hand edit)
+  // is reported for THIS job instead of thrown: a throw here used to take down claude_jobs and
+  // host-api's /v1/jobs for every other job too.
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); }
+  catch (e) { return { jobId: id, hostname, status: "unknown", error: `unreadable meta.json: ${e.message}` }; }
+  if (!isPlainObject(meta)) return { jobId: id, hostname, status: "unknown", error: "unreadable meta.json: not a JSON object" };
   let state, exitCode = null, finishedAt = null;
   const extra = {};
   // Read once, up front: both the "completed/incomplete vs failed" classification below and
@@ -880,7 +922,7 @@ export function checkJob(id, tailBytes = 8000) {
     }
   }
 
-  if ((state === "died" || state === "timed_out") && meta.cardId && !meta.cardReaped) {
+  if (reap && (state === "died" || state === "timed_out") && meta.cardId && !meta.cardReaped) {
     const reap = failCard(meta.cardId);
     if (reap.ok) {
       meta.cardReaped = true;
@@ -915,13 +957,18 @@ export function checkJob(id, tailBytes = 8000) {
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
+// One bad job dir never hides the rest: an entry that vanishes mid-scan is skipped, and a job whose
+// status check throws (e.g. an unreadable exit_code) gets its own "unknown" row with the error.
 export function listJobs() {
-  const ids = fs.existsSync(JOB_ROOT)
-    ? fs.readdirSync(JOB_ROOT).filter((f) => fs.statSync(path.join(JOB_ROOT, f)).isDirectory())
-    : [];
+  let names = [];
+  try { names = fs.readdirSync(JOB_ROOT); } catch {}
+  const ids = names.filter((f) => { try { return fs.statSync(path.join(JOB_ROOT, f)).isDirectory(); } catch { return false; } });
   return ids.map((id) => {
-    const s = checkJob(id, 0);
+    let s;
+    try { s = checkJob(id, 0); }
+    catch (e) { s = { status: "unknown", error: `status check failed: ${e.message}` }; }
     const row = { jobId: id, status: s.status, exitCode: s.exitCode ?? null, startedAt: s.startedAt ?? null };
+    if (s.error) row.error = s.error;
     if (s.lastAlive) row.lastAlive = s.lastAlive;
     if (s.elapsed) row.elapsed = s.elapsed;
     if (s.stalled) row.stalled = true;
@@ -936,8 +983,11 @@ export async function runSelfTest() {
   const id = `selftest-${Date.now()}`;
   const p = jobPaths(id);
   fs.mkdirSync(p.d, { recursive: true });
+  // The child prints the default completeness marker (discord-notify.mjs's
+  // DEFAULT_COMPLETENESS_MARKER_SOURCE) after SELFTEST_OK: since the "incomplete" status, an exit-0
+  // run without it reads as "incomplete", and this selftest failed on every healthy install.
   const { pid, pidSource } = await launch(p, process.execPath,
-    ["-e", "setTimeout(() => console.log('SELFTEST_OK'), 300)"], JOB_ROOT);
+    ["-e", "setTimeout(() => { console.log('SELFTEST_OK'); console.log('DELEGATION-METRICS: selftest'); }, 300)"], JOB_ROOT);
   writeJsonAtomic(p.meta, { jobId: id, pid, pidSource, startedAt: new Date().toISOString() }, { space: 0 });
 
   const deadline = Date.now() + 5000;
@@ -947,9 +997,14 @@ export async function runSelfTest() {
     s = checkJob(id);
   } while (s.status === "running" && Date.now() < deadline);
 
-  const pass = s.status === "completed" && s.exitCode === 0 && s.stdout.includes("SELFTEST_OK");
+  // "incomplete" still proves the detach/poll/exit plumbing: it only means notify.json configures a
+  // custom completeness markerRegex that the default marker above does not match.
+  const plumbingOk = s.exitCode === 0 && s.stdout.includes("SELFTEST_OK");
+  const pass = plumbingOk && (s.status === "completed" || s.status === "incomplete");
   fs.rmSync(p.d, { recursive: true, force: true });
-  console.log(pass ? "SELFTEST PASS — detach/poll/exit plumbing works"
+  console.log(pass ? "SELFTEST PASS — detach/poll/exit plumbing works" +
+                       (s.status === "incomplete" ? " (status \"incomplete\": notify.json's completeness.markerRegex " +
+                         "does not match the default DELEGATION-METRICS marker)" : "")
                    : `SELFTEST FAIL — status=${s.status} exit=${s.exitCode} stdout=${JSON.stringify(s.stdout)}`);
   process.exit(pass ? 0 : 1);
 }
