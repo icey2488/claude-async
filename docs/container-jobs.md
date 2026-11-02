@@ -505,12 +505,25 @@ limited per container; the clone and everything else live in the writable layer 
 - **Cleanup state is separate from the CLI's exit.** `exit_code` says the docker client exited; it
   does not say nothing is running (the client can exit, or be killed, while its container keeps
   going, and the final removal can fail while the daemon is unreachable). Cleanup is **confirmed**
-  only when docker lists nothing with the label AND no launch can still be pending (the runner
-  finished, or the docker client pid it recorded in `docker_client.pid` is gone). The runner records
-  its result in `exit.json.container.cleanup.confirmed`; job-core records a later confirmation in
-  `meta.json.containerCleanup`. `claude_check` shows `containerCleanup: "confirmed" | "unconfirmed"`
-  for a finished job and retries an unconfirmed cleanup on every call. The concurrency-cap count
-  never does docker housekeeping.
+  only when, in this order, (1) no launch can still be pending and (2) docker then lists nothing
+  with the label. "No launch pending" is decided from the runner's **launch state file**
+  `docker_launch`, written `pending` *before* `docker run` is spawned, `spawned` (with the client's
+  pid, also in `docker_client.pid`) right after, `exited` when the client ended on its own, or
+  `killed` when a stop fallback had to kill it. A launch is still pending while the recorded client
+  pid is alive (even after `exit_code` exists), while the runner is alive, while any process whose
+  command line carries the job's `--label claude-async.job=<id>` exists (a process scan, which also
+  finds a client whose pid was never recorded because the runner died between the spawn and the pid
+  write, and on Windows the `com.docker.cli.exe` child that `docker.exe` hands its work to), and for
+  `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` (2 min) after a client was killed, because its create
+  request may still be in flight daemon-side. Liveness first, listing second: a client that creates
+  its container and exits between the two observations is then seen by the listing. The runner
+  records its result in `exit.json.container.cleanup.confirmed`; job-core records a later
+  confirmation in `meta.json.containerCleanup`. `claude_check` shows
+  `containerCleanup: "confirmed" | "unconfirmed"` for a finished job and retries an unconfirmed
+  cleanup on every call. The concurrency-cap count never does docker housekeeping, but **a container
+  job holds a `CLAUDE_ASYNC_MAX_CONCURRENT` slot until its cleanup is confirmed**, whatever its
+  status, since its container may still be using the VM's CPUs and memory; a `claude_check` (or
+  `claude_jobs`) is what confirms it.
 - **Cancel = `claude_cancel`** (routed by host prefix; `POST /v1/cancel` on a remote host):
   1. The cancel intent is written first, as `cancel_requested` in the job dir.
   2. The job's containers are removed by label. If none exists yet, the answer says so
@@ -526,7 +539,11 @@ limited per container; the clone and everything else live in the writable layer 
   the client and records the cleanup as NOT confirmed; `claude_check` confirms it later.
 - **A runner that died** (`taskkill /F`, `TerminateProcess`): `claude_check` classifies the job
   `died`/`timed_out`, writes `cancel_requested` (so a slow runner never starts docker), removes by
-  label, and confirms only if the recorded docker client is gone.
+  label, and confirms only under the launch-state rules above (recorded client gone, no process with
+  the job's label, hold after a kill). On Docker Desktop for Windows `docker.exe` may spawn
+  `com.docker.cli.exe` to do the actual work; `TerminateProcess` on `docker.exe` does not kill that
+  child (not verified here: no Windows). The label-based process scan and the label-based container
+  listing are the backstop for that case, not the pid.
 - Verified with a real Docker engine (Linux, not Docker Desktop): cancel right after launch never
   started the container; cancel while running and SIGTERM gave exit 137 with cleanup confirmed; the
   wall-clock limit gave `timed_out`; a normal run confirmed cleanup; no labelled container was left.
@@ -592,7 +609,8 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY` | unset | phase 2 |
 | `CLAUDE_ASYNC_CONTAINER_OLLAMA_URL` | `http://host.docker.internal:11434` | |
 | `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD` | `container/CLAUDE.md` | |
-| `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` | `30000` | runner: how long to wait for the client after a signal |
+| `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` | `30000` | runner: how long to wait for the client after a signal, cancel or the wall-clock limit before killing it |
+| `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` | `120000` | job-core: how long after a killed docker client an empty listing does not yet confirm cleanup |
 
 Removed in review round 1: `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, `_DENIED_ROOTS` and
 `_GIT_AUTOCRLF` (no host folder is mounted any more).

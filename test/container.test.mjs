@@ -834,3 +834,88 @@ test("checkJob: a container job's stdout/stderr tails and exit.json tails are re
   fs.appendFileSync(path.join(core.JOB_ROOT, hostId, "out.log"), `ghp_${"Q".repeat(36)}\n`);
   assert.match(core.checkJob(hostId, 8000).stdout, /ghp_QQQ/, "host-mode output is untouched");
 });
+
+// ------------------------------------------------------------ review round 2, finding A1 ---
+
+// The liveness check must come BEFORE the authoritative listing: a client that creates its container
+// and exits between an (empty) listing and the liveness check used to get the job confirmed with a
+// running container. Here the listing seam itself "lets the client exit" (rewrites the pid file to a
+// dead pid) after it has returned an empty list.
+test("A1: liveness is established before the final listing (client exiting mid-reconcile is not confirmation)", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx, deadLaunch);
+  fs.writeFileSync(path.join(d, "docker_launch"), JSON.stringify({ state: "spawned", pid: process.pid, at: new Date().toISOString() }));
+  fs.writeFileSync(path.join(d, "docker_client.pid"), String(process.pid));
+  const seam = () => { fs.writeFileSync(path.join(d, "docker_client.pid"), "999999");
+                       fs.writeFileSync(path.join(d, "docker_launch"), JSON.stringify({ state: "spawned", pid: 999999 }));
+                       return { ok: true, absent: true, removed: 0, remaining: [] }; };
+  const r = core.checkJob(id, 0, { cleanupContainers: seam });
+  assert.equal(r.status, "died");
+  assert.equal(r.containerCleanup, "unconfirmed", JSON.stringify(r.containerCleanupError));
+});
+
+// Argon #2 (b): a FINISHED job (exit_code present) whose runner recorded cleanup as unconfirmed with
+// the docker client still alive (or killed with a create possibly in flight) stays unconfirmed.
+test("A1: a finished job's live or just-killed docker client keeps cleanup unconfirmed", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  fs.writeFileSync(path.join(d, "exit.json"), JSON.stringify({ exitCode: null, exitReason: "signal",
+    container: { cleanup: { confirmed: false, reason: "the docker client did not exit within the stop wait and was killed" } } }));
+  fs.writeFileSync(path.join(d, "exit_code"), "1");
+  fs.writeFileSync(path.join(d, "docker_client.pid"), String(process.pid));
+  fs.writeFileSync(path.join(d, "docker_launch"), JSON.stringify({ state: "spawned", pid: process.pid, at: new Date().toISOString() }));
+  const empty = () => ({ ok: true, absent: true, removed: 0, remaining: [] });
+  assert.equal(core.checkJob(id, 0, { cleanupContainers: empty }).containerCleanup, "unconfirmed", "client alive");
+  assert.equal(core.cancelJob(id, { cleanupContainers: empty }).alreadyFinished, undefined);
+  // the client is gone now, but it was killed moments ago: hold before confirming
+  fs.writeFileSync(path.join(d, "docker_launch"), JSON.stringify({ state: "killed", pid: 999999, at: new Date().toISOString() }));
+  fs.writeFileSync(path.join(d, "docker_client.pid"), "999999");
+  process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS = "600000";
+  try {
+    const held = core.checkJob(id, 0, { cleanupContainers: empty });
+    assert.equal(held.containerCleanup, "unconfirmed", "killed client: its create request may still be in flight");
+    assert.match(held.containerCleanupError, /killed/);
+  } finally { delete process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS; }
+  // killed long ago: an empty listing confirms
+  fs.writeFileSync(path.join(d, "docker_launch"), JSON.stringify({ state: "killed", pid: 999999, at: new Date(Date.now() - 3_600_000).toISOString() }));
+  assert.equal(core.checkJob(id, 0, { cleanupContainers: empty }).containerCleanup, "confirmed");
+});
+
+// A runner that died before writing any launch state, with no docker client of this job's label
+// alive anywhere, is the only "missing state" case that confirms on an empty listing. A live runner
+// (even one whose status reads died because its heartbeat lagged) never confirms.
+test("A1: missing launch state is uncertain while the runner is alive; confirmed only when nothing of the job's can be found", async () => {
+  const fx = fixture();
+  const empty = () => ({ ok: true, absent: true, removed: 0, remaining: [] });
+  const alive = await startCtr(fx, async () => ({ pid: process.pid, pidSource: "test", launchPath: "test" }));
+  fs.writeFileSync(path.join(alive.d, "runner_heartbeat"), new Date(Date.now() - 10 * 60_000).toISOString());
+  const r = core.checkJob(alive.id, 0, { cleanupContainers: empty, findDockerClients: () => [] });
+  assert.equal(r.status, "running", "stale heartbeat but a live pid reads running (unchanged)");
+  const dead = await startCtr(fx, deadLaunch);
+  // a docker client process carrying this job's label exists (found by the process scan): pending
+  assert.equal(core.checkJob(dead.id, 0, { cleanupContainers: empty, findDockerClients: () => [4242] }).containerCleanup, "unconfirmed");
+  assert.equal(core.checkJob(dead.id, 0, { cleanupContainers: empty, findDockerClients: () => [] }).containerCleanup, "confirmed");
+});
+
+// Argon #2 (c): a container job whose cleanup is unconfirmed still owns a container's CPU and
+// memory, so it counts toward CLAUDE_ASYNC_MAX_CONCURRENT whatever its status says. No docker call
+// is made for the count (file reads only).
+test("A1: countActiveJobs counts a container job while its cleanup is unconfirmed, confirmed ones not", async () => {
+  const fx = fixture();
+  const before = core.countActiveJobs(Date.now()).count;
+  const unc = await startCtr(fx, deadLaunch);
+  fs.writeFileSync(path.join(unc.d, "exit.json"), JSON.stringify({ exitCode: 137, container: { cleanup: { confirmed: false, error: "daemon down" } } }));
+  fs.writeFileSync(path.join(unc.d, "exit_code"), "137");
+  const conf = await startCtr(fx, deadLaunch);
+  fs.writeFileSync(path.join(conf.d, "exit.json"), JSON.stringify({ exitCode: 0, container: { cleanup: { confirmed: true } } }));
+  fs.writeFileSync(path.join(conf.d, "exit_code"), "0");
+  const deadNoRecord = await startCtr(fx, deadLaunch); // died before docker run; never reconciled yet
+  const opts = [];
+  const { count } = core.countActiveJobs(Date.now(), { check: (jid2, tail, o) => { opts.push(o); return core.checkJob(jid2, tail, o); } });
+  assert.equal(count, before + 2, "the unconfirmed finished job and the unreconciled dead one count; the confirmed one does not");
+  assert.ok(opts.every((o) => o && o.containerCleanup === false), "still no docker housekeeping from the cap count");
+  assert.ok(!fs.existsSync(path.join(deadNoRecord.d, "cancel_requested")));
+  // once a check confirms the dead one, it stops counting
+  core.checkJob(deadNoRecord.id, 0, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }), findDockerClients: () => [] });
+  assert.equal(core.countActiveJobs(Date.now()).count, before + 1);
+});

@@ -8,19 +8,35 @@
 //                (default 0), removing the container (--rm) -- unless $FAKE_DOCKER_LEAVE_RUNNING=1,
 //                which models a client that exits while its container keeps running. If the
 //                container is removed while it runs (rm -f), the client exits 137, as the real one does.
+//                $FAKE_DOCKER_DAEMON_CREATE_DELAY_MS=N decouples creation from the client process, as
+//                it is in the real engine: the client hands the create request to a detached "daemon"
+//                process which writes the state after N ms whether or not the client is still alive
+//                (a killed client's request is still served). The client waits for the state to appear.
 //   ps -a ... -> prints "<id>\t<state>\t<label>" for the container, if it exists. Fails like a
 //                daemon that is down while $FAKE_DOCKER_DAEMON_DOWN names an existing file.
 //   rm -f <id>-> removes the container (exit 0; a missing one is also exit 0, as with docker 29),
 //                unless $FAKE_DOCKER_IGNORE_RM=1 (models a wedged daemon: exit 0, container stays).
+//                $FAKE_DOCKER_IGNORE_RM may also name a file: rm is ignored only while it exists, so a
+//                test can let the daemon "recover" by deleting it.
 import fs from "node:fs";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const argv = process.argv.slice(2);
+
+// Internal: the detached daemon-side create (see FAKE_DOCKER_DAEMON_CREATE_DELAY_MS above).
+if (argv[0] === "__daemon-create") {
+  const [, file, json, delay] = argv;
+  setTimeout(() => { try { fs.writeFileSync(file, json); } catch {} }, Number(delay) || 0);
+} else {
+
 const log = process.env.FAKE_DOCKER_LOG;
 if (log) fs.appendFileSync(log, JSON.stringify({ argv }) + "\n");
 const stateFile = log ? `${log}.state.json` : null;
 const readState = () => { try { return JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch { return null; } };
 const daemonDown = () => process.env.FAKE_DOCKER_DAEMON_DOWN && fs.existsSync(process.env.FAKE_DOCKER_DAEMON_DOWN);
+const ignoreRm = () => { const v = process.env.FAKE_DOCKER_IGNORE_RM; return v === "1" || (v && v !== "0" && fs.existsSync(v)); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (daemonDown() && argv[0] !== "run") {
@@ -35,7 +51,7 @@ if (argv[0] === "ps") {
 }
 
 if (argv[0] === "rm") {
-  if (process.env.FAKE_DOCKER_IGNORE_RM !== "1") { try { fs.rmSync(stateFile); } catch {} }
+  if (!ignoreRm()) { try { fs.rmSync(stateFile); } catch {} }
   process.exit(0);
 }
 
@@ -45,7 +61,16 @@ if (argv[0] === "run") {
   const id = crypto.createHash("sha256").update(name).digest("hex");
   const createDelay = Number(process.env.FAKE_DOCKER_CREATE_DELAY_MS) || 0;
   if (createDelay) await sleep(createDelay);
-  fs.writeFileSync(stateFile, JSON.stringify({ id, label, state: "running" }));
+  const state = JSON.stringify({ id, label, state: "running" });
+  const daemonDelay = Number(process.env.FAKE_DOCKER_DAEMON_CREATE_DELAY_MS) || 0;
+  if (daemonDelay) {
+    const d = spawn(process.execPath, [fileURLToPath(import.meta.url), "__daemon-create", stateFile, state, String(daemonDelay)],
+                    { detached: true, stdio: "ignore" });
+    d.unref();
+    while (!readState()) await sleep(25);
+  } else {
+    fs.writeFileSync(stateFile, state);
+  }
   if (process.env.FAKE_DOCKER_STDOUT) process.stdout.write(process.env.FAKE_DOCKER_STDOUT + "\n");
   process.stdout.write("container stdout\n");
   process.stderr.write("container stderr\n");
@@ -62,3 +87,5 @@ if (argv[0] === "run") {
   }
 }
 process.exit(0);
+
+}

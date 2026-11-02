@@ -41,8 +41,10 @@
  *   (1) Cancel intent: if job-core wrote cancel_requested before this runner got to `docker run`, the
  *       container is never started; while the client runs, the file is polled and the container is
  *       removed the moment it is seen (also right after a container that was still being created
- *       appears). The docker client's pid goes to docker_client.pid so job-core can tell whether a
- *       launch may still be pending.
+ *       appears). The launch state goes to docker_launch ("pending" BEFORE the spawn, "spawned" with
+ *       the client's pid, "exited", or "killed" when a fallback had to kill the client) plus the pid
+ *       alone in docker_client.pid, so job-core can tell whether a launch may still be pending even
+ *       when this runner died between two of those writes (job-core.mjs containerLaunchPending).
  *   (2) Every stop removes the job's containers BY LABEL (claude-async.job=<jobId>) with
  *       `docker rm -f <id>` (container.mjs cleanupJobContainers), which catches a container in the
  *       Created state too. Stopping the docker client alone leaves the container running.
@@ -114,7 +116,27 @@ const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
 // Container jobs: cancel intent (written by job-core) and the docker client's pid (written here).
 const cancelPath = path.join(path.dirname(specPath), "cancel_requested");
 const dockerPidPath = path.join(path.dirname(specPath), "docker_client.pid");
+// Container jobs: the launch state job-core reads to decide whether a `docker run` could still
+// create a container (see job-core.mjs containerLaunchPending). Written BEFORE the client is
+// spawned ("pending"), again once its pid is known ("spawned"), when the client exited on its own
+// ("exited": no further creation possible) and when this runner had to kill it ("killed": the
+// daemon may still be serving its create request). A runner that dies between any two of these
+// leaves the earlier state behind, which job-core treats as "uncertain", never as "done".
+const dockerLaunchPath = path.join(path.dirname(specPath), "docker_launch");
 const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null };
+function writeLaunchState(state, pid = null) {
+  const tmp = dockerLaunchPath + ".tmp";
+  try {
+    fs.writeFileSync(tmp, JSON.stringify({ state, pid, runnerPid: process.pid, at: new Date().toISOString() }), "utf8");
+    fs.renameSync(tmp, dockerLaunchPath);
+  } catch { try { fs.writeFileSync(dockerLaunchPath, JSON.stringify({ state, pid, runnerPid: process.pid, at: new Date().toISOString() })); } catch {} }
+}
+// Kills the docker client (fallback paths only) and records that its create request may be in flight.
+function killClient(child) {
+  if (!child || (child.exitCode !== null || child.signalCode !== null)) return;
+  writeLaunchState("killed", child.pid || null);
+  try { child.kill("SIGKILL"); } catch {}
+}
 // Container jobs: the secret values to redact from anything that leaves this runner. In memory only.
 const redactValues = containerSpec ? readEnvFileSecretValues(containerSpec.envFile) : [];
 const redact = (text) => (containerSpec ? redactSecrets(text, redactValues) : text);
@@ -344,7 +366,7 @@ async function finish(code) {
   let cleanupRecord = null;
   if (containerSpec) {
     if (containerWatch) clearInterval(containerWatch);
-    if (child && child.exitCode === null && child.signalCode === null) { try { child.kill("SIGKILL"); } catch {} }
+    if (child && child.exitCode === null && child.signalCode === null) { containerState.fallbackFired = true; killClient(child); }
     try {
       const r = removeJobContainers("finish");
       const absent = !!(r.ok && r.absent);
@@ -353,7 +375,7 @@ async function finish(code) {
       const confirmed = absent && !containerState.fallbackFired;
       cleanupRecord = { confirmed, removed: r.removed || 0,
                         ...(!r.ok ? { error: r.error } : !absent ? { error: "a container is still listed after docker rm -f" } : {}),
-                        ...(containerState.fallbackFired ? { reason: "the docker client did not exit within the stop wait and was killed" } : {}) };
+                        ...(containerState.fallbackFired ? { clientKilled: true, reason: "the docker client did not exit within the stop wait and was killed" } : {}) };
       if (absent && r.removed > 0 && !containerState.cancelled && !containerState.runtimeExceeded) {
         fs.writeSync(errFd, `\n[job-runner] container ${containerSpec.name} was still present after docker exited; removed it\n`);
       }
@@ -438,9 +460,13 @@ if (containerSpec && fs.existsSync(cancelPath)) {
   exitInfo = { exitCode: null, exitSignal: null, exitReason: "cancelled" };
   finish(130);
 } else {
+  // Container jobs: "a launch is pending" is on disk BEFORE the spawn, so a runner that dies in the
+  // next few lines can never be mistaken for one that never got this far.
+  if (containerSpec) writeLaunchState("pending");
   try {
     child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true, env: spawnEnv });
   } catch (e) {
+    if (containerSpec) writeLaunchState("exited");
     try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
     exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
     finish(127);
@@ -452,7 +478,18 @@ if (containerSpec && fs.existsSync(cancelPath)) {
 // tick until the client exits, which also catches a container that was still being created when
 // the cancel arrived.
 if (child && containerSpec) {
+  // Test-only knob (test/container-runner.test.mjs, finding A1): die between the spawn and the pid
+  // write, the exact window a TerminateProcess can hit. Production never sets this.
+  if (process.env.CLAUDE_ASYNC_TEST_DIE_AFTER_SPAWN === "1") process.kill(process.pid, "SIGKILL");
   try { if (child.pid) fs.writeFileSync(dockerPidPath, String(child.pid)); } catch {}
+  writeLaunchState("spawned", child.pid || null);
+  // A cancel that landed between the pre-spawn check and here is acted on at once, not on the
+  // first poll tick.
+  if (fs.existsSync(cancelPath)) {
+    containerState.cancelled = true;
+    try { fs.writeSync(errFd, `\n[job-runner] cancel request seen right after docker run started; removing container ${containerSpec.name}\n`); } catch {}
+    removeJobContainers("cancel");
+  }
   const startedMs = Date.now();
   const maxRuntimeMs = Number(containerSpec.maxRuntimeMs) > 0 ? Number(containerSpec.maxRuntimeMs) : DEFAULT_MAX_RUNTIME_MS;
   const pollMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_POLL_MS) || 1000;
@@ -487,7 +524,7 @@ if (child && containerSpec) {
     setTimeout(() => {
       if (done) return;
       containerState.fallbackFired = true;
-      try { child.kill("SIGKILL"); } catch {}
+      killClient(child);
       exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
       finish(1);
     }, stopWaitMs).unref();
@@ -512,6 +549,9 @@ if (child) {
     // try to detect "was this really a kill" from code 1 alone, because 1 is also the CLI's
     // ordinary error exit code -- any such heuristic would misclassify real CLI failures.
     exitInfo = { exitCode: code, exitSignal: signal, exitReason: signal ? "signal" : "exit" };
+    // Container jobs: a client that exited on its own can't create anything any more; one this runner
+    // killed (fallback) keeps the "killed" state written by killClient().
+    if (containerSpec && !containerState.fallbackFired) writeLaunchState("exited", child.pid || null);
     finish(code == null ? (signal ? 1 : 0) : code);
   });
 }

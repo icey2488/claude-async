@@ -62,8 +62,22 @@ function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).argv) : []);
   const exitRecord = () => JSON.parse(fs.readFileSync(path.join(dir, "exit.json"), "utf8"));
   const containerExists = () => fs.existsSync(`${log}.state.json`);
-  return { jobId, dir, name, env, log, calls, exitRecord, containerExists, spec: path.join(dir, "spec.json") };
+  const patchMeta = (patch) => { const m = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
+                                 fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ ...m, ...patch })); };
+  return { jobId, dir, name, env, log, calls, exitRecord, containerExists, patchMeta, spec: path.join(dir, "spec.json") };
 }
+const pidGone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+// checkJob()/cancelJob() run in this process; point the fake at the job's daemon state while fn runs.
+function withFakeDaemon(j, fn, extra = {}) {
+  const saved = {};
+  const set = { FAKE_DOCKER_LOG: j.log, ...extra };
+  for (const k of Object.keys(set)) { saved[k] = process.env[k]; process.env[k] = set[k]; }
+  try { return fn(); }
+  finally { for (const k of Object.keys(set)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; } }
+}
+// Makes checkJob classify a runner that is really dead as died now, instead of after the 3 min
+// heartbeat-freshness window: the runner's last heartbeat is rewritten 10 minutes into the past.
+const ageHeartbeat = (j) => fs.writeFileSync(path.join(j.dir, "runner_heartbeat"), new Date(Date.now() - 10 * 60_000).toISOString());
 const runSync = (j, env = j.env) => spawnSync(process.execPath, [RUNNER, j.spec], { env, encoding: "utf8", timeout: 60_000 });
 const waitFor = async (pred, ms = 15_000) => {
   const deadline = Date.now() + ms;
@@ -279,4 +293,54 @@ test("redaction: printed tokens never reach exit.json or the Discord ping", { sk
     assert.match(got[0], /REDACTED/, "the headline was the leaking line, redacted");
     assert.match(fs.readFileSync(path.join(j.dir, "out.log"), "utf8"), new RegExp(SECRET_GH), "out.log on disk stays raw");
   } finally { await new Promise((r) => server.close(r)); }
+});
+
+// ------------------------------------------------------------ review round 2, finding A1 ---
+// Cleanup must never be confirmed while a docker client that could still create the container is
+// alive, or while a killed client's create request may still be in flight daemon-side.
+
+// The runner dies right after spawning `docker run`, before it could persist the client's pid. The
+// client survives and the daemon creates the container later. The first check must stay
+// unconfirmed (nothing to list yet, but a client carrying this job's label is alive); a later one
+// must find the container and remove it; confirmation comes only once the client is gone.
+test("A1: runner killed between spawn and pid persistence; delayed creation is still found and removed", { skip: SKIP }, async () => {
+  const j = setup({ CLAUDE_ASYNC_TEST_DIE_AFTER_SPAWN: "1", FAKE_DOCKER_DAEMON_CREATE_DELAY_MS: "2500", FAKE_DOCKER_RUN_MS: "60000" });
+  const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  j.patchMeta({ pid: child.pid });
+  await exited(child);
+  assert.ok(!fs.existsSync(path.join(j.dir, "docker_client.pid")), "the pid was never persisted (that is the scenario)");
+  assert.ok(!fs.existsSync(path.join(j.dir, "exit_code")));
+  assert.ok(!j.containerExists(), "the daemon has not created the container yet");
+  ageHeartbeat(j);
+  const s1 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0));
+  assert.equal(s1.status, "died");
+  assert.equal(s1.containerCleanup, "unconfirmed", `an empty listing with a live docker client is not cleanup: ${JSON.stringify(s1)}`);
+  assert.ok(await waitFor(() => j.containerExists(), 10_000), "the surviving client's create request was served");
+  const s2 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0));
+  assert.ok(!j.containerExists(), "the later check found and removed the container");
+  assert.ok(await waitFor(() => withFakeDaemon(j, () => core.checkJob(j.jobId, 0)).containerCleanup === "confirmed", 10_000),
+    `confirmed once the client is gone (last: ${JSON.stringify(s2.containerCleanupError)})`);
+});
+
+// Signal fallback with a create request still in flight: SIGTERM lands while `docker run` is
+// waiting on the daemon, the stop wait passes, the client is killed, and the daemon creates the
+// container AFTER the runner finished. The runner recorded "unconfirmed"; the next check must not
+// turn one empty listing into permanent success while the killed client's request may still land.
+test("A1: delayed daemon creation after the signal fallback is reaped, not confirmed away", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_DAEMON_CREATE_DELAY_MS: "4000", FAKE_DOCKER_RUN_MS: "60000", CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS: "1000" });
+  const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  j.patchMeta({ pid: child.pid });
+  assert.ok(await waitFor(() => j.calls().some((a) => a[0] === "run")), "docker run started");
+  child.kill("SIGTERM");
+  assert.equal(await exited(child), 0);
+  const rec = j.exitRecord();
+  assert.equal(rec.container.cleanup.confirmed, false);
+  assert.ok(!j.containerExists(), "nothing exists yet when the runner finished");
+  const hold = { CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS: "3000" };
+  const s1 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.equal(s1.containerCleanup, "unconfirmed", `right after a killed client, one empty listing is not confirmation: ${JSON.stringify(s1.containerCleanupError)}`);
+  assert.ok(await waitFor(() => j.containerExists(), 10_000), "the killed client's create request was served by the daemon");
+  withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.ok(!j.containerExists(), "the late container was removed");
+  assert.ok(await waitFor(() => withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold).containerCleanup === "confirmed", 10_000));
 });

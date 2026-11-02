@@ -27,7 +27,7 @@ import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentSt
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues,
-         redactSecrets, checkHttpBridgeLocked } from "./container.mjs";
+         redactSecrets, checkHttpBridgeLocked, CONTAINER_JOB_LABEL } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -420,7 +420,8 @@ const jobPaths = (id) => {
            spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat"),
            exitJson: path.join(d, "exit.json"),
            // container jobs only: the persisted cancel intent (job-core writes, the runner reads) and
-           // the docker client's pid (the runner writes, job-core reads; see containerLaunchPending)
+           // the docker client's pid (the runner writes, job-core reads; see containerLaunchPending;
+           // the fuller launch state is docker_launch, read by readDockerLaunchState)
            cancel: path.join(d, "cancel_requested"), dockerPid: path.join(d, "docker_client.pid") };
 };
 
@@ -886,6 +887,16 @@ export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
 export function isPlainObject(x) {
   return x !== null && typeof x === "object" && !Array.isArray(x);
 }
+// File reads only (meta.json, exit.json), never docker: is this a container job whose cleanup has
+// not been confirmed yet? false for host jobs and for anything unreadable that is not a container job.
+function containerJobCleanupUnconfirmed(p, meta = null) {
+  try {
+    if (!meta) meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+    if (!isPlainObject(meta) || meta.sandbox !== "container" || !meta.container) return false;
+    return !containerCleanupConfirmed(meta, readExitJson(p));
+  } catch { return false; }
+}
+
 export function countActiveJobs(nowMs, { check = checkJob } = {}) {
   let count = 0;
   const warnings = [];
@@ -895,19 +906,24 @@ export function countActiveJobs(nowMs, { check = checkJob } = {}) {
     const p = jobPaths(id);
     let dirStat;
     try { dirStat = fs.statSync(p.d); } catch { continue; } // raced away
-    if (!dirStat.isDirectory() || fs.existsSync(p.exit)) continue;
+    if (!dirStat.isDirectory()) continue;
+    const finished = fs.existsSync(p.exit);
+    if (finished && !containerJobCleanupUnconfirmed(p)) continue;
     let problem = null;
     let running = false;
     let meta;
     try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); }
     catch (e) { problem = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`; }
     if (!problem && !isPlainObject(meta)) problem = "has an unreadable meta.json (not a JSON object)";
-    if (!problem) {
+    if (!problem && !finished) {
       // containerCleanup:false: the cap count only needs a status, never docker housekeeping (which
       // could spend docker timeouts inside the start lock when the daemon is down).
       try { running = check(id, 0, { containerCleanup: false }).status === "running"; }
       catch (e) { problem = `has a readable meta.json but its status check failed (${e.message})`; }
     }
+    // A container job whose cleanup is not confirmed may still own a running container (4 CPUs, 8g
+    // in the WSL2 VM), whatever its status says: it holds a slot until a check confirms the cleanup.
+    if (!problem && !running && containerJobCleanupUnconfirmed(p, meta)) running = true;
     if (!problem) { if (running) count++; continue; }
     let lastModMs = dirStat.mtimeMs;
     try { lastModMs = Math.max(lastModMs, fs.statSync(p.meta).mtimeMs); } catch {}
@@ -1253,7 +1269,7 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
     const terminal = exitCode !== null || state === "died" || state === "timed_out";
     if (terminal) {
       const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "checkJob", runnerFinished: exitCode !== null,
-                                                                   cleanup: opts.cleanupContainers });
+                                                                   cleanup: opts.cleanupContainers, findClients: opts.findDockerClients });
       extra.containerCleanup = cl.confirmed ? "confirmed" : "unconfirmed";
       if (!cl.confirmed && cl.reason) extra.containerCleanupError = cl.reason;
     }
@@ -1309,25 +1325,102 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
 // A container job's cleanup is tracked separately from the CLI's completion: exit_code says the
 // docker client exited, not that nothing the job owns is still running (the client can exit, or be
 // killed, while its container keeps going, and the final removal can fail while the daemon is
-// unreachable). Cleanup is CONFIRMED only when (a) docker lists no container with the job's
-// claude-async.job label after removing what it found, and (b) no launch can still be pending:
-// either the runner finished (its finish() kills the client first), or the docker client pid the
-// runner recorded is gone. Confirmation is stored once -- by the runner in exit.json
+// unreachable). Cleanup is CONFIRMED only when (a) no launch can still be pending (decided FIRST,
+// see containerLaunchPending: the recorded docker client is gone, the runner is gone or finished, no
+// process carrying the job's label exists, and a killed client's create request has had time to
+// land), and then (b) docker lists no container with the job's claude-async.job label after
+// removing what it found. Confirmation is stored once -- by the runner in exit.json
 // (container.cleanup.confirmed) or by job-core in meta.json (containerCleanup) -- and every later
-// check/cancel retries until then.
+// check/cancel retries until then. Until then the job also holds a concurrency slot
+// (countActiveJobs), since its container may still be running.
 
 export function containerCleanupConfirmed(meta, exitRecord) {
   return !!((exitRecord && exitRecord.container && exitRecord.container.cleanup && exitRecord.container.cleanup.confirmed === true) ||
             (meta && meta.containerCleanup && meta.containerCleanup.confirmed === true));
 }
 
-// True while a `docker run` the runner started could still create (or start) a container: the
-// runner has not finished and the docker client it recorded is still alive.
-function containerLaunchPending(p, runnerFinished) {
-  if (runnerFinished) return false;
-  let pid = null;
-  try { pid = Number(fs.readFileSync(p.dockerPid, "utf8").trim()) || null; } catch {}
-  return pid !== null && pidAlive(pid);
+// The runner's launch state (docker_launch in the job dir, see job-runner.mjs writeLaunchState):
+// { state: "pending" | "spawned" | "exited" | "killed", pid, at }. null when the runner never got as
+// far as the container section (or the file is unreadable), which is treated as uncertain below.
+function readDockerLaunchState(p) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(p.d, "docker_launch"), "utf8"));
+    if (!isPlainObject(j) || typeof j.state !== "string") return null;
+    return { state: j.state, pid: Number(j.pid) || null, at: j.at ? new Date(j.at).getTime() : NaN };
+  } catch { return null; }
+}
+
+// After a docker client was KILLED (the runner's stop-wait fallback), its create request may still be
+// in flight daemon-side, so an empty listing taken right afterwards proves nothing. The job stays
+// unconfirmed for this long after the kill (every check in between still removes whatever appears).
+export const CONTAINER_CONFIRM_HOLD_MS_DEFAULT = 2 * 60 * 1000;
+const confirmHoldMs = () => Number(process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS) || CONTAINER_CONFIRM_HOLD_MS_DEFAULT;
+
+// Process scan: every live process whose command line carries this job's container label
+// (`--label claude-async.job=<jobId>`), i.e. a docker client (or, on Docker Desktop for Windows,
+// the com.docker.cli.exe grandchild docker.exe hands the real work to, which TerminateProcess on
+// docker.exe does not kill) that could still create the job's container. This is how a client whose
+// pid was never recorded (runner died between spawn and the pid write) is still found. Returns pids;
+// [] when nothing is found; null when the scan itself failed (treated as uncertain by the caller).
+export function findDockerClientsForJob(jobId, { spawnSync: run = spawnSync, platform = process.platform } = {}) {
+  const needle = `${CONTAINER_JOB_LABEL}=${jobId}`;
+  try {
+    if (platform === "win32") {
+      const ps = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${needle.replace(/'/g, "''")}') } | ForEach-Object { $_.ProcessId }`;
+      const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+      if (r.error || r.status !== 0) return null;
+      return String(r.stdout || "").split(/\r?\n/).map((l) => Number(l.trim())).filter((n) => n > 0 && n !== process.pid);
+    }
+    const r = run("ps", ["-eo", "pid=,args="], { encoding: "utf8", timeout: 15_000 });
+    if (r.error || r.status !== 0) return null;
+    const pids = [];
+    for (const line of String(r.stdout || "").split("\n")) {
+      if (!line.includes(needle)) continue;
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (pid > 0 && pid !== process.pid) pids.push(pid);
+    }
+    return pids;
+  } catch { return null; }
+}
+
+// Could a `docker run` of this job still create (or start) a container? Decided BEFORE the final
+// listing (see reconcileContainerCleanup). Returns { pending, reason }. In order:
+//   1. launch state "exited": the client ended on its own; nothing more can be created.
+//   2. the recorded client pid is alive: pending (whether or not the runner finished -- the
+//      fallback path writes exit_code with the client possibly still winding down).
+//   3. the runner itself is alive and not finished: it may spawn the client yet.
+//   4. no usable pid (state "pending", or no state at all because the runner died early, or the
+//      recorded pid is dead but the runner never saw it exit): a process scan for a client
+//      carrying this job's label decides; a failed scan is uncertain.
+//   5. state "killed" (or the runner's record says the client was killed) within the confirm hold:
+//      the daemon may still be serving the create request.
+function containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClients } = {}) {
+  const launch = readDockerLaunchState(p);
+  if (launch && launch.state === "exited") return { pending: false };
+  let pid = launch ? launch.pid : null;
+  if (!pid) { try { pid = Number(fs.readFileSync(p.dockerPid, "utf8").trim()) || null; } catch {} }
+  if (pid && pidAlive(pid)) return { pending: true, reason: "no container found, but the docker client is still alive and may still create one" };
+  if (!runnerFinished) {
+    let runnerPid = meta && Number(meta.pid) || null;
+    try { runnerPid = Number(fs.readFileSync(path.join(p.d, "runner.pid"), "utf8").trim()) || runnerPid; } catch {}
+    if (runnerPid && pidAlive(runnerPid) && isOurProcess(runnerPid)) {
+      return { pending: true, reason: "no container found, but the runner is still alive and may still run docker" };
+    }
+  }
+  const jobId = (meta.container && meta.container.jobId) || meta.jobId || path.basename(p.d);
+  const found = (findClients || findDockerClientsForJob)(jobId);
+  if (found === null) return { pending: true, reason: "no container found, and the process scan for this job's docker client failed" };
+  if (found.length) return { pending: true, reason: `no container found, but a docker client process carrying this job's label is alive (pid ${found.join(", ")})` };
+  const killedAt = launch && launch.state === "killed" ? launch.at
+    : (exitRecord && exitRecord.container && exitRecord.container.cleanup && exitRecord.container.cleanup.clientKilled && exitRecord.endedAt)
+      ? new Date(exitRecord.endedAt).getTime() : NaN;
+  if (Number.isFinite(killedAt)) {
+    const since = Date.now() - killedAt;
+    if (since < confirmHoldMs()) {
+      return { pending: true, reason: `the docker client was killed ${Math.round(since / 1000)}s ago; its create request may still be in flight daemon-side (holding ${Math.round(confirmHoldMs() / 1000)}s before an empty listing counts)` };
+    }
+  }
+  return { pending: false };
 }
 
 // A write-once flag (its existence is the signal): created with O_EXCL, an existing one is kept.
@@ -1336,19 +1429,21 @@ function writeCancelIntent(p, why) {
 }
 
 // Removes whatever the job still owns and confirms if it can. Returns { confirmed, removed, reason }.
-function reconcileContainerCleanup(p, meta, exitRecord, { by, runnerFinished, cleanup }) {
+// Order matters: "launch activity has ended" is established FIRST, then the listing. A client that
+// creates its container and exits between the two observations is then seen by the listing; the
+// other order (list, then liveness) could confirm an empty listing taken before the create landed.
+function reconcileContainerCleanup(p, meta, exitRecord, { by, runnerFinished, cleanup, findClients }) {
   if (containerCleanupConfirmed(meta, exitRecord)) return { confirmed: true, removed: 0 };
   // A runner that died before `docker run` must never start it later.
   if (!runnerFinished) writeCancelIntent(p, `${by}: runner not alive`);
+  const pending = containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClients });
   const jobId = (meta.container && meta.container.jobId) || meta.jobId || path.basename(p.d);
   let r;
   try { r = (cleanup || cleanupJobContainers)({ dockerBin: meta.container.dockerBin, jobId }); }
   catch (e) { r = { ok: false, error: e.message }; }
   if (!r.ok) return { confirmed: false, removed: r.removed || 0, reason: r.error || "docker cleanup failed" };
   if (!r.absent) return { confirmed: false, removed: r.removed, reason: `container(s) still present after docker rm -f: ${(r.remaining || []).map((x) => x.id.slice(0, 12)).join(", ")}` };
-  if (containerLaunchPending(p, runnerFinished)) {
-    return { confirmed: false, removed: r.removed, reason: "no container found, but the docker client is still alive and may still create one" };
-  }
+  if (pending.pending) return { confirmed: false, removed: r.removed, reason: pending.reason };
   meta.containerCleanup = { confirmed: true, at: new Date().toISOString(), by };
   try { writeJsonAtomic(p.meta, meta); } catch {}
   return { confirmed: true, removed: r.removed };
@@ -1376,7 +1471,8 @@ export function cancelJob(id, opts = {}) {
   const runnerFinished = fs.existsSync(p.exit);
   if (runnerFinished) {
     const exitRecord = readExitJson(p);
-    const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "cancelJob", runnerFinished: true, cleanup: opts.cleanupContainers });
+    const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "cancelJob", runnerFinished: true, cleanup: opts.cleanupContainers,
+                                                                 findClients: opts.findDockerClients });
     if (cl.confirmed) return { jobId: id, hostname, ok: true, alreadyFinished: true, cleanup: "confirmed", container: name, removed: cl.removed };
     return { jobId: id, hostname, ok: false, cleanup: "unconfirmed", container: name,
              error: `the job has finished but its container cleanup is not confirmed: ${cl.reason}` };
