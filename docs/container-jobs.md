@@ -291,7 +291,8 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
   values. It refuses: a key other than the two above (notably `ANTHROPIC_API_KEY`, which outranks
   `CLAUDE_CODE_OAUTH_TOKEN` and would silently switch billing to the API), a missing, empty or
   duplicate key, a bare `KEY` line, CRLF line endings, a UTF-8 BOM, a file inside the claude-async
-  checkout, and any value with quotes, leading/trailing or inner whitespace (how a trailing
+  checkout or at/under either read-only mount source (the CLAUDE.md file, the hooks dir: as
+  CLAUDE.md the tokens would be in the model's instructions), and any value with quotes, leading/trailing or inner whitespace (how a trailing
   `# comment` shows up) or control characters, since Docker's `--env-file` keeps all of those
   literally.
 - **Never in the image.** The Dockerfile takes no secret build args, and nothing in it reads one.

@@ -991,3 +991,19 @@ test("A3: host jobs' tails are byte-identical to before (no window change, no re
   assert.equal(core.checkJob(hostId, 20).stdout, `…(${body.length - 20} earlier bytes omitted)\n${body.slice(-20)}`);
   assert.equal(core.checkJob(hostId, 8000).stdout, body);
 });
+
+// ------------------------------------------------------------ review round 2, finding N2 ---
+// Argon #6: the secrets file must never be one of the read-only mount sources, or a misconfigured
+// CLAUDE_ASYNC_CONTAINER_CLAUDE_MD would put both raw tokens into the model's instructions.
+test("N2: planContainerJob refuses an env file that is the CLAUDE.md mount source or lives in the hooks dir", () => {
+  const fx = fixture();
+  const asMd = c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, claudeMd: fx.envFile }, resolveBin: (b) => b });
+  assert.match(asMd.error, /env file .* is the same file as .* \(a container mount source\)/);
+  // the env file inside a custom hooks dir
+  const hooks = path.join(fx.base, "hooks"); fs.mkdirSync(hooks);
+  const envInHooks = path.join(hooks, "container.env"); fs.copyFileSync(fx.envFile, envInHooks);
+  const inHooks = c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, hooksDir: hooks, envFile: envInHooks }, resolveBin: (b) => b });
+  assert.match(inHooks.error, /env file .* is inside/);
+  // a sane config still plans
+  assert.ok(!c.planContainerJob({ jobId: "j", repo: REPO, cfg: fx.cfg, resolveBin: (b) => b }).error);
+});

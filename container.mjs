@@ -319,7 +319,8 @@ export function checkEnvFile(envFile, { forbidInside = [], platform = process.pl
   if (rd.error) return { error: rd.error };
   for (const root of forbidInside) {
     let r; try { r = realpath(root); } catch { continue; }
-    if (isInside(r, rd.real, platform) || r === rd.real) return { error: `container env file ${rd.real} is inside ${r}; keep secrets outside the claude-async checkout` };
+    if (r === rd.real) return { error: `container env file ${rd.real} is the same file as ${r} (a container mount source); keep secrets in their own file outside the checkout` };
+    if (isInside(r, rd.real, platform)) return { error: `container env file ${rd.real} is inside ${r}; keep secrets outside the claude-async checkout and the mount sources` };
   }
   const buf = rd.buf;
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
@@ -442,13 +443,15 @@ export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platfo
   if (bv.error) return { error: bv.error };
   const dockerBin = resolveBin ? resolveBin(cfg.dockerBin) : cfg.dockerBin;
   if (!dockerBin) return { error: `docker binary ${JSON.stringify(cfg.dockerBin)} not found (set CLAUDE_ASYNC_DOCKER_BIN to docker.exe's full path)` };
-  const ef = checkEnvFile(cfg.envFile, { forbidInside: [REPO_DIR], platform, realpath });
-  if (ef.error) return { error: ef.error };
   const rp = (p) => { try { return realpath(p); } catch { return null; } };
   const mdReal = rp(cfg.claudeMd);
   if (!mdReal || statKind(mdReal, fsImpl) !== "file") return { error: `container CLAUDE.md ${cfg.claudeMd} does not exist` };
   const hooksReal = rp(cfg.hooksDir);
   if (!hooksReal || statKind(hooksReal, fsImpl) !== "dir") return { error: `hooks dir ${cfg.hooksDir} does not exist` };
+  // The secrets file may be neither in the checkout nor one of the two read-only mount sources: as
+  // CLAUDE.md it would land in the model's instructions, under hooks/ it would be readable in the job.
+  const ef = checkEnvFile(cfg.envFile, { forbidInside: [REPO_DIR, mdReal, hooksReal], platform, realpath });
+  if (ef.error) return { error: ef.error };
   const mounts = {};
   for (const [k, p] of [["claudeMd", mdReal], ["hooks", hooksReal]]) {
     const m = toDockerMountSource(p, platform);
