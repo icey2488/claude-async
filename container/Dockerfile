@@ -10,9 +10,9 @@
 # this file reads them. The image never contains any host path, config or credential.
 #
 # Pinning: every downloaded tool is pinned to an exact version AND a checksum. gh, uv: SHA-256 from
-# the release's checksum file. Claude Code: the npm registry's sha512 `dist.integrity` for the
-# wrapper package and its linux-x64 native package is compared with the values pinned below before
-# installing (npm itself then verifies the downloaded tarballs against that same metadata). The base
+# the release's checksum file. Claude Code: the sha512 of the downloaded wrapper and linux-x64
+# tarballs themselves is checked against the pinned integrity values below, and the binary is placed
+# from those verified bytes (no npm install, no package script; see that step). The base
 # image is pinned to a Node major tag rather than a digest because a digest can't be verified from
 # where this file was written; docs/container-jobs.md's rollout step "Pin the base image" records
 # the digest after the first build. Debian packages come from the base image's apt sources at
@@ -32,7 +32,7 @@ ARG CLAUDE_CODE_LINUX_X64_INTEGRITY=sha512-36D6kMC0fWdWLwBA8XYaJTSTXEWvw0Kc3WQYq
 # hadolint ignore=DL3008
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git python3 python3-venv ripgrep jq less procps openssh-client \
+      ca-certificates curl git openssl python3 python3-venv ripgrep jq less procps openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # gh: release tarball, checksum-verified (no third-party apt repo to trust).
@@ -51,16 +51,42 @@ RUN set -eu; \
     install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/; \
     rm -rf /tmp/uv.tgz /tmp/uv-x86_64-unknown-linux-gnu
 
-# Claude Code CLI via its npm package (the install method its own README documents). The package's
-# postinstall copies the platform's native binary over bin/claude, so no Node process stays
-# resident. Installed root-owned into the global prefix: the non-root job user can run it but can
-# neither update nor replace it.
+# Claude Code CLI, from VERIFIED BYTES ONLY, with no npm install and no package script:
+#   1. `npm pack` downloads the exact wrapper and linux-x64 tarballs (the registry is untrusted:
+#      whatever metadata it serves, only the bytes are judged).
+#   2. Each tarball's sha512 is computed here (openssl, base64) and compared with the pinned
+#      integrity values above. A mismatch fails the build before anything is extracted.
+#   3. The wrapper's package.json must name the same version and pin the same linux-x64 version.
+#   4. The native binary is placed explicitly. This is exactly what the wrapper's postinstall
+#      (install.cjs) would do -- copy the platform binary over bin/claude.exe -- so neither the
+#      postinstall nor npm's optional-dependency fetch from the registry ever runs.
+# NPM_CONFIG_REGISTRY can point at a mirror; the pinned hashes still decide.
+# Root-owned in /usr/local: the non-root job user can run it but can neither update nor replace it.
+ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
 RUN set -eu; \
-    test "$(npm view "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" dist.integrity)" = "${CLAUDE_CODE_INTEGRITY}"; \
-    test "$(npm view "@anthropic-ai/claude-code-linux-x64@${CLAUDE_CODE_VERSION}" dist.integrity)" = "${CLAUDE_CODE_LINUX_X64_INTEGRITY}"; \
-    npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
- && npm cache clean --force \
- && claude --version
+    mkdir /tmp/cc && cd /tmp/cc; \
+    npm pack --silent --ignore-scripts \
+      "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@anthropic-ai/claude-code-linux-x64@${CLAUDE_CODE_VERSION}" > /dev/null; \
+    verify() { got="sha512-$(openssl dgst -sha512 -binary "$1" | base64 -w0)"; \
+      if [ "$got" != "$2" ]; then echo "INTEGRITY MISMATCH for $1: got $got, pinned $2" >&2; exit 1; fi; \
+      echo "verified $1"; }; \
+    verify "anthropic-ai-claude-code-${CLAUDE_CODE_VERSION}.tgz" "${CLAUDE_CODE_INTEGRITY}"; \
+    verify "anthropic-ai-claude-code-linux-x64-${CLAUDE_CODE_VERSION}.tgz" "${CLAUDE_CODE_LINUX_X64_INTEGRITY}"; \
+    mkdir wrapper native; \
+    tar -xzf "anthropic-ai-claude-code-${CLAUDE_CODE_VERSION}.tgz" -C wrapper; \
+    tar -xzf "anthropic-ai-claude-code-linux-x64-${CLAUDE_CODE_VERSION}.tgz" -C native; \
+    V="${CLAUDE_CODE_VERSION}" node -e ' \
+      const w = require("/tmp/cc/wrapper/package/package.json"), n = require("/tmp/cc/native/package/package.json"); \
+      const v = process.env.V; \
+      if (w.name !== "@anthropic-ai/claude-code" || w.version !== v) throw new Error("wrapper is not claude-code@" + v); \
+      if (n.name !== "@anthropic-ai/claude-code-linux-x64" || n.version !== v) throw new Error("native package is not linux-x64@" + v); \
+      if ((w.optionalDependencies || {})["@anthropic-ai/claude-code-linux-x64"] !== v) throw new Error("wrapper pins a different linux-x64"); \
+    '; \
+    install -d -m 0755 /usr/local/lib/claude-code; \
+    install -m 0755 native/package/claude /usr/local/lib/claude-code/claude; \
+    ln -sf /usr/local/lib/claude-code/claude /usr/local/bin/claude; \
+    cd / && rm -rf /tmp/cc /root/.npm; \
+    test "$(claude --version)" = "${CLAUDE_CODE_VERSION} (Claude Code)"
 
 # Non-root job user, uid/gid 1000 (job-core.mjs passes --user 1000:1000). Whatever user/group the
 # base image already has at 1000 ("node" in the official node images) is removed first, so the name
