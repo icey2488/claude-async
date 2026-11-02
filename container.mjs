@@ -45,6 +45,8 @@ export const CONTAINER_WORKDIR = "/workspace";                   // container-lo
 export const CONTAINER_CLAUDE_MD = `${CONTAINER_HOME}/.claude/CLAUDE.md`; // user-level memory file
 export const CONTAINER_HOOKS_DIR = "/opt/claude-async/hooks";
 export const CONTAINER_ENTRYPOINT = "/usr/local/bin/claude-async-job-entry"; // container/job-entry.sh
+// The image's node, by absolute path: the hook command must not depend on the job's PATH.
+export const CONTAINER_NODE = "/usr/local/bin/node";
 // Inline MCP config: the host's empty-mcp.json path does not exist inside the container, and the
 // CLI's --mcp-config accepts a JSON string as well as a file path.
 export const EMPTY_MCP_INLINE = JSON.stringify({ mcpServers: {} });
@@ -333,14 +335,17 @@ export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platfo
 // ------------------------------------------------------------------------------- argv ---
 
 // The --settings object for the CLI INSIDE the container: the same catch-all no-background hook
-// job-core.mjs wires for host jobs (buildNoBackgroundHookSettings), but pointing at the image's
-// node and the read-only hooks mount. The job-tool-gate and Ollama-guard hooks are host-only.
+// job-core.mjs wires for host jobs (buildNoBackgroundHookSettings), run by the image's node at an
+// absolute path with NODE_OPTIONS removed, so neither a PATH entry nor NODE_OPTIONS (--require /
+// --import) the job sets can replace or pre-empt the hook. This is a RELIABILITY guard (it keeps
+// jobs from backgrounding work), not a security boundary: the job already runs arbitrary code in
+// its own container. The job-tool-gate and Ollama-guard hooks are host-only.
 export function buildContainerSettings({ ultracode = false } = {}) {
   const s = {
     hooks: {
       PreToolUse: [{
         matcher: "*",
-        hooks: [{ type: "command", command: `node ${CONTAINER_HOOKS_DIR}/no-background-hook.mjs`, timeout: 5 }],
+        hooks: [{ type: "command", command: `env -u NODE_OPTIONS ${CONTAINER_NODE} ${CONTAINER_HOOKS_DIR}/no-background-hook.mjs`, timeout: 5 }],
       }],
     },
   };
@@ -349,10 +354,16 @@ export function buildContainerSettings({ ultracode = false } = {}) {
 }
 
 // The CLI argv inside the container. --dangerously-skip-permissions is deliberate: the container is
-// the permission boundary (docs/container-jobs.md, "Why skip-permissions inside"). The prompt goes
-// last, after "--", and the model is bound with "=", so neither can ever be parsed as a CLI option.
+// the permission boundary (docs/container-jobs.md, "Why skip-permissions inside").
+// --setting-sources user: the CLI loads ONLY user settings (~/.claude/settings.json, which the image
+// makes unwritable) plus --settings, never the cloned repo's .claude/settings.json or
+// settings.local.json, so a hostile repo can't set env (ANTHROPIC_BASE_URL), an apiKeyHelper or
+// hooks that run before the model ever sees the prompt. --strict-mcp-config with an empty inline
+// config ignores the repo's .mcp.json. The prompt goes last, after "--", and the model is bound
+// with "=", so neither can ever be parsed as a CLI option.
 export function buildContainerCliArgv({ prompt, model, effortArgv = [], settings }) {
-  return ["-p", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP_INLINE,
+  return ["-p", "--dangerously-skip-permissions", "--setting-sources", "user",
+          "--strict-mcp-config", "--mcp-config", EMPTY_MCP_INLINE,
           `--model=${model}`, ...effortArgv, "--settings", JSON.stringify(settings), "--", prompt];
 }
 

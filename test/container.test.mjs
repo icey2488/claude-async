@@ -217,10 +217,22 @@ test("CLI argv inside the container: prompt last after \"--\", model bound with 
   }
 });
 
+test("CLI argv inside the container: only user settings load (--setting-sources user), never the clone's", () => {
+  const a = c.buildContainerCliArgv({ prompt: "p", model: "m", effortArgv: [], settings: c.buildContainerSettings() });
+  const i = a.indexOf("--setting-sources");
+  assert.ok(i > 0 && i < a.indexOf("--"), "before the prompt separator");
+  assert.equal(a[i + 1], "user", "project (.claude/settings.json) and local (settings.local.json) are not loaded");
+  assert.equal(a.filter((x) => x === "--setting-sources").length, 1);
+  assert.ok(a.includes("--strict-mcp-config"), "the clone's .mcp.json is ignored too");
+});
+
 test("container settings: the no-background hook runs from the read-only hooks mount; ultracode merges in", () => {
   const s = c.buildContainerSettings();
   assert.equal(s.hooks.PreToolUse[0].matcher, "*");
-  assert.equal(s.hooks.PreToolUse[0].hooks[0].command, "node /opt/claude-async/hooks/no-background-hook.mjs");
+  // absolute node, NODE_OPTIONS dropped: neither the job's PATH nor a --require/--import it sets
+  // can replace or pre-empt the hook
+  assert.equal(s.hooks.PreToolUse[0].hooks[0].command,
+    "env -u NODE_OPTIONS /usr/local/bin/node /opt/claude-async/hooks/no-background-hook.mjs");
   assert.equal(s.ultracode, undefined);
   assert.equal(c.buildContainerSettings({ ultracode: true }).ultracode, true);
 });

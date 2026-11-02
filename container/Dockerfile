@@ -74,6 +74,20 @@ RUN set -eu; \
  && printf '{\n  "hasCompletedOnboarding": true\n}\n' > /home/agent/.claude.json \
  && chown -R agent:agent /home/agent /workspace
 
+# ~/.claude is ROOT-owned (0755), so a job can't create ~/.claude/settings.json (user settings, the
+# one settings source --setting-sources user still loads), settings.local.json, agents/, commands/
+# or skills/, and can't replace the read-only CLAUDE.md mount point. Only the directories the CLI
+# writes during a headless run are agent-owned. The list was taken by running claude -p (with a
+# Bash tool call) in this image against a local fake API and listing what it created under HOME:
+# backups, projects, session-env, sessions, shell-snapshots. The rest are created up front because
+# other code paths write them (todos/plans/file-history/debug/statsig/paste-cache/ide); an
+# unlisted directory the CLI can't create shows up as a CLI error, not as a security hole.
+RUN set -eu; \
+    chown root:root /home/agent/.claude && chmod 0755 /home/agent/.claude; \
+    for d in backups projects session-env sessions shell-snapshots todos plans file-history debug statsig paste-cache ide; do \
+      install -d -o agent -g agent -m 0700 "/home/agent/.claude/$d"; \
+    done
+
 # Defaults for every job. None of these is a secret.
 #   DISABLE_AUTOUPDATER: the CLI version is the image's; a job must not change it.
 #   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: no telemetry/error reporting/update checks, which also
