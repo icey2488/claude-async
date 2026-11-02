@@ -84,6 +84,7 @@ const DEFAULTS = Object.freeze({
 });
 
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$/;
+export const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/;
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
 const CPUS_RE = /^(?:\d{1,3})(?:\.\d{1,2})?$/;
 const MEMORY_RE = /^\d{1,6}[kmg]?$/i;
@@ -328,7 +329,7 @@ export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platfo
     if (m.error) return { error: `cannot mount ${k}: ${m.error}` };
     mounts[k] = m.source;
   }
-  return { plan: { jobId, name: containerName(jobId), dockerBin, image: cfg.image, envFile: ef.real,
+  return { plan: { jobId, name: containerName(jobId), dockerBin, image: cfg.image, imageId: null, envFile: ef.real,
                    envFileKeys: ef.keys, repo: rv.repo, baseRef: bv.ref, mounts, cfg } };
 }
 
@@ -402,8 +403,12 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
   // fewer than the host), so the configured value is a ceiling, clamped to what the host reports.
   const hostCpus = plan.hostCpus || os.availableParallelism?.() || os.cpus().length || 1;
   const cpus = String(Math.min(Number(cfg.cpus), hostCpus));
+  // The image runs by the immutable ID the preflight inspected, never by tag, and never pulls: a
+  // tag retargeted (or removed) between preflight and launch cannot change what runs, and a missing
+  // image fails the run (exit 125) instead of fetching a same-named one from a registry.
+  const image = plan.imageId || plan.image;
   const argv = [
-    "run", "--rm", "--name", name, "--label", `${CONTAINER_JOB_LABEL}=${jobId}`,
+    "run", "--rm", "--pull=never", "--name", name, "--label", `${CONTAINER_JOB_LABEL}=${jobId}`,
     "--init",                                   // PID 1 reaps the CLI's children and forwards signals
     "--user", CONTAINER_USER,
     "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -417,16 +422,17 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
     "--mount", `type=bind,source=${mounts.claudeMd},target=${CONTAINER_CLAUDE_MD},readonly`,
     "--mount", `type=bind,source=${mounts.hooks},target=${CONTAINER_HOOKS_DIR},readonly`,
     "--workdir", CONTAINER_WORKDIR,
-    plan.image,
+    image,
     CONTAINER_ENTRYPOINT, plan.repo, plan.baseRef || "", "--",
     "claude", ...cliArgv,
   );
   return argv;
 }
 
-// Preflight: is the daemon up and the image present locally? A job never pulls (no `--pull`): the
-// image is built on claunker from container/Dockerfile, and pulling a same-named image from a
-// registry would run someone else's code with the job's secrets.
+// Preflight: is the daemon up and the image present locally? Returns { imageId } (the immutable
+// sha256 ID the job will run) or { error }. A job never pulls: the image is built on claunker from
+// container/Dockerfile, and pulling a same-named image would run someone else's code with the job's
+// secrets.
 export function checkDockerImage({ dockerBin, image, spawnSync = nodeSpawnSync, timeoutMs = 20_000 }) {
   let r;
   try { r = spawnSync(dockerBin, ["image", "inspect", "--format", "{{.Id}}", image], { encoding: "utf8", timeout: timeoutMs, windowsHide: true }); }
@@ -437,7 +443,9 @@ export function checkDockerImage({ dockerBin, image, spawnSync = nodeSpawnSync, 
     if (/no such image|not found/i.test(err)) return { error: `docker image ${image} is not built on this host (see docs/container-jobs.md, "Build the image")` };
     return { error: `docker is not usable (is Docker Desktop running?): ${err || `exit ${r.status}`}` };
   }
-  return { ok: true, imageId: String(r.stdout || "").trim() };
+  const imageId = String(r.stdout || "").trim();
+  if (!IMAGE_ID_RE.test(imageId)) return { error: `docker image inspect returned an unexpected image ID ${JSON.stringify(imageId.slice(0, 80))}` };
+  return { ok: true, imageId };
 }
 
 // ----------------------------------------------------------------------------- kill ---

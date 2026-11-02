@@ -959,7 +959,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
     const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
     if (img.error) return fail("preflight", `preflight failed on ${hostLabel}: ${img.error}`);
-    containerPlan = planned.plan;
+    // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
+    containerPlan = { ...planned.plan, imageId: img.imageId };
   }
 
   // A container job has no workFolder; preflight only checks the docker binary (JOB_ROOT always exists).
@@ -1132,7 +1133,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  ...(persistedIntent ? { intent: persistedIntent } : {}),
                  ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
-                       image: containerPlan.image, dockerBin: containerPlan.dockerBin,
+                       image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
                        repo: containerPlan.repo, baseRef: containerPlan.baseRef || null } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),

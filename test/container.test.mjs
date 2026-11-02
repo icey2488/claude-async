@@ -109,7 +109,8 @@ test("docker run argv: exact isolation and lifecycle flags are present", () => {
   assert.ok(!argv.includes("--privileged"));
   assert.ok(!argv.includes("--volume") && !argv.includes("-v"));
   assert.ok(!argv.some((a) => /^--cap-add/.test(a)));
-  assert.ok(!argv.some((a) => /^--pull/.test(a)), "never pulls");
+  assert.equal(argv.filter((a) => /^--pull/.test(a)).length, 1);
+  assert.ok(argv.includes("--pull=never"), "never pulls, even if the image is missing at launch");
   const img = argv.indexOf("claude-async-job:local");
   assert.ok(img > 0);
   assert.deepEqual(argv.slice(img + 1, img + 6), ["/usr/local/bin/claude-async-job-entry", REPO, "", "--", "claude"],
@@ -389,10 +390,31 @@ test("kill targets the container by name, never a pid", () => {
   assert.equal(c.killContainer({ dockerBin: "docker", name: "claude-async-j", spawnSync: down }).ok, false);
 });
 
+test("checkDockerImage: returns the immutable image ID; refuses a malformed one", () => {
+  const id = `sha256:${"0123456789abcdef".repeat(4)}`;
+  const run = (res) => () => res;
+  assert.deepEqual(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 0, stdout: `${id}\n` }) }),
+    { ok: true, imageId: id });
+  for (const out of ["sha256:x", "", "claude-async-job:local", `${id} extra`]) {
+    assert.match(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 0, stdout: out }) }).error,
+      /unexpected image ID/, JSON.stringify(out));
+  }
+});
+
+test("docker run argv: runs the inspected image ID, not the tag", () => {
+  const fx = fixture();
+  const id = `sha256:${"ab".repeat(32)}`;
+  const plan = { ...planFor(fx), imageId: id };
+  const argv = c.buildDockerRunArgv({ plan, cliArgv: ["-p"] });
+  assert.ok(argv.includes(id));
+  assert.ok(!argv.includes("claude-async-job:local"), "the tag never reaches docker run");
+  assert.equal(argv[argv.indexOf(id) + 1], "/usr/local/bin/claude-async-job-entry");
+});
+
 test("checkDockerImage: distinguishes a missing image from a stopped daemon; never pulls", () => {
   const seen = [];
   const run = (res) => (bin, args) => { seen.push(args); return res; };
-  assert.equal(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 0, stdout: "sha256:x\n" }) }).ok, true);
+  assert.equal(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 0, stdout: `sha256:${"a".repeat(64)}\n` }) }).ok, true);
   assert.match(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 1, stderr: "Error: No such image: i" }) }).error, /not built/);
   assert.match(c.checkDockerImage({ dockerBin: "docker", image: "i", spawnSync: run({ status: 1, stderr: "error during connect" }) }).error, /Docker Desktop running/);
   assert.ok(seen.every((a) => a[0] === "image" && a[1] === "inspect"));
@@ -493,6 +515,11 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.equal(r.startHead, null, "no host git HEAD for a container job");
   assert.equal(r.hermesHome, undefined, "no per-job HERMES_HOME dir for container jobs");
   assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "name", "repo"]);
+  // the image runs by the ID preflight inspected (ctrOpts' checkImage), recorded in meta too
+  const imageId = `sha256:${"ab".repeat(32)}`;
+  assert.ok(argv.includes(imageId) && !argv.includes(fx.cfg.image));
+  assert.equal(r.container.imageId, imageId);
+  assert.equal(r.container.image, fx.cfg.image);
   assert.equal(launchExtra.container.repo, REPO);
   assert.ok(!JSON.stringify(cap[0]).includes(SECRET_GH), "no secret anywhere in what launch() receives");
   assert.equal(extraEnv.GH_TOKEN, undefined);
