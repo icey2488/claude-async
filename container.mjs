@@ -244,10 +244,13 @@ export function validateRepo(repo, allowedRepos) {
   return { repo };
 }
 
+// A plain branch, tag or (abbreviated) commit name. Full ref names (refs/...) are refused: the
+// entrypoint resolves baseRef locally as origin/<ref>, tags/<ref> or a commit the clone has, and
+// refs/pull/N/head or refs/heads/x would mean something else (or nothing) there.
 export function validateBaseRef(ref) {
   if (ref === undefined || ref === null || ref === "") return { ref: "" };
   if (typeof ref !== "string" || !BASE_REF_RE.test(ref) || ref.includes("..") || ref.includes("@{") ||
-      ref.endsWith("/") || ref.endsWith(".lock") || ref.includes("//")) {
+      ref.endsWith("/") || ref.endsWith(".lock") || ref.includes("//") || /^refs(\/|$)/i.test(ref)) {
     return { error: `baseRef ${JSON.stringify(ref)} is not a plain branch, tag or commit name` };
   }
   return { ref };

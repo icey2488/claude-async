@@ -27,9 +27,10 @@ The repo's own `CLAUDE.md` (if it has one) still applies on top of it.
   change `user.name`/`user.email`.
 - `git` and `gh` are already authenticated as the bot: git over https asks `gh`, and `gh` reads
   `GH_TOKEN`. You don't need `gh auth setup-git` or `gh auth login`.
-- Publish with `git push -u origin <branch>` and `gh pr create --base <base>`, where `<base>` is
-  `$CLAUDE_ASYNC_BASE_REF` when that names a branch, else the default branch. If `origin` is not
-  writable by the bot (someone else's repo), fork it with
+- Publish with `git push -u origin <branch>` and `gh pr create --base <base>`, where `<base>` must
+  be a branch: `$CLAUDE_ASYNC_BASE_REF` when that names a branch, else the default branch (a PR
+  cannot target a tag or a commit; if the task started from one, say so in the PR body). If
+  `origin` is not writable by the bot (someone else's repo), fork it with
   `gh repo fork --remote --remote-name fork`, push the branch to `fork`, and open the PR against
   the upstream repo with `gh pr create --repo <owner>/<repo> --head <bot-login>:<branch>`.
 - Print the PR URL on its own line in your final message (`PR: https://github.com/...`). The

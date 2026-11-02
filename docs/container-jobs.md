@@ -25,7 +25,7 @@ environment and `spec.json` are unchanged (a test asserts the literal host argv)
 | job image and its entrypoint (the clone) | `container/Dockerfile`, `container/job-entry.sh` |
 | rules mounted read-only into every job | `container/CLAUDE.md` |
 | image build + checks on claunker | `container/smoke-test.ps1`, `container/probe.sh` |
-| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs` |
+| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs`, `test/job-entry.test.mjs` |
 
 ## Why
 
@@ -50,7 +50,10 @@ claude_cancel { jobId }        POST /v1/cancel { jobId }   (routed by the job id
   executing host's `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` (comma, semicolon or space separated,
   case-insensitive). There is no default: unset means every container job is refused.
 - **`baseRef`** (optional): a branch, tag or commit to start from. Plain names only (no leading
-  `-`, no `..`, no `@{`). Default: the repo's default branch.
+  `-`, no `..`, no `@{`, no `refs/...`). Default: the repo's default branch. It is resolved
+  **locally in the fresh clone** (`origin/<ref>`, then `tags/<ref>`, then a 7-40 hex commit the
+  clone already has), never fetched, so it can only name something on a branch or tag of the repo
+  itself; `refs/pull/N/head` or a fork's SHA from GitHub's shared object network is exit 70.
 - **`workFolder` is refused** for a container job ("container jobs do not take workFolder"), and
   **`repo`/`baseRef` are refused** for a host job. So no call can mean two things, and every
   existing host-mode call is unaffected. `repo`, `baseRef` and `sandbox` are only forwarded to a
@@ -243,18 +246,29 @@ non-empty `/workspace`, then:
 
 ```
 git clone -- https://github.com/<owner/repo>.git /workspace
-git fetch origin <baseRef> && git checkout --detach FETCH_HEAD     # only when baseRef is given
+# only when baseRef is given: resolved locally, never fetched
+git checkout --detach refs/remotes/origin/<baseRef> | refs/tags/<baseRef> | <sha>^{commit}
 exec claude ...
 ```
+
+Why local resolution: `git fetch origin <ref>` accepts full SHAs and full ref names, so
+`refs/pull/123/head` or a commit from a fork would pull objects from GitHub's shared fork network
+that are on no branch or tag of the allowed repo, and it rejects abbreviated SHAs outright
+(`couldn't find remote ref`), although the interface advertises "a commit". Resolving against what
+`git clone` already brought over keeps `baseRef` within the repo and makes short SHAs work. Not
+found is exit 70 (`baseRef <x> not found in <repo>`).
 
 - **Credentials.** The image's system git config (`/etc/gitconfig`, root-owned) sets
   `credential.https://github.com.helper = !/usr/local/bin/gh auth git-credential`. git asks gh, and
   gh answers from `GH_TOKEN` in the environment. The token is never in argv, a remote URL or a
   file; `gh auth setup-git` is not needed. Verified in the image: the helper answers from the env
   token, and a clone leaves no token in `.git/config`.
-- **Exit codes** of the entrypoint itself: 64 usage/validation, 70 clone or checkout failed (the
-  runner adds a warning naming the repo), 78 configuration (no `GH_TOKEN`, `/workspace` not empty).
-  The entrypoint's success and failure paths were exercised in the image against a local repo.
+- **Exit codes** of the entrypoint itself: 64 usage/validation, 70 clone failed or `baseRef` not
+  found / not checked out (the runner adds a warning naming the repo), 78 configuration (no
+  `GH_TOKEN`, `/workspace` not empty). `test/job-entry.test.mjs` runs the script on the host against
+  a local bare repo (URL rewritten with `url.insteadOf`): branch, tag and 8-char SHA check out,
+  `refs/pull/1/head`, an unreachable SHA and an unknown name exit 70, and the fork commit never
+  reaches the clone.
 - `CLAUDE_ASYNC_REPO` and `CLAUDE_ASYNC_BASE_REF` are set in the container so the job knows what it
   cloned and what to open its PR against.
 
@@ -358,10 +372,13 @@ commits link to the bot account. The clone is made on Linux inside the container
 git switch -c feat/short-slug
 ... work, commit ...
 git push -u origin feat/short-slug
-gh pr create --base "${CLAUDE_ASYNC_BASE_REF:-<default branch>}" --fill
+gh pr create --base <branch> --fill
 ```
 
-The job prints `PR: <url>` in its final message. The runner records the URL in
+`--base` must be a **branch**: `$CLAUDE_ASYNC_BASE_REF` when it names one (a detached checkout of
+`origin/<branch>`), otherwise the job has to pick one, normally the default branch, since a PR
+cannot target a tag or a commit. `container/CLAUDE.md` says the same. The job prints `PR: <url>` in
+its final message. The runner records the URL in
 `exit.json.container.prUrl` when it names the job's own repo, so `claude_check` shows what was
 delivered. `scripts/publish-branch.mjs` is not used inside the container: its checks would be
 advisory there, and the real limits are server-side (collaborator list, token scopes, the `main`

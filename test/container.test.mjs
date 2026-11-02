@@ -304,9 +304,13 @@ test("validateBaseRef: plain branch/tag/sha only; never an option, never a range
   for (const ok of ["main", "release/1.2", "v2.0.1", "feat/x_y", "0123abcd", undefined, null, ""]) {
     assert.ok(!c.validateBaseRef(ok).error, `accepts ${JSON.stringify(ok)}`);
   }
-  for (const bad of ["-main", "--upload-pack=x", "a..b", "HEAD@{1}", "a/", "x.lock", "a//b", "a b", "a;b", "a\nb", "$(x)", 1]) {
+  for (const bad of ["-main", "--upload-pack=x", "a..b", "HEAD@{1}", "a/", "x.lock", "a//b", "a b", "a;b", "a\nb", "$(x)", 1,
+                     // round 2, N1: full ref names could name GitHub's fork-network objects (refs/pull/N/head) or
+                     // anything else the entrypoint's local resolution does not mean; branch/tag/sha names only
+                     "refs/pull/1/head", "refs/heads/main", "refs/tags/v1", "REFS/heads/main", "refs"]) {
     assert.ok(c.validateBaseRef(bad).error, `refuses ${JSON.stringify(bad)}`);
   }
+  assert.ok(!c.validateBaseRef("refs-and-more").error, "a branch merely starting with refs- is fine");
 });
 
 test("planContainerJob: refuses workFolder outright (container jobs never mount a host folder)", () => {
