@@ -26,8 +26,9 @@ import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
-         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues,
-         redactSecrets, readRedactedTail, checkHttpBridgeLocked, CONTAINER_JOB_LABEL } from "./container.mjs";
+         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues, readTokenFileSecretValues,
+         redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME } from "./container.mjs";
+import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -959,7 +960,8 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), allowedSandboxes (replaces
 // CLAUDE_ASYNC_ALLOWED_SANDBOXES), containerConfig (replaces
 // loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight), checkHttpBridge
-// (replaces the loopback-bridge lock check).
+// (replaces the loopback-bridge lock check), checkGitHubApp (replaces github-app.mjs's
+// preflightGitHubApp: the App installation lookup and identity fetch against api.github.com).
 // repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
 // start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
@@ -984,7 +986,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   let containerPlan = null;
   if (sb.mode === "container") {
     const planned = planContainerJob({ jobId: id, repo, baseRef, workFolder, cfg: opts.containerConfig || loadContainerConfig(),
-                                       resolveBin: (b) => resolveBinary(b) });
+                                       jobDir: jobPaths(id).d, resolveBin: (b) => resolveBinary(b) });
     if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
     const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
     if (img.error) return fail("preflight", `preflight failed on ${hostLabel}: ${img.error}`);
@@ -993,8 +995,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     const pc = planned.plan.cfg;
     const br = await (opts.checkHttpBridge || checkHttpBridgeLocked)({ port: pc.httpBridgePort, configFile: pc.httpBridgeConfig, tls: pc.httpBridgeTls });
     if (br.error) return fail("preflight", `preflight failed on ${hostLabel}: ${br.error}`);
+    // The GitHub App (github-app.mjs): the key parses, the App is installed on this repo, and its
+    // slug + bot user id (commit authorship). Fails closed; the message says what to do. Nothing
+    // is minted here: the runner mints the installation token right before `docker run`.
+    const ga = planned.plan.githubApp;
+    const app = await (opts.checkGitHubApp || preflightGitHubApp)({ appId: ga.appId, keyFile: ga.keyFile, repo: planned.plan.repo, apiBase: ga.apiBase });
+    if (app.error) return fail("preflight", `preflight failed on ${hostLabel}: ${app.error}`);
     // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
-    containerPlan = { ...planned.plan, imageId: img.imageId };
+    containerPlan = { ...planned.plan, imageId: img.imageId, ...resolveGitIdentity(pc, app),
+                      githubApp: { ...ga, installationId: app.installationId, slug: app.slug, botUserId: app.botUserId } };
   }
 
   // A container job has no workFolder; preflight only checks the docker binary (JOB_ROOT always exists).
@@ -1146,8 +1155,14 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     launchCommand = containerPlan.dockerBin;
     // jobId: the claude-async.job label every cleanup lists by; maxRuntimeMs: the runner's wall-clock limit.
     // envFile: a PATH (the runner reads the values into memory only, to redact what it sends out).
+    // githubApp: what the runner needs to mint and refresh the installation token (app id, the key
+    // PATH, the installation, the repo name); credsDir: where it writes the token for the mount.
+    const ga = containerPlan.githubApp;
     launchExtra.container = { name: containerPlan.name, jobId: id, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo,
-                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs, envFile: containerPlan.envFile };
+                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs, envFile: containerPlan.envFile,
+                              githubApp: { appId: ga.appId, keyFile: ga.keyFile, installationId: ga.installationId,
+                                           repoName: repoNameOf(containerPlan.repo), refreshMs: ga.refreshMs, apiBase: ga.apiBase },
+                              credsDir: containerPlan.credsDir };
   }
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, launchCommand, launchArgv, launchCwd, extraEnv, launchExtra);
@@ -1172,7 +1187,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
                        image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
                        jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null,
-                       envFile: containerPlan.envFile } } : {}) };
+                       envFile: containerPlan.envFile, credsDir: containerPlan.credsDir,
+                       githubApp: { appId: containerPlan.githubApp.appId, slug: containerPlan.githubApp.slug,
+                                    botUserId: containerPlan.githubApp.botUserId, installationId: containerPlan.githubApp.installationId } } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -1306,7 +1323,10 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
   // clear. Host jobs are unchanged.
   let stdout, stderr, exitOut = exitRecord;
   if (meta.sandbox === "container") {
-    const values = readEnvFileSecretValues(meta.container && meta.container.envFile);
+    // The OAuth token from the env file plus the job's current installation token (the runner's
+    // creds/token, while the job runs); older token generations are covered by the ghs_ patterns.
+    const credsDir = (meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME);
+    const values = [...readEnvFileSecretValues(meta.container && meta.container.envFile), ...readTokenFileSecretValues(credsDir)];
     stdout = readRedactedTail(p.out, tailBytes, values);
     stderr = readRedactedTail(p.err, tailBytes, values);
     if (exitRecord && typeof exitRecord === "object") {

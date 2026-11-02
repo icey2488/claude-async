@@ -26,9 +26,14 @@ const c = await import("../container.mjs");
 const core = await import("../job-core.mjs");
 const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
-const BOT = { CLAUDE_ASYNC_CONTAINER_GIT_NAME: "claunker-bot",
-              CLAUDE_ASYNC_CONTAINER_GIT_EMAIL: "123+claunker-bot@users.noreply.github.com" };
-const SECRET_GH = "ghp_TESTSECRETVALUE0000000000000000000000";
+// The GitHub App that container jobs act as (github-app.mjs): a throwaway key per test run.
+const APP_KEY = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs1", format: "pem" });
+const APP_KEY_FILE = path.join(TMP, "app.pem");
+fs.writeFileSync(APP_KEY_FILE, APP_KEY, { mode: 0o600 }); fs.chmodSync(APP_KEY_FILE, 0o600);
+const BOT = { CLAUDE_ASYNC_GITHUB_APP_ID: "123456", CLAUDE_ASYNC_GITHUB_APP_KEY_FILE: APP_KEY_FILE };
+// What preflightGitHubApp() returns for the App (the seam in startJob: opts.checkGitHubApp).
+const APP_IDENTITY = { installationId: 777, slug: "claunker-jobs", botUserId: 98765, keyFile: APP_KEY_FILE };
+const SECRET_GH = "ghs_TESTSECRETVALUE0000000000000000000000";   // an installation token the runner minted
 const SECRET_OAUTH = "sk-ant-oat01-TESTSECRETVALUE";
 
 const REPO = "icey2488/container-job-scratch";
@@ -41,18 +46,21 @@ function fixture() {
   const secrets = path.join(base, "secrets");
   fs.mkdirSync(secrets);
   const envFile = path.join(secrets, "container.env");
-  fs.writeFileSync(envFile, `GH_TOKEN=${SECRET_GH}\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
+  fs.writeFileSync(envFile, `CLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
   const env = { ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS: `${REPO}, icey2488/claude-async`, CLAUDE_ASYNC_CONTAINER_ENV_FILE: envFile };
-  return { base, hostDir, envFile, env, cfg: c.loadContainerConfig(env) };
+  const jobDir = path.join(base, "jobdir");
+  return { base, hostDir, envFile, env, jobDir, cfg: c.loadContainerConfig(env) };
 }
 
 const realpath = (p) => fs.realpathSync.native(p);
 
 function planFor(fx, overrides = {}, { repo = REPO, baseRef } = {}) {
-  const r = c.planContainerJob({ jobId: "claunker.t-20261101-abcd1234", repo, baseRef,
+  const r = c.planContainerJob({ jobId: "claunker.t-20261101-abcd1234", repo, baseRef, jobDir: fx.jobDir,
                                  cfg: { ...fx.cfg, ...overrides }, resolveBin: (b) => b });
   assert.ok(!r.error, r.error);
-  return { ...r.plan, hostCpus: 16 }; // pin the CPU clamp so argv doesn't depend on the test machine
+  // pin the CPU clamp so argv doesn't depend on the test machine; the git identity startJob resolves
+  // from the App at preflight (resolveGitIdentity) is applied here the same way
+  return { ...r.plan, hostCpus: 16, ...c.resolveGitIdentity({ ...fx.cfg, ...overrides }, APP_IDENTITY) };
 }
 
 function sampleArgv(fx, { extraEnv = {}, prompt = "do the thing", cfg = {}, baseRef } = {}) {
@@ -148,9 +156,11 @@ test("docker run argv: NO read-write host mount; only CLAUDE.md and hooks, both 
   const fx = fixture();
   const { argv } = sampleArgv(fx);
   const mounts = allValuesAfter(argv, "--mount");
-  assert.equal(mounts.length, 2);
+  assert.equal(mounts.length, 3);
   assert.match(mounts[0], /^type=bind,source=.+CLAUDE\.md,target=\/home\/agent\/\.claude\/CLAUDE\.md,readonly$/);
   assert.match(mounts[1], /^type=bind,source=.+hooks,target=\/opt\/claude-async\/hooks,readonly$/);
+  // the per-job credentials dir (the runner writes the installation token there), read-only
+  assert.equal(mounts[2], `type=bind,source=${path.join(fx.jobDir, "creds")},target=/run/claude-async/creds,readonly`);
   for (const m of mounts) assert.ok(m.endsWith(",readonly"), m);
   assert.ok(!mounts.some((m) => /target=\/workspace/.test(m)), "the workspace is container-local, never a host folder");
   assert.ok(!argv.includes("-v") && !argv.includes("--volume") && !argv.some((a) => /^--volumes-from|^--tmpfs/.test(a)));
@@ -182,6 +192,7 @@ test("docker run argv: secrets go by --env-file PATH only; no token value or sec
   assert.equal(valueAfter(argv, "--env-file"), realpath(fx.envFile));
   const joined = argv.join("\n");
   assert.ok(!joined.includes(SECRET_GH) && !joined.includes(SECRET_OAUTH), "no secret value in argv");
+  assert.ok(!joined.includes(APP_KEY_FILE) && !joined.includes("PRIVATE KEY") && !joined.includes("123456"), "the App key (path or material) and app id never reach docker");
   assert.ok(!joined.includes("leak"), "extraEnv secrets are not forwarded");
   for (const e of allValuesAfter(argv, "-e")) {
     assert.match(e, /^[A-Za-z_][A-Za-z0-9_]*=/, `-e ${e} must be NAME=value, never a bare name`);
@@ -198,15 +209,16 @@ test("docker run argv: only allowlisted job env is forwarded (HERMES_HOME etc. s
   assert.ok(names.includes("CLAUDE_ASYNC_DEPTH") && names.includes("CLAUDE_ASYNC_JOB_EFFORT") && names.includes("BASH_MAX_TIMEOUT_MS"));
   for (const n of ["HERMES_HOME", "CLAUNKER_LIVE_HERMES_HOME", "CLAUDE_ASYNC_GATE_REPO"]) assert.ok(!names.includes(n), n);
   const env = Object.fromEntries(allValuesAfter(argv, "-e").map((e) => [e.slice(0, e.indexOf("=")), e.slice(e.indexOf("=") + 1)]));
-  assert.equal(env.GIT_AUTHOR_NAME, "claunker-bot");
-  assert.equal(env.GIT_COMMITTER_EMAIL, "123+claunker-bot@users.noreply.github.com");
+  assert.equal(env.GIT_AUTHOR_NAME, "claunker-jobs[bot]");
+  assert.equal(env.GIT_COMMITTER_EMAIL, "98765+claunker-jobs[bot]@users.noreply.github.com");
   assert.equal(env.OLLAMA_HOST, "http://host.docker.internal:11434");
   assert.equal(env.CLAUDE_ASYNC_JOB_ID, "claunker.t-20261101-abcd1234");
 });
 
 test("buildContainerEnv: extraEnv secrets are dropped, and the name guard throws on a secret-like key", () => {
   const cfg = c.loadContainerConfig(BOT);
-  const env = c.buildContainerEnv({ cfg, jobId: "j", extraEnv: { GH_TOKEN: "x", CLAUDE_CODE_OAUTH_TOKEN: "y" } });
+  const env = c.buildContainerEnv({ cfg, jobId: "j", gitName: "a[bot]", gitEmail: "1+a[bot]@users.noreply.github.com",
+                                    extraEnv: { GH_TOKEN: "x", CLAUDE_CODE_OAUTH_TOKEN: "y" } });
   assert.ok(!env.some(([k]) => k === "GH_TOKEN" || k === "CLAUDE_CODE_OAUTH_TOKEN"));
   // The guard itself: FORWARDED_ENV_KEYS is frozen, so exercise it through a config value whose
   // name it would produce if the allowlist ever grew a secret-like entry.
@@ -346,39 +358,46 @@ test("the removed host-mount machinery is gone (no workFolder validation, no all
 
 // -------------------------------------------------------------------------- secrets file ---
 
-test("checkEnvFile: returns key names only, never values", () => {
+test("checkEnvFile: returns key names only, never values; CLAUDE_CODE_OAUTH_TOKEN is the only key", () => {
   const fx = fixture();
   const r = c.checkEnvFile(fx.envFile);
-  assert.deepEqual(r.keys, ["GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]);
-  assert.ok(!JSON.stringify(r).includes(SECRET_GH) && !JSON.stringify(r).includes(SECRET_OAUTH));
+  assert.deepEqual(r.keys, ["CLAUDE_CODE_OAUTH_TOKEN"]);
+  assert.ok(!JSON.stringify(r).includes(SECRET_OAUTH));
+  assert.deepEqual(c.ENV_FILE_ALLOWED_KEYS, ["CLAUDE_CODE_OAUTH_TOKEN"]);
+  // GH_TOKEN (the old bot PAT) is refused: GitHub credentials come from the App, per job
+  fs.writeFileSync(fx.envFile, `GH_TOKEN=ghp_x\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
+  const old = c.checkEnvFile(fx.envFile);
+  assert.match(old.error, /GH_TOKEN.*not allowed.*GitHub App/);
+  assert.ok(!old.error.includes(SECRET_OAUTH));
 });
 
 test("checkEnvFile: refuses unknown keys (ANTHROPIC_API_KEY), bare keys, empties, dupes, CRLF, BOM, missing keys", () => {
   const fx = fixture();
+  const K = "CLAUDE_CODE_OAUTH_TOKEN";
   const cases = [
-    [`GH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN=b\nANTHROPIC_API_KEY=${SECRET_GH}\n`, /ANTHROPIC_API_KEY.*not allowed/],
-    ["GH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN\n", /not KEY=value/],
-    ["GH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN=\n", /is empty/],
-    ["GH_TOKEN=a\nGH_TOKEN=b\nCLAUDE_CODE_OAUTH_TOKEN=c\n", /appears twice/],
-    ["GH_TOKEN=a\r\nCLAUDE_CODE_OAUTH_TOKEN=b\r\n", /CRLF/],
-    ["\ufeffGH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /BOM/],
-    ["GH_TOKEN=a\n", /missing CLAUDE_CODE_OAUTH_TOKEN/],
+    [`${K}=b\nANTHROPIC_API_KEY=${SECRET_OAUTH}\n`, /ANTHROPIC_API_KEY.*not allowed/],
+    [`${K}\n`, /not KEY=value/],
+    [`${K}=\n`, /is empty/],
+    [`${K}=a\n${K}=b\n`, /appears twice/],
+    [`${K}=b\r\n`, /CRLF/],
+    [`\ufeff${K}=b\n`, /BOM/],
+    ["# nothing\n", /missing CLAUDE_CODE_OAUTH_TOKEN/],
     // docker --env-file keeps these literally, so the token inside the container would be wrong
-    ['GH_TOKEN="ghp_a"\nCLAUDE_CODE_OAUTH_TOKEN=b\n', /GH_TOKEN contains a quote/],
-    ["GH_TOKEN='ghp_a'\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains a quote/],
-    ["GH_TOKEN=ghp_a # bot\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains whitespace/],
-    ["GH_TOKEN= ghp_a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN has leading or trailing whitespace/],
-    ["GH_TOKEN=ghp_a \nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN has leading or trailing whitespace/],
-    ["GH_TOKEN=ghp\ta\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains whitespace/],
-    ["GH_TOKEN=ghp\u0007a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains a control character/],
+    [`${K}="sk-ant-a"\n`, /CLAUDE_CODE_OAUTH_TOKEN contains a quote/],
+    [`${K}='sk-ant-a'\n`, /CLAUDE_CODE_OAUTH_TOKEN contains a quote/],
+    [`${K}=sk-ant-a # me\n`, /CLAUDE_CODE_OAUTH_TOKEN contains whitespace/],
+    [`${K}= sk-ant-a\n`, /CLAUDE_CODE_OAUTH_TOKEN has leading or trailing whitespace/],
+    [`${K}=sk-ant-a \n`, /CLAUDE_CODE_OAUTH_TOKEN has leading or trailing whitespace/],
+    [`${K}=sk\tant\n`, /CLAUDE_CODE_OAUTH_TOKEN contains whitespace/],
+    [`${K}=sk\u0007ant\n`, /CLAUDE_CODE_OAUTH_TOKEN contains a control character/],
   ];
   for (const [body, re] of cases) {
     fs.writeFileSync(fx.envFile, body);
     const r = c.checkEnvFile(fx.envFile);
     assert.match(r.error || "", re, JSON.stringify(body));
-    assert.ok(!r.error.includes(SECRET_GH), "error text never carries a value");
+    assert.ok(!r.error.includes(SECRET_OAUTH), "error text never carries a value");
   }
-  fs.writeFileSync(fx.envFile, "# comment\n\nGH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN=b\n");
+  fs.writeFileSync(fx.envFile, `# comment\n\n${K}=b\n`);
   assert.ok(!c.checkEnvFile(fx.envFile).error, "comments and blank lines are fine");
   assert.match(c.checkEnvFile(null).error, /not set/);
   assert.match(c.checkEnvFile(path.join(fx.base, "missing.env")).error, /does not exist/);
@@ -396,16 +415,31 @@ test("checkEnvFile / planContainerJob: a secrets file inside the claude-async ch
 
 test("readEnvFileSecretValues: the values, in memory, for redaction only; [] for a bad or missing file", () => {
   const fx = fixture();
-  // the raw values first, then their base64 forms (round 2, A3); 6 entries, none under 8 chars
+  // the raw value first, then its base64 forms (round 2, A3); 3 entries, none under 8 chars
   const v1 = c.readEnvFileSecretValues(fx.envFile);
-  assert.deepEqual(v1.slice(0, 2), [SECRET_GH, SECRET_OAUTH]);
-  assert.equal(v1.length, 6);
+  assert.deepEqual(v1.slice(0, 1), [SECRET_OAUTH]);
+  assert.equal(v1.length, 3);
   assert.ok(v1.every((v) => typeof v === "string" && v.length >= 8));
   assert.deepEqual(c.readEnvFileSecretValues(null), []);
   assert.deepEqual(c.readEnvFileSecretValues(path.join(fx.base, "missing.env")), []);
   // CRLF/BOM files still yield their values (redaction must not depend on the file being perfect)
-  fs.writeFileSync(fx.envFile, `\ufeffGH_TOKEN=${SECRET_GH}\r\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\r\n`);
+  fs.writeFileSync(fx.envFile, `\ufeffCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\r\n`);
   assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), v1);
+  // the same encoding helper serves the runner's minted tokens
+  assert.deepEqual(c.secretEncodings([SECRET_GH]), [SECRET_GH,
+    Buffer.from(`x-access-token:${SECRET_GH}`).toString("base64").replace(/=+$/, ""), Buffer.from(SECRET_GH).toString("base64").replace(/=+$/, "")]);
+});
+
+test("readTokenFileSecretValues: the job's current installation token (creds/token) plus its base64 forms; [] when absent", () => {
+  const fx = fixture();
+  const creds = path.join(fx.jobDir, "creds");
+  assert.deepEqual(c.readTokenFileSecretValues(creds), []);
+  fs.mkdirSync(creds, { recursive: true });
+  fs.writeFileSync(path.join(creds, "token"), `${SECRET_GH}\n`);
+  const v = c.readTokenFileSecretValues(creds);
+  assert.equal(v[0], SECRET_GH, "trailing newline stripped");
+  assert.equal(v.length, 3);
+  assert.deepEqual(c.readTokenFileSecretValues(null), []);
 });
 
 test("redactSecrets: exact env-file values and GitHub/Anthropic token shapes become [REDACTED]", () => {
@@ -423,9 +457,17 @@ test("redactSecrets: exact env-file values and GitHub/Anthropic token shapes bec
 
 // -------------------------------------------------------------------------------- config ---
 
-test("validateContainerConfig: refuses host/none networks, bad limits, missing bot identity", () => {
+test("validateContainerConfig: refuses host/none networks, bad limits, missing App settings, bad identity overrides", () => {
   const ok = c.loadContainerConfig(BOT);
   assert.deepEqual(c.validateContainerConfig(ok), []);
+  assert.match(c.validateContainerConfig(c.loadContainerConfig({})).join(" "), /CLAUDE_ASYNC_GITHUB_APP_ID is not set/);
+  assert.match(c.validateContainerConfig(c.loadContainerConfig({ CLAUDE_ASYNC_GITHUB_APP_ID: "1" })).join(" "), /KEY_FILE is not set/);
+  assert.match(c.validateContainerConfig(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS: "5" })).join(" "), /REFRESH_MS/);
+  // the old required identity settings are now optional overrides, validated only when set
+  assert.equal(ok.gitName, null); assert.equal(ok.gitEmail, null);
+  assert.deepEqual(c.validateContainerConfig(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_GIT_NAME: "x", CLAUDE_ASYNC_CONTAINER_GIT_EMAIL: "x@y" })), []);
+  assert.match(c.validateContainerConfig(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_GIT_EMAIL: "not an email" })).join(" "), /GIT_EMAIL/);
+  assert.match(c.validateContainerConfig(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_GIT_NAME: "a\u0007b" })).join(" "), /GIT_NAME/);
   assert.ok(c.validateContainerConfig({ ...ok, network: "host" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, network: "none" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, cpus: "0" }).length);
@@ -433,8 +475,6 @@ test("validateContainerConfig: refuses host/none networks, bad limits, missing b
   assert.ok(c.validateContainerConfig({ ...ok, memory: "lots" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, pidsLimit: "10" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, image: "--privileged" }).length);
-  assert.ok(c.validateContainerConfig({ ...ok, gitName: null }).length);
-  assert.ok(c.validateContainerConfig({ ...ok, gitEmail: "not an email" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, ollamaUrl: "http://u:p@evil/" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, egressProxy: "socks5://x" }).length);
 });
@@ -538,6 +578,7 @@ const CAPS = { maxConcurrent: 1000, maxStartsPerMinute: 1000 };
 const jid = (s) => `${s}-${crypto.randomBytes(4).toString("hex")}`;
 // Container-mode startJob seams shared by the tests below.
 const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, allowedSandboxes: BOTH, checkHttpBridge: async () => ({ ok: true }),
+                                       checkGitHubApp: async () => ({ ...APP_IDENTITY }),
                                        containerConfig: { ...fx.cfg, dockerBin: process.execPath },
                                        checkImage: () => ({ ok: true, imageId: `sha256:${"ab".repeat(32)}` }), ...extra });
 
@@ -639,8 +680,18 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.equal(r.workFolder, null, "no host folder");
   assert.equal(r.startHead, null, "no host git HEAD for a container job");
   assert.equal(r.hermesHome, undefined, "no per-job HERMES_HOME dir for container jobs");
-  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "envFile", "jobId", "maxRuntimeMs", "name", "repo"]);
+  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["credsDir", "dockerBin", "envFile", "githubApp", "jobId", "maxRuntimeMs", "name", "repo"]);
   assert.equal(launchExtra.container.envFile, fs.realpathSync.native(fx.envFile), "a path, never a value");
+  // the runner mints the installation token itself: it gets the app id, the KEY PATH, the installation, the repo name
+  assert.deepEqual(launchExtra.container.githubApp, { appId: "123456", keyFile: fs.realpathSync.native(APP_KEY_FILE), installationId: 777,
+    repoName: "container-job-scratch", refreshMs: 45 * 60_000, apiBase: "https://api.github.com" });
+  assert.equal(launchExtra.container.credsDir, path.join(p.d, "creds"));
+  assert.ok(argv.includes(`type=bind,source=${path.join(p.d, "creds")},target=/run/claude-async/creds,readonly`));
+  assert.ok(allValuesAfter(argv, "-e").includes("GIT_AUTHOR_NAME=claunker-jobs[bot]"));
+  assert.ok(allValuesAfter(argv, "-e").includes("GIT_COMMITTER_EMAIL=98765+claunker-jobs[bot]@users.noreply.github.com"));
+  assert.deepEqual(r.container.githubApp, { appId: "123456", slug: "claunker-jobs", botUserId: 98765, installationId: 777 }, "meta records the App identity, never the key path or a token");
+  assert.equal(r.container.credsDir, path.join(p.d, "creds"));
+  assert.ok(!JSON.stringify(r).includes("PRIVATE KEY") && !JSON.stringify(r).includes(APP_KEY_FILE));
   // the image runs by the ID preflight inspected (ctrOpts' checkImage), recorded in meta too
   const imageId = `sha256:${"ab".repeat(32)}`;
   assert.ok(argv.includes(imageId) && !argv.includes(fx.cfg.image));
@@ -689,7 +740,12 @@ test("startJob: container preflight refusals happen before the job dir exists", 
     [{ baseRef: "--upload-pack=x" }, {}, /baseRef/],
     [{}, { cfg: { allowedRepos: [] } }, /no container repos are allowed/],
     [{}, { cfg: { envFile: null } }, /CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set/],
-    [{}, { cfg: { gitName: null } }, /GIT_NAME/],
+    // the GitHub App: fail closed on every missing piece, with the fix in the message
+    [{}, { cfg: { githubApp: { ...fx.cfg.githubApp, appId: null } } }, /CLAUDE_ASYNC_GITHUB_APP_ID is not set.*App ID/],
+    [{}, { cfg: { githubApp: { ...fx.cfg.githubApp, keyFile: null } } }, /CLAUDE_ASYNC_GITHUB_APP_KEY_FILE is not set/],
+    [{}, { cfg: { githubApp: { ...fx.cfg.githubApp, keyFile: path.join(fx.base, "nokey.pem") } } }, /key file .* does not exist/],
+    [{}, { app: async () => ({ error: "GitHub App preflight against api.github.com failed: the GitHub App is not installed on icey2488/container-job-scratch" }) }, /not installed on/],
+    [{}, { app: async () => ({ error: "the JWT was rejected (401): CLAUDE_ASYNC_GITHUB_APP_ID and CLAUDE_ASYNC_GITHUB_APP_KEY_FILE do not match" }) }, /do not match/],
     [{}, { image: () => ({ error: "docker image claude-async-job:local is not built on this host" }) }, /not built/],
     [{}, { cfg: { dockerBin: path.join(fx.base, "no-docker.exe") } }, /docker binary/],
     [{}, { bridge: async () => ({ error: "the loopback HTTP MCP bridge is not token-locked" }) }, /not token-locked/],
@@ -698,7 +754,8 @@ test("startJob: container preflight refusals happen before the job dir exists", 
     const id = jid("pf");
     const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO, ...args },
       ctrOpts(fx, { launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: process.execPath, ...(o.cfg || {}) },
-                    ...(o.image ? { checkImage: o.image } : {}), ...(o.bridge ? { checkHttpBridge: o.bridge } : {}) }));
+                    ...(o.image ? { checkImage: o.image } : {}), ...(o.bridge ? { checkHttpBridge: o.bridge } : {}),
+                    ...(o.app ? { checkGitHubApp: o.app } : {}) }));
     assert.equal(r.errorCode, "preflight", JSON.stringify(r));
     assert.match(r.error, re);
     assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)), "no job dir on refusal");
@@ -825,7 +882,10 @@ test("checkJob: a container job's stdout/stderr tails and exit.json tails are re
   const { id, d } = await startCtr(fx);
   const meta = JSON.parse(fs.readFileSync(path.join(d, "meta.json"), "utf8"));
   assert.equal(meta.container.envFile, fs.realpathSync.native(fx.envFile), "the env file PATH is recorded (never a value)");
-  fs.appendFileSync(path.join(d, "out.log"), `token ${SECRET_GH} and ghp_${"Z".repeat(36)}\n`);
+  // the runner's current token file (a generation checkJob can know about) is redacted by value too
+  const CUSTOM = "custom-installation-token-value-0001";
+  fs.mkdirSync(path.join(d, "creds")); fs.writeFileSync(path.join(d, "creds", "token"), CUSTOM);
+  fs.appendFileSync(path.join(d, "out.log"), `token ${SECRET_GH} and ghp_${"Z".repeat(36)} file ${CUSTOM} b64 ${Buffer.from(CUSTOM).toString("base64")}\n`);
   fs.appendFileSync(path.join(d, "err.log"), `oauth ${SECRET_OAUTH}\n`);
   fs.writeFileSync(path.join(d, "exit.json"), JSON.stringify({ exitCode: 0, stdoutTail: [`x ${SECRET_GH}`], stderrTail: [SECRET_OAUTH],
     container: { cleanup: { confirmed: true } } }));
@@ -833,6 +893,7 @@ test("checkJob: a container job's stdout/stderr tails and exit.json tails are re
   const r = core.checkJob(id, 8000);
   const all = JSON.stringify(r);
   assert.ok(!all.includes(SECRET_GH) && !all.includes(SECRET_OAUTH) && !all.includes("ghp_ZZZ"), all);
+  assert.ok(!all.includes(CUSTOM) && !all.includes(Buffer.from(CUSTOM).toString("base64").replace(/=+$/, "")), all);
   assert.match(r.stdout, /token \[REDACTED\]/);
   assert.match(fs.readFileSync(path.join(d, "out.log"), "utf8"), new RegExp(SECRET_GH), "the file on disk is not rewritten");
   // host jobs: tails are returned exactly as before
@@ -941,12 +1002,13 @@ test("A3: redactSecrets has no word-boundary gap (TOKEN_ghp_..., foo_sk-ant-...)
   assert.equal(c.redactSecrets(`GITHUB_PAT=github_pat_${"C".repeat(30)}`, []), "GITHUB_PAT=[REDACTED]");
   // GIT_TRACE_CURL / GIT_CURL_VERBOSE print "Authorization: Basic base64(x-access-token:<token>)"
   const fx = fixture();
-  const values = c.readEnvFileSecretValues(fx.envFile);
+  // the env file's value plus a minted installation token, the way the runner assembles its set
+  const values = [...c.readEnvFileSecretValues(fx.envFile), ...c.secretEncodings([SECRET_GH])];
   const basic = Buffer.from(`x-access-token:${SECRET_GH}`).toString("base64");
   const raw64 = Buffer.from(SECRET_GH).toString("base64");
   const oauth64 = Buffer.from(SECRET_OAUTH).toString("base64");
   for (const enc of [basic, raw64, oauth64]) {
-    assert.ok(values.includes(enc.replace(/=+$/, "")), `readEnvFileSecretValues includes ${enc.slice(0, 12)}...`);
+    assert.ok(values.includes(enc.replace(/=+$/, "")), `the redaction set includes ${enc.slice(0, 12)}...`);
     const out = c.redactSecrets(`Authorization: Basic ${enc}`, values);
     assert.equal(leaks(out, enc.replace(/=+$/, "")).length, 0, out);
     assert.match(out, /Basic \[REDACTED\]=*$/);
@@ -1005,5 +1067,65 @@ test("N2: planContainerJob refuses an env file that is the CLAUDE.md mount sourc
   const inHooks = c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, hooksDir: hooks, envFile: envInHooks }, resolveBin: (b) => b });
   assert.match(inHooks.error, /env file .* is inside/);
   // a sane config still plans
-  assert.ok(!c.planContainerJob({ jobId: "j", repo: REPO, cfg: fx.cfg, resolveBin: (b) => b }).error);
+  assert.ok(!c.planContainerJob({ jobId: "j", repo: REPO, jobDir: fx.jobDir, cfg: fx.cfg, resolveBin: (b) => b }).error);
+});
+
+// The App's private key: the same placement rules as the secrets file, plus the permission check.
+test("planContainerJob: the App key may not be the env file, a mount source, or inside the checkout; permissive modes are refused", { skip: process.platform === "win32" }, () => {
+  const fx = fixture();
+  const plan = (githubApp) => c.planContainerJob({ jobId: "j", repo: REPO, jobDir: fx.jobDir, cfg: { ...fx.cfg, githubApp: { ...fx.cfg.githubApp, ...githubApp } }, resolveBin: (b) => b });
+  fs.chmodSync(fx.envFile, 0o600);
+  assert.match(plan({ keyFile: fx.envFile }).error, /key file .* is not a PEM/);
+  assert.match(plan({ keyFile: fx.cfg.claudeMd }).error, /key file .* (same file as|is not a PEM|readable by group)/);
+  const loose = path.join(fx.base, "loose.pem"); fs.writeFileSync(loose, APP_KEY); fs.chmodSync(loose, 0o644);
+  assert.match(plan({ keyFile: loose }).error, /readable by group or others.*chmod 600/);
+  const inCheckout = path.join(REPO_DIR, "hooks", `app-test-${process.pid}.pem`);
+  fs.writeFileSync(inCheckout, APP_KEY); fs.chmodSync(inCheckout, 0o600);
+  try { assert.match(plan({ keyFile: inCheckout }).error, /key file .* is inside/); } finally { fs.rmSync(inCheckout, { force: true }); }
+  // and the env file may not be the key file either
+  assert.match(c.planContainerJob({ jobId: "j", repo: REPO, jobDir: fx.jobDir, cfg: { ...fx.cfg, envFile: APP_KEY_FILE }, resolveBin: (b) => b }).error, /env file/);
+  const ok = plan({});
+  assert.ok(!ok.error, ok.error);
+  assert.deepEqual(ok.plan.githubApp, { appId: "123456", keyFile: fs.realpathSync.native(APP_KEY_FILE), refreshMs: 45 * 60_000, apiBase: "https://api.github.com" });
+  assert.equal(ok.plan.credsDir, path.join(fx.jobDir, "creds"));
+  assert.equal(ok.plan.gitName, undefined, "the identity is resolved at preflight from the App, not in the plan");
+});
+
+test("resolveGitIdentity: <slug>[bot] and <id>+<slug>[bot]@users.noreply.github.com from the App; CLAUDE_ASYNC_CONTAINER_GIT_NAME/_EMAIL override", () => {
+  assert.deepEqual(c.resolveGitIdentity(c.loadContainerConfig(BOT), APP_IDENTITY),
+    { gitName: "claunker-jobs[bot]", gitEmail: "98765+claunker-jobs[bot]@users.noreply.github.com" });
+  const over = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_GIT_NAME: "Custom Name", CLAUDE_ASYNC_CONTAINER_GIT_EMAIL: "c@example.com" });
+  assert.deepEqual(c.resolveGitIdentity(over, APP_IDENTITY), { gitName: "Custom Name", gitEmail: "c@example.com" });
+  // one override alone leaves the other derived
+  assert.deepEqual(c.resolveGitIdentity(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_GIT_NAME: "N" }), APP_IDENTITY),
+    { gitName: "N", gitEmail: "98765+claunker-jobs[bot]@users.noreply.github.com" });
+  assert.throws(() => c.buildContainerEnv({ cfg: c.loadContainerConfig(BOT), jobId: "j" }), /git identity/);
+});
+
+test("startJob: the App preflight receives the plan's app id, key path, repo and API base; its result sets the commit identity", async () => {
+  const fx = fixture();
+  const seen = [];
+  const cap = [];
+  const r = await core.startJob({ prompt: "p", jobId: jid("appseam"), sandbox: "container", repo: REPO },
+    ctrOpts(fx, { launch: fakeLaunch(cap), checkGitHubApp: async (a) => { seen.push(a); return { installationId: 5, slug: "other-app", botUserId: 7, keyFile: a.keyFile }; } }));
+  assert.ok(!r.error, r.error);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].appId, "123456");
+  assert.equal(seen[0].keyFile, fs.realpathSync.native(APP_KEY_FILE));
+  assert.equal(seen[0].repo, REPO);
+  assert.equal(seen[0].apiBase, "https://api.github.com");
+  const env = allValuesAfter(cap[0].argv, "-e");
+  assert.ok(env.includes("GIT_AUTHOR_NAME=other-app[bot]") && env.includes("GIT_AUTHOR_EMAIL=7+other-app[bot]@users.noreply.github.com"));
+  assert.equal(cap[0].launchExtra.container.githubApp.installationId, 5);
+});
+
+test("SECRET_PATTERNS: installation tokens (ghs_) and their base64 forms are redacted without a known value", () => {
+  const tok = `ghs_${"R".repeat(36)}`;
+  const basic = Buffer.from(`x-access-token:${tok}`).toString("base64");
+  const raw64 = Buffer.from(tok).toString("base64");
+  const out = c.redactSecrets(`a ${tok} b Authorization: Basic ${basic} c ${raw64} d`, []);
+  assert.equal(leaks(out, tok).length, 0, out);
+  assert.equal(leaks(out, basic).length, 0, out);
+  assert.equal(leaks(out, raw64).length, 0, out);
+  assert.match(out, /^a \[REDACTED\] b Authorization: Basic \[REDACTED\]=* c \[REDACTED\]=* d$/);
 });

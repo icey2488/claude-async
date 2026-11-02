@@ -10,12 +10,14 @@
  *
  * NO HOST FOLDER IS MOUNTED READ-WRITE. A container job names a GitHub repo ("owner/repo", checked
  * against CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS) and an optional base ref. The image's entrypoint
- * (container/job-entry.sh) clones it over https inside the container, with the bot's GH_TOKEN
- * supplied to git by gh's credential helper (the token is never in argv or in a file), and the job
- * works in container-local storage, pushes a branch and opens a PR as the bot. The only host
- * mounts are two READ-ONLY ones: container/CLAUDE.md (the job rules) and this repo's hooks/ (the
- * no-background hook). Nothing the job writes reaches the host disk except the runner's captured
- * stdout/stderr.
+ * (container/job-entry.sh) clones it over https inside the container, and the job works in
+ * container-local storage, pushes a branch and opens a PR as the GitHub App (github-app.mjs) the
+ * host mints a one-hour, one-repo installation token for. That token reaches the container as a
+ * FILE: the runner writes <jobdir>/creds/token (0700 dir, 0600 file) and it is bind-mounted
+ * read-only at /run/claude-async/creds, where the image's git credential helper and gh wrapper read
+ * it; the runner re-mints it while the job runs. The only host mounts are three READ-ONLY ones:
+ * container/CLAUDE.md (the job rules), this repo's hooks/ (the no-background hook) and that creds
+ * dir. Nothing the job writes reaches the host disk except the runner's captured stdout/stderr.
  *
  * OFF BY DEFAULT, and gated twice: a job runs in a container only when the call (or
  * CLAUDE_ASYNC_JOB_SANDBOX) asks for it AND CLAUDE_ASYNC_ALLOWED_SANDBOXES permits it (default
@@ -24,9 +26,11 @@
  *
  * This module builds and validates argv and config, and runs the small docker housekeeping
  * commands (image inspect, list/remove this job's containers). It never runs `docker run` itself
- * (job-runner.mjs does). Secret VALUES are read in exactly one place, readEnvFileSecretValues(),
- * and only so the runner and checkJob() can redact them from what leaves the host; checkEnvFile()
- * returns key names only. Docker reads the env file itself (--env-file).
+ * (job-runner.mjs does) and never mints a token (job-runner.mjs does, through github-app.mjs).
+ * Secret VALUES are read in exactly two places, readEnvFileSecretValues() and
+ * readTokenFileSecretValues(), and only so the runner and checkJob() can redact them from what
+ * leaves the host; checkEnvFile() returns key names only. Docker reads the env file itself
+ * (--env-file).
  */
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -36,6 +40,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isInside } from "./scripts/publish-branch.mjs";
+import { loadGitHubAppConfig, validateGitHubAppConfig, checkAppKeyFile, botGitIdentity } from "./github-app.mjs";
 
 const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,6 +54,13 @@ export const CONTAINER_WORKDIR = "/workspace";                   // container-lo
 export const CONTAINER_CLAUDE_MD = `${CONTAINER_HOME}/.claude/CLAUDE.md`; // user-level memory file
 export const CONTAINER_HOOKS_DIR = "/opt/claude-async/hooks";
 export const CONTAINER_ENTRYPOINT = "/usr/local/bin/claude-async-job-entry"; // container/job-entry.sh
+// Where the per-job GitHub installation token is mounted (read-only) inside the container; the
+// image's credential helper and gh wrapper read CONTAINER_TOKEN_FILE. On the host it is
+// <jobdir>/CREDS_DIR_NAME/CREDS_TOKEN_NAME, written by job-runner.mjs.
+export const CONTAINER_CREDS_DIR = "/run/claude-async/creds";
+export const CONTAINER_TOKEN_FILE = `${CONTAINER_CREDS_DIR}/token`;
+export const CREDS_DIR_NAME = "creds";
+export const CREDS_TOKEN_NAME = "token";
 // The image's node, by absolute path: the hook command must not depend on the job's PATH.
 export const CONTAINER_NODE = "/usr/local/bin/node";
 // Inline MCP config: the host's empty-mcp.json path does not exist inside the container, and the
@@ -59,11 +71,13 @@ export const ENTRY_EXIT_USAGE = 64;
 export const ENTRY_EXIT_CLONE = 70;
 export const ENTRY_EXIT_CONFIG = 78;
 
-// The only keys the host secrets env file may hold. Anything else (notably ANTHROPIC_API_KEY,
+// The only key the host secrets env file may hold. Anything else (notably ANTHROPIC_API_KEY,
 // which would silently switch the job from Erick's subscription to API billing -- it outranks
 // CLAUDE_CODE_OAUTH_TOKEN in Claude Code's auth precedence) is refused before the job starts.
-export const ENV_FILE_ALLOWED_KEYS = Object.freeze(["GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]);
-export const ENV_FILE_REQUIRED_KEYS = Object.freeze(["GH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"]);
+// GH_TOKEN is refused too: GitHub credentials are per-job installation tokens of the GitHub App
+// (github-app.mjs), delivered as a file, never a long-lived token in the environment.
+export const ENV_FILE_ALLOWED_KEYS = Object.freeze(["CLAUDE_CODE_OAUTH_TOKEN"]);
+export const ENV_FILE_REQUIRED_KEYS = Object.freeze(["CLAUDE_CODE_OAUTH_TOKEN"]);
 const ENV_FILE_MAX_BYTES = 64 * 1024;
 
 // Non-secret job env that is forwarded into the container as explicit -e NAME=value pairs. An
@@ -178,6 +192,10 @@ export function loadContainerConfig(env = process.env) {
     memory: env.CLAUDE_ASYNC_CONTAINER_MEMORY || DEFAULTS.memory,
     pidsLimit: env.CLAUDE_ASYNC_CONTAINER_PIDS_LIMIT || DEFAULTS.pidsLimit,
     network: env.CLAUDE_ASYNC_CONTAINER_NETWORK || DEFAULTS.network,
+    // The GitHub App jobs act as (github-app.mjs): app id, private key PATH, refresh period, API origin.
+    githubApp: loadGitHubAppConfig(env),
+    // Optional overrides of the commit identity (normally derived from the App at preflight:
+    // <slug>[bot] / <id>+<slug>[bot]@users.noreply.github.com). Rarely needed.
     gitName: env.CLAUDE_ASYNC_CONTAINER_GIT_NAME || null,
     gitEmail: env.CLAUDE_ASYNC_CONTAINER_GIT_EMAIL || null,
     ollamaUrl: env.CLAUDE_ASYNC_CONTAINER_OLLAMA_URL || DEFAULTS.ollamaUrl,
@@ -209,11 +227,12 @@ export function validateContainerConfig(cfg) {
   if (!CPUS_RE.test(cfg.cpus || "") || Number(cfg.cpus) <= 0) errs.push(`CLAUDE_ASYNC_CONTAINER_CPUS ${JSON.stringify(cfg.cpus)} must be a positive number like 4 or 2.5`);
   if (!MEMORY_RE.test(cfg.memory || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_MEMORY ${JSON.stringify(cfg.memory)} must look like 8g / 4096m`);
   if (!PIDS_RE.test(cfg.pidsLimit || "") || Number(cfg.pidsLimit) < 64) errs.push(`CLAUDE_ASYNC_CONTAINER_PIDS_LIMIT ${JSON.stringify(cfg.pidsLimit)} must be an integer >= 64`);
-  if (!cfg.gitName || CONTROL_RE.test(cfg.gitName) || cfg.gitName.length > 100) {
-    errs.push("CLAUDE_ASYNC_CONTAINER_GIT_NAME (the bot account's commit name) must be set, at most 100 characters, no control characters");
+  errs.push(...validateGitHubAppConfig(cfg.githubApp || {}));
+  if (cfg.gitName !== null && cfg.gitName !== undefined && (CONTROL_RE.test(cfg.gitName) || cfg.gitName.length > 100 || cfg.gitName.trim() === "")) {
+    errs.push("CLAUDE_ASYNC_CONTAINER_GIT_NAME (optional override of the App's commit name) must be at most 100 characters with no control characters");
   }
-  if (!cfg.gitEmail || !EMAIL_RE.test(cfg.gitEmail) || cfg.gitEmail.length > 200) {
-    errs.push("CLAUDE_ASYNC_CONTAINER_GIT_EMAIL (the bot account's commit email, e.g. <id>+<login>@users.noreply.github.com) must be set to a plain address");
+  if (cfg.gitEmail !== null && cfg.gitEmail !== undefined && (!EMAIL_RE.test(cfg.gitEmail) || cfg.gitEmail.length > 200)) {
+    errs.push("CLAUDE_ASYNC_CONTAINER_GIT_EMAIL (optional override of the App's commit email) must be a plain address");
   }
   if (!HTTP_URL_RE.test(cfg.ollamaUrl || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_OLLAMA_URL ${JSON.stringify(cfg.ollamaUrl)} must be a plain http://host:port URL`);
   if (cfg.egressProxy !== null && cfg.egressProxy !== undefined && !HTTP_URL_RE.test(cfg.egressProxy)) {
@@ -289,7 +308,12 @@ function parseEnvFileText(text, real) {
     const eq = line.indexOf("=");
     if (eq <= 0) return { error: `container env file ${real} line ${i + 1} is not KEY=value (a bare KEY would copy the host's own value of that variable into the container)` };
     const key = line.slice(0, eq);
-    if (!ENV_FILE_ALLOWED_KEYS.includes(key)) return { error: `container env file ${real} line ${i + 1}: key ${JSON.stringify(key)} is not allowed (allowed: ${ENV_FILE_ALLOWED_KEYS.join(", ")})` };
+    if (!ENV_FILE_ALLOWED_KEYS.includes(key)) {
+      const why = key === "GH_TOKEN" || key === "GITHUB_TOKEN"
+        ? "; GitHub credentials are no longer a token in this file: container jobs act as a GitHub App (CLAUDE_ASYNC_GITHUB_APP_ID / _KEY_FILE) and the runner mints a per-job installation token. Remove the line"
+        : "";
+      return { error: `container env file ${real} line ${i + 1}: key ${JSON.stringify(key)} is not allowed (allowed: ${ENV_FILE_ALLOWED_KEYS.join(", ")})${why}` };
+    }
     if (entries.some(([k]) => k === key)) return { error: `container env file ${real}: key ${key} appears twice` };
     const bad = badEnvValue(line.slice(eq + 1));
     if (bad) return { error: `container env file ${real}: the value of ${key} ${bad}` };
@@ -314,7 +338,7 @@ function readEnvFileBytes(envFile, realpath) {
 // time. forbidInside: folders the file must not be in (the claude-async checkout, so it can never
 // be committed or reach the read-only hooks mount).
 export function checkEnvFile(envFile, { forbidInside = [], platform = process.platform, realpath = defaultRealpath } = {}) {
-  if (!envFile) return { error: "CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set (the host secrets file holding GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN)" };
+  if (!envFile) return { error: "CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set (the host secrets file holding CLAUDE_CODE_OAUTH_TOKEN)" };
   const rd = readEnvFileBytes(envFile, realpath);
   if (rd.error) return { error: rd.error };
   for (const root of forbidInside) {
@@ -345,13 +369,30 @@ export function readEnvFileSecretValues(envFile, { realpath = defaultRealpath } 
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   const parsed = parseEnvFileText(text.replace(/\r/g, ""), rd.real);
   if (parsed.error) return [];
-  const raw = parsed.entries.map(([, v]) => v).filter((v) => v.length >= 8);
-  // Plus the encodings git itself prints: GIT_TRACE_CURL / GIT_CURL_VERBOSE log the Basic header the
-  // credential helper produces, base64("x-access-token:<GH_TOKEN>"), and a job can base64 a value
-  // in one line. Trailing "=" padding is stripped so a prefix match still covers the padded form.
+  return secretEncodings(parsed.entries.map(([, v]) => v));
+}
+
+// A list of secret values plus the encodings git itself prints: GIT_TRACE_CURL / GIT_CURL_VERBOSE
+// log the Basic header the credential helper produces, base64("x-access-token:<token>"), and a job
+// can base64 a value in one line. Trailing "=" padding is stripped so a prefix match still covers
+// the padded form. Values under 8 characters are dropped (they would redact ordinary text).
+export function secretEncodings(values) {
+  const raw = (values || []).filter((v) => typeof v === "string" && v.length >= 8);
   const b64 = (v) => Buffer.from(v, "utf8").toString("base64").replace(/=+$/, "");
   const encoded = raw.flatMap((v) => [b64(`x-access-token:${v}`), b64(v)]);
   return [...raw, ...encoded.filter((v) => v.length >= 8 && !raw.includes(v))];
+}
+
+// The job's CURRENT installation token (the runner's <credsDir>/token, see job-runner.mjs), with
+// its encodings, for checkJob()'s redaction. [] when the file is gone (the job finished) or
+// unreadable. Earlier generations the runner already replaced are not on disk any more; the
+// ghs_ shape patterns below cover their raw and base64 forms.
+export function readTokenFileSecretValues(credsDir) {
+  if (!credsDir) return [];
+  try {
+    const t = fs.readFileSync(path.join(credsDir, CREDS_TOKEN_NAME), "utf8").trim();
+    return secretEncodings([t]);
+  } catch { return []; }
 }
 
 // --------------------------------------------------------------------------------- redaction ---
@@ -364,6 +405,12 @@ export const SECRET_PATTERNS = Object.freeze([
   /gh[pousr]_[A-Za-z0-9]{20,}/g,
   /github_pat_[A-Za-z0-9_]{20,}/g,
   /sk-ant-[A-Za-z0-9_-]{8,}/g,
+  // Installation tokens (ghs_) as git prints them in a Basic header, base64("x-access-token:ghs_..."):
+  // "x-access-token:" is 15 bytes, so the token starts on a 3-byte boundary and "ghs" encodes to
+  // "Z2hz" at a fixed offset. And base64("ghs_...") on its own: "ghs" -> "Z2hz", "_" -> "X...".
+  // These cover token generations the runner has already replaced (not on disk any more).
+  /eC1hY2Nlc3MtdG9rZW46Z2hz[A-Za-z0-9+/]{20,}/g,
+  /Z2hzX[A-Za-z0-9+/]{20,}/g,
 ]);
 export const REDACTED = "[REDACTED]";
 
@@ -429,8 +476,11 @@ function statKind(p, fsImpl) {
 
 // Validates everything a container job needs on the host, before the job dir exists. Returns
 // { plan } or { error }. resolveBin is job-core's resolveBinary(). workFolder must be absent: a
-// container job never runs in (or mounts) a host folder.
-export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platform = process.platform, resolveBin,
+// container job never runs in (or mounts) a host folder. jobDir is the job's (future) directory:
+// the runner creates <jobDir>/creds there and the argv mounts it. The GitHub App is checked here
+// only as far as the host can without the network (config, key file); job-core then calls
+// github-app.mjs's preflightGitHubApp() for the installation and the identity.
+export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, jobDir, platform = process.platform, resolveBin,
                                    realpath = defaultRealpath, fsImpl = fs }) {
   if (workFolder !== undefined && workFolder !== null && workFolder !== "") {
     return { error: "container jobs do not take workFolder (no host folder is mounted); pass repo (\"owner/repo\") and optionally baseRef instead" };
@@ -448,18 +498,35 @@ export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platfo
   if (!mdReal || statKind(mdReal, fsImpl) !== "file") return { error: `container CLAUDE.md ${cfg.claudeMd} does not exist` };
   const hooksReal = rp(cfg.hooksDir);
   if (!hooksReal || statKind(hooksReal, fsImpl) !== "dir") return { error: `hooks dir ${cfg.hooksDir} does not exist` };
-  // The secrets file may be neither in the checkout nor one of the two read-only mount sources: as
-  // CLAUDE.md it would land in the model's instructions, under hooks/ it would be readable in the job.
-  const ef = checkEnvFile(cfg.envFile, { forbidInside: [REPO_DIR, mdReal, hooksReal], platform, realpath });
+  // The App key may be neither in the checkout nor one of the read-only mount sources, nor the
+  // secrets file; the secrets file may not be the key file either. As CLAUDE.md either would land in
+  // the model's instructions; under hooks/ it would be readable in the job.
+  const app = cfg.githubApp || {};
+  const kf = checkAppKeyFile(app.keyFile, { forbidInside: [REPO_DIR, mdReal, hooksReal], platform, realpath });
+  if (kf.error) return { error: kf.error };
+  const ef = checkEnvFile(cfg.envFile, { forbidInside: [REPO_DIR, mdReal, hooksReal, kf.real], platform, realpath });
   if (ef.error) return { error: ef.error };
+  if (ef.real === kf.real) return { error: `container env file ${ef.real} is the GitHub App key file; keep them separate` };
+  if (typeof jobDir !== "string" || jobDir === "") return { error: "planContainerJob: jobDir is required (the credentials dir is mounted from it)" };
+  const credsDir = path.join(jobDir, CREDS_DIR_NAME);
   const mounts = {};
-  for (const [k, p] of [["claudeMd", mdReal], ["hooks", hooksReal]]) {
+  for (const [k, p] of [["claudeMd", mdReal], ["hooks", hooksReal], ["creds", credsDir]]) {
     const m = toDockerMountSource(p, platform);
     if (m.error) return { error: `cannot mount ${k}: ${m.error}` };
     mounts[k] = m.source;
   }
   return { plan: { jobId, name: containerName(jobId), dockerBin, image: cfg.image, imageId: null, envFile: ef.real,
-                   envFileKeys: ef.keys, repo: rv.repo, baseRef: bv.ref, mounts, cfg } };
+                   envFileKeys: ef.keys, repo: rv.repo, baseRef: bv.ref, mounts, credsDir, cfg,
+                   githubApp: { appId: app.appId, keyFile: kf.real, refreshMs: app.refreshMs, apiBase: app.apiBase } } };
+}
+
+// The commit identity for the container: the App's bot user (<slug>[bot] and
+// <id>+<slug>[bot]@users.noreply.github.com, which GitHub links to the App), unless
+// CLAUDE_ASYNC_CONTAINER_GIT_NAME / _GIT_EMAIL override one or both. `app` is what
+// github-app.mjs's preflightGitHubApp() returned.
+export function resolveGitIdentity(cfg, app) {
+  const derived = app && app.slug && app.botUserId ? botGitIdentity(app) : { name: null, email: null };
+  return { gitName: cfg.gitName || derived.name, gitEmail: cfg.gitEmail || derived.email };
 }
 
 // ------------------------------------------------------------------------------- argv ---
@@ -498,9 +565,11 @@ export function buildContainerCliArgv({ prompt, model, effortArgv = [], settings
 }
 
 // -e NAME=value pairs for the container: the allowlisted job env, git identity, the repo, Ollama,
-// and (phase 2) the egress proxy. Never secrets (those come from --env-file), never a bare -e NAME
-// (which would copy the docker CLI process's own host value in).
-export function buildContainerEnv({ extraEnv = {}, cfg, jobId, repo = null, baseRef = "" }) {
+// and (phase 2) the egress proxy. Never secrets (the OAuth token comes from --env-file, the GitHub
+// token from the creds mount), never a bare -e NAME (which would copy the docker CLI process's own
+// host value in). gitName/gitEmail: see resolveGitIdentity().
+export function buildContainerEnv({ extraEnv = {}, cfg, jobId, repo = null, baseRef = "", gitName, gitEmail }) {
+  if (!gitName || !gitEmail) throw new Error("buildContainerEnv: the git identity (gitName/gitEmail) is not resolved; the GitHub App preflight must run first");
   const env = [];
   const add = (k, v) => {
     if (SECRET_NAME_RE.test(k)) throw new Error(`refusing to pass ${k} on the docker command line; secrets go through --env-file`);
@@ -512,9 +581,9 @@ export function buildContainerEnv({ extraEnv = {}, cfg, jobId, repo = null, base
   if (repo) add("CLAUDE_ASYNC_REPO", repo);
   if (baseRef) add("CLAUDE_ASYNC_BASE_REF", baseRef);
   for (const k of FORWARDED_ENV_KEYS) if (extraEnv[k] !== undefined) add(k, extraEnv[k]);
-  // Commits are the bot's.
-  add("GIT_AUTHOR_NAME", cfg.gitName); add("GIT_COMMITTER_NAME", cfg.gitName);
-  add("GIT_AUTHOR_EMAIL", cfg.gitEmail); add("GIT_COMMITTER_EMAIL", cfg.gitEmail);
+  // Commits are the App's bot user's.
+  add("GIT_AUTHOR_NAME", gitName); add("GIT_COMMITTER_NAME", gitName);
+  add("GIT_AUTHOR_EMAIL", gitEmail); add("GIT_COMMITTER_EMAIL", gitEmail);
   add("OLLAMA_HOST", cfg.ollamaUrl);
   add("CLAUDE_ASYNC_OLLAMA_URL", cfg.ollamaUrl);
   if (cfg.egressProxy) {
@@ -548,10 +617,15 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
   // network) has no route to the host except through the proxy, so the gateway name is not added.
   if (!cfg.egressProxy) argv.push("--add-host", "host.docker.internal:host-gateway");
   argv.push("--env-file", plan.envFile);
-  for (const [k, v] of buildContainerEnv({ extraEnv, cfg, jobId, repo: plan.repo, baseRef: plan.baseRef })) argv.push("-e", `${k}=${v}`);
+  for (const [k, v] of buildContainerEnv({ extraEnv, cfg, jobId, repo: plan.repo, baseRef: plan.baseRef, gitName: plan.gitName, gitEmail: plan.gitEmail })) argv.push("-e", `${k}=${v}`);
+  if (!mounts.creds) throw new Error("buildDockerRunArgv: the plan has no creds mount (planContainerJob needs jobDir)");
   argv.push(
     "--mount", `type=bind,source=${mounts.claudeMd},target=${CONTAINER_CLAUDE_MD},readonly`,
     "--mount", `type=bind,source=${mounts.hooks},target=${CONTAINER_HOOKS_DIR},readonly`,
+    // The per-job installation token (job-runner.mjs writes and refreshes <credsDir>/token). A
+    // directory, not the file, so an in-place rewrite on the host is the same inode the container
+    // holds open; read-only so the job cannot alter what the next git call presents.
+    "--mount", `type=bind,source=${mounts.creds},target=${CONTAINER_CREDS_DIR},readonly`,
     "--workdir", CONTAINER_WORKDIR,
     image,
     CONTAINER_ENTRYPOINT, plan.repo, plan.baseRef || "", "--",

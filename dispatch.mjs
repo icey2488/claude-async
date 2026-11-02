@@ -204,8 +204,8 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
         .describe("Where the job runs. \"host\" (the default unless the host sets CLAUDE_ASYNC_JOB_SANDBOX=container): " +
                   "directly on the executing host, as before -- use it for Windows-admin work (scheduled tasks, " +
                   "services, firewall). \"container\": in a Docker container that clones `repo` itself (no host " +
-                  "folder is mounted), with a full shell and the bot GitHub account's token, so the job can commit, " +
-                  "push a branch and open a PR as the bot. See docs/container-jobs.md."),
+                  "folder is mounted), with a full shell and a one-hour GitHub App installation token scoped to that one " +
+                  "repo, so the job can commit, push a branch and open a PR as the App. See docs/container-jobs.md."),
       repo: z.string().optional().describe("Container jobs only (required there): the GitHub repo to clone inside " +
                   "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
       baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
