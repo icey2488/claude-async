@@ -25,22 +25,35 @@
          A probe that did not run (container failed, a result missing or duplicated, a name that did
          not resolve) is a FAIL, never a pass.
        - no Docker socket is visible, no host path is bind-mounted except CLAUDE.md and hooks
-         (read-only), and /workspace is container-local and empty
-       - with -EnvFile: the secrets reach the container as env vars (only NAMES and lengths are
-         printed), gh authenticates as the bot (prints the login only), git over https works through
-         the image's credential helper, the entrypoint clones -Repo, and (-RunClaude) claude makes one
-         tiny model call the way a real job does.
+         (read-only), /workspace is container-local and empty, the image's git credential helper and
+         gh wrapper are in place, and no GH_TOKEN exists anywhere without the creds mount
+       - TOKEN FILE PROPAGATION (section 5b, always): a host file bind-mounted (read-only, as a
+         directory) into a running container is rewritten IN PLACE on the host (open, write, truncate,
+         flush: no rename), and the container must see the new content within 5 s. This is how the
+         runner refreshes the GitHub App installation token every 45 minutes; it is unverified on
+         Docker Desktop's file sharing, so this check is a FAIL if it does not propagate.
+       - with -EnvFile and the GitHub App settings (-AppId/-AppKeyFile, or the CLAUDE_ASYNC_GITHUB_APP_ID /
+         _KEY_FILE environment variables): CLAUDE_CODE_OAUTH_TOKEN reaches the container as env (only
+         the NAME and length are printed), tools/mint-app-token.mjs mints an installation token for
+         -Repo into a temporary creds dir (the preflight job-core runs: key file, installation, App
+         identity), the container reads it through the read-only creds mount while `env` shows no
+         GH_TOKEN, gh authenticates as the App (prints the repo's full name only), git over https works
+         through the image's credential helper, the entrypoint clones -Repo with no token in
+         .git/config, and (-RunClaude) claude makes one tiny model call the way a real job does.
   Never prints a secret value. Exits 0 when every check passes (WARNs allowed), 1 otherwise.
 
 .EXAMPLE
   powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1
   powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1 -SkipBuild `
-    -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" -RunClaude
+    -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" `
+    -AppId 123456 -AppKeyFile "$env:USERPROFILE\.claude-async-secrets\github-app.pem" -RunClaude
   ... -LanTargets "192.168.1.10:8123","100.101.102.103:7850" -ExtraHosts "claunker.tailnet-name.ts.net"
 #>
 param(
   [string]$Image = "claude-async-job:local",
   [string]$EnvFile = "",
+  [string]$AppId = $env:CLAUDE_ASYNC_GITHUB_APP_ID,
+  [string]$AppKeyFile = $env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE,
   [switch]$RunClaude,
   [switch]$SkipBuild,
   [string]$Docker = "docker",
@@ -236,7 +249,7 @@ for p in /var/run/docker.sock /run/docker.sock /.docker /root/.docker /home/agen
   if [ -e "$p" ]; then echo "VISIBLE $p"; bad=1; fi
 done
 if grep -Ei "docker\.sock|\.ssh|\.claunker|\.claude-async|GitCredentialManager|Microsoft/Credentials|\.git-credentials|AppData" /proc/self/mountinfo; then bad=1; fi
-targets=$(awk '$5 ~ /^\/(workspace|home\/agent\/\.claude\/CLAUDE\.md|opt\/claude-async\/hooks)$/ {print $5}' /proc/self/mountinfo | sort | tr '\n' ' ')
+targets=$(awk '$5 ~ /^\/(workspace|home\/agent\/\.claude\/CLAUDE\.md|opt\/claude-async\/hooks|run\/claude-async\/creds)$/ {print $5}' /proc/self/mountinfo | sort | tr '\n' ' ')
 echo "BIND_TARGETS $targets"
 case "$targets" in *"/workspace"*) echo "WORKSPACE_IS_A_MOUNT"; bad=1 ;; esac
 [ -z "$(ls -A /workspace)" ] || { echo "WORKSPACE_NOT_EMPTY"; bad=1; }
@@ -244,29 +257,117 @@ touch /home/agent/.claude/CLAUDE.md 2>/dev/null && { echo "CLAUDE_MD_WRITABLE"; 
 touch /opt/claude-async/hooks/x 2>/dev/null && { echo "HOOKS_WRITABLE"; bad=1; }
 touch /workspace/.smoke-write && rm /workspace/.smoke-write || { echo "WORKSPACE_NOT_WRITABLE"; bad=1; }
 env | cut -d= -f1 | grep -E "TOKEN|SECRET|PASSWORD|API_KEY" && bad=1
+# the GitHub App credential path: helper wired for github.com, gh is the wrapper over the real binary,
+# the creds mount point exists and is empty without the mount, and nothing answers without a token file
+[ "$(git config --system credential.https://github.com.helper)" = "/usr/local/bin/claude-async-git-credential" ] || { echo "HELPER_NOT_CONFIGURED"; bad=1; }
+git config --system --get-all credential.helper | grep -q "gh auth" && { echo "OLD_GH_HELPER_PRESENT"; bad=1; }
+head -1 /usr/local/bin/gh | grep -q "^#!/bin/bash" && [ -x /usr/local/lib/gh/gh ] || { echo "GH_WRAPPER_MISSING"; bad=1; }
+[ -d /run/claude-async/creds ] && [ -z "$(ls -A /run/claude-async/creds)" ] || { echo "CREDS_DIR_NOT_EMPTY_OR_MISSING"; bad=1; }
+[ -z "$(printf 'protocol=https\nhost=github.com\n\n' | /usr/local/bin/claude-async-git-credential get)" ] || { echo "HELPER_ANSWERS_WITHOUT_FILE"; bad=1; }
+gh --version | head -1
 exit $bad
 '@
 $r = Invoke-InContainer $roMounts $check
-if ($r.code -eq 0) { Pass "no Docker socket, no host credential paths, only CLAUDE.md/hooks mounted (read-only), /workspace container-local and empty, no secrets without -EnvFile`n$($r.out.Trim())" }
+if ($r.code -eq 0) { Pass "no Docker socket, no host credential paths, only CLAUDE.md/hooks mounted (read-only), /workspace container-local and empty, credential helper + gh wrapper in place, no secrets without -EnvFile`n$($r.out.Trim())" }
 else { Fail "isolation check:`n$($r.out)" }
 
-# --- 6. Secrets file (optional) --------------------------------------------------------------
-if ($EnvFile) {
-  if (-not (Test-Path -LiteralPath $EnvFile)) { Fail "env file $EnvFile not found" }
+# --- 5b. Token file propagation through a bind mount (the runner's refresh path) -------------
+# The runner rewrites <jobdir>\creds\token IN PLACE (open the existing file, write at offset 0,
+# truncate, flush; never a rename) every 45 minutes while the container runs. On a Linux engine the
+# container sees the new content at once; through Docker Desktop's Windows file sharing this is
+# UNVERIFIED, so it is measured here: a container tails the file, the host rewrites it the same
+# way, and the new content must show up in the container's output within 5 seconds.
+$propDir = Join-Path ([IO.Path]::GetTempPath()) ("claude-async-smoke-creds-" + [IO.Path]::GetRandomFileName())
+New-Item -ItemType Directory -Path $propDir | Out-Null
+$propFile = Join-Path $propDir "token"
+$utf8 = New-Object Text.UTF8Encoding($false)
+[IO.File]::WriteAllText($propFile, "generation-one`n", $utf8)
+$propName = "claude-async-smoke-prop-" + [IO.Path]::GetRandomFileName().Replace(".", "")
+$propMount = "type=bind,source=$($propDir -replace '\\','/'),target=/run/claude-async/creds,readonly"
+# base64, like Invoke-InContainer: PowerShell 5.1 would not escape the embedded quotes for docker.exe
+$propScript = 'for i in $(seq 1 60); do echo "SEEN:$(cat /run/claude-async/creds/token 2>/dev/null || echo READ_FAILED)"; sleep 0.5; done'
+$propB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($propScript))
+$prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+try {
+  $propArgs = @("run", "-d", "--name", $propName, "--pull=never", "--init", "--user", "1000:1000", "--security-opt", "no-new-privileges",
+                "--cap-drop", "ALL", "--network", "none", "--mount", $propMount, $script:imageRef, "bash", "-c", "echo $propB64 | base64 -d | bash")
+  $cid = (& $Docker @propArgs 2>&1 | Out-String).Trim()
+  if ($LASTEXITCODE -ne 0) { Fail "token propagation: could not start the tailing container: $cid" }
   else {
+    Start-Sleep -Seconds 2
+    $logs0 = (& $Docker logs $propName 2>&1 | Out-String)
+    if ($logs0 -notmatch "SEEN:generation-one") { Fail "token propagation: the container did not read the initial file through the read-only creds mount: $($logs0.Trim())" }
+    else {
+      # the in-place rewrite, as job-runner.mjs does it: same file, same inode, no rename
+      $fsm = [IO.File]::Open($propFile, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+      try {
+        $bytes = $utf8.GetBytes("generation-two`n")
+        $fsm.Position = 0; $fsm.Write($bytes, 0, $bytes.Length); $fsm.SetLength($bytes.Length); $fsm.Flush($true)
+      } finally { $fsm.Close() }
+      $t0 = Get-Date; $seen = $false; $logs = ""
+      while (((Get-Date) - $t0).TotalSeconds -lt 5) {
+        $logs = (& $Docker logs $propName 2>&1 | Out-String)
+        if ($logs -match "SEEN:generation-two") { $seen = $true; break }
+        Start-Sleep -Milliseconds 250
+      }
+      $took = [int]((Get-Date) - $t0).TotalMilliseconds
+      if ($seen) { Pass "token propagation: an in-place rewrite of the host file was visible in the running container after ${took} ms (the runner's 45-minute token refresh will reach jobs)" }
+      else { Fail "token propagation: the container did NOT see the in-place rewrite within 5 s (last lines: $(($logs.Trim() -split "`r?`n" | Select-Object -Last 3) -join ' | ')). Docker Desktop's file sharing is not propagating content changes of a bind-mounted file; container jobs longer than an hour would lose GitHub access. Do not enable container mode until this passes (docs/container-jobs.md, 'Token delivery and refresh')." }
+    }
+  }
+} finally {
+  & $Docker rm -f $propName *> $null
+  $ErrorActionPreference = $prev
+  Remove-Item -Recurse -Force $propDir -ErrorAction SilentlyContinue
+}
+
+# --- 6. Credentials (optional): the OAuth env file and the GitHub App ------------------------
+if ($EnvFile -or $AppId -or $AppKeyFile) {
+  if (-not $EnvFile) { Fail "-EnvFile is required together with the GitHub App settings" }
+  elseif (-not (Test-Path -LiteralPath $EnvFile)) { Fail "env file $EnvFile not found" }
+  elseif (-not $AppId -or -not $AppKeyFile) { Fail "the GitHub App settings are required with -EnvFile: -AppId and -AppKeyFile (or CLAUDE_ASYNC_GITHUB_APP_ID / CLAUDE_ASYNC_GITHUB_APP_KEY_FILE in the environment)" }
+  elseif (-not (Test-Path -LiteralPath $AppKeyFile)) { Fail "GitHub App key file $AppKeyFile not found" }
+  else {
+    # the env file may hold only CLAUDE_CODE_OAUTH_TOKEN now (GH_TOKEN is refused by job-core)
+    $keys = @(Get-Content -LiteralPath $EnvFile | Where-Object { $_ -match "=" } | ForEach-Object { ($_ -split "=", 2)[0] })
+    if (($keys -join ",") -eq "CLAUDE_CODE_OAUTH_TOKEN") { Pass "env file holds exactly CLAUDE_CODE_OAUTH_TOKEN" }
+    else { Fail "env file keys are '$($keys -join ',')'; container jobs accept only CLAUDE_CODE_OAUTH_TOKEN (GitHub credentials come from the App; remove GH_TOKEN)" }
     $envArgs = @("--env-file", $EnvFile)
-    $r = Invoke-InContainer $envArgs 'for k in GH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do v=$(printenv "$k" || true); echo "$k length=${#v}"; done; gh api user --jq .login'
-    if ($r.code -eq 0 -and $r.out -match "GH_TOKEN length=[1-9]" -and $r.out -match "CLAUDE_CODE_OAUTH_TOKEN length=[1-9]") {
-      $login = ($r.out.Trim() -split "`r?`n")[-1]
-      Pass "secrets reach the container as env (names/lengths only shown); gh authenticated as: $login"
-    } else { Fail "secrets/gh auth: $($r.out)" }
-    $r = Invoke-InContainer $envArgs "git ls-remote https://github.com/$Repo HEAD | cut -c1-12"
-    if ($r.code -eq 0 -and $r.out.Trim()) { Pass "git over https uses the bot token through the image's credential helper ($Repo)" } else { Fail "git credential helper / repo access: $($r.out)" }
-    $r = Invoke-InContainer $envArgs "/usr/local/bin/claude-async-job-entry $Repo '' -- bash -c 'git log -1 --format=%h; git remote get-url origin; ! grep -rq x-access-token .git/config'"
-    if ($r.code -eq 0) { Pass "the entrypoint clones $Repo into /workspace; no token in .git/config:`n$($r.out.Trim())" } else { Fail "entrypoint clone (exit $($r.code)): $($r.out)" }
-    if ($RunClaude) {
-      $r = Invoke-InContainer ($envArgs + $roMounts) "/usr/local/bin/claude-async-job-entry $Repo '' -- claude -p --dangerously-skip-permissions --setting-sources user --strict-mcp-config --mcp-config '{""mcpServers"":{}}' --model=claude-sonnet-5 --effort low -- 'Reply with exactly the word PONG and nothing else.'"
-      if ($r.code -eq 0 -and $r.out -match "PONG") { Pass "claude -p ran headless on the subscription token, in the clone, like a real job" } else { Fail "claude headless call: $($r.out)" }
+    $r = Invoke-InContainer $envArgs 'v=$(printenv CLAUDE_CODE_OAUTH_TOKEN || true); echo "CLAUDE_CODE_OAUTH_TOKEN length=${#v}"; env | grep -c "^GH_TOKEN=" || true'
+    if ($r.code -eq 0 -and $r.out -match "CLAUDE_CODE_OAUTH_TOKEN length=[1-9]" -and $r.out -match "(?m)^0\s*$") { Pass "the OAuth token reaches the container as env (name/length only shown); no GH_TOKEN in the environment" }
+    else { Fail "env file in the container: $($r.out)" }
+    # Mint one installation token the way the runner does (tools/mint-app-token.mjs runs job-core's
+    # preflight first: key file mode/shape, the installation on -Repo, the App's slug and bot id).
+    $credsDir = Join-Path ([IO.Path]::GetTempPath()) ("claude-async-smoke-app-" + [IO.Path]::GetRandomFileName())
+    New-Item -ItemType Directory -Path $credsDir | Out-Null
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    icacls $credsDir /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" *> $null
+    try {
+      $env:CLAUDE_ASYNC_GITHUB_APP_ID = $AppId; $env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE = $AppKeyFile
+      $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+      try { $mint = (& node (Join-Path $repoRoot "tools\mint-app-token.mjs") $Repo (Join-Path $credsDir "token") 2>&1 | Out-String) } finally { $ErrorActionPreference = $prev }
+      if ($LASTEXITCODE -ne 0) { Fail "GitHub App preflight/mint failed (this is what job-core's preflight would say):`n$($mint.Trim())" }
+      else {
+        Pass "GitHub App preflight + installation token for ${Repo}:`n$($mint.Trim())"
+        $credsMount = @("--mount", "type=bind,source=$($credsDir -replace '\\','/'),target=/run/claude-async/creds,readonly")
+        # single-quoted: bash's $(...) and ${#t} must reach the container untouched by PowerShell
+        $body = 'set -e; t=$(cat /run/claude-async/creds/token); echo "token file length=${#t}"; echo "env GH_TOKEN count=$(env | grep -c ''^GH_TOKEN='' || true)"; a=$(gh auth token); [ "$a" = "$t" ] && echo GH_WRAPPER_USES_FILE || echo GH_WRAPPER_MISMATCH; gh api repos/__REPO__ --jq .full_name'
+        $r = Invoke-InContainer ($envArgs + $credsMount) ($body.Replace("__REPO__", $Repo))
+        if ($r.code -eq 0 -and $r.out -match "token file length=[1-9]" -and $r.out -match "env GH_TOKEN count=0" -and $r.out -match "GH_WRAPPER_USES_FILE" -and $r.out -match [regex]::Escape($Repo)) {
+          Pass "the container reads the token through the read-only creds mount, the shell env has no GH_TOKEN, gh authenticates as the App for $Repo"
+        } else { Fail "creds mount / gh wrapper / App access: $($r.out)" }
+        $r = Invoke-InContainer ($envArgs + $credsMount) "git ls-remote https://github.com/$Repo HEAD | cut -c1-12"
+        if ($r.code -eq 0 -and $r.out.Trim()) { Pass "git over https uses the installation token through the image's credential helper ($Repo)" } else { Fail "git credential helper / repo access: $($r.out)" }
+        $r = Invoke-InContainer ($envArgs + $credsMount) "/usr/local/bin/claude-async-job-entry $Repo '' -- bash -c 'git log -1 --format=%h; git remote get-url origin; ! grep -rq x-access-token .git/config'"
+        if ($r.code -eq 0) { Pass "the entrypoint clones $Repo into /workspace; no token in .git/config:`n$($r.out.Trim())" } else { Fail "entrypoint clone (exit $($r.code)): $($r.out)" }
+        if ($RunClaude) {
+          $r = Invoke-InContainer ($envArgs + $credsMount + $roMounts) "/usr/local/bin/claude-async-job-entry $Repo '' -- claude -p --dangerously-skip-permissions --setting-sources user --strict-mcp-config --mcp-config '{""mcpServers"":{}}' --model=claude-sonnet-5 --effort low -- 'Reply with exactly the word PONG and nothing else.'"
+          if ($r.code -eq 0 -and $r.out -match "PONG") { Pass "claude -p ran headless on the subscription token, in the clone, like a real job" } else { Fail "claude headless call: $($r.out)" }
+        }
+      }
+    } finally {
+      Remove-Item -Recurse -Force $credsDir -ErrorAction SilentlyContinue
+      Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_ID -ErrorAction SilentlyContinue; Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE -ErrorAction SilentlyContinue
     }
   }
 }
