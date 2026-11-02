@@ -137,7 +137,7 @@ test("container job: output captured, exit.json written, cleanup by label confir
 // (0700 dir, 0600 file; the argv mounts the dir read-only at /run/claude-async/creds), rewrites it IN
 // PLACE every refreshMs while the container runs, redacts every generation, and deletes it on finish.
 
-test("token delivery: file created before docker run with owner-only modes, refreshed in place (same inode), all generations redacted, deleted on finish", { skip: SKIP }, async () => {
+test("token delivery: file created before docker run with owner-only modes, republished by atomic rename (a new inode each generation, never torn), all generations redacted, deleted on finish", { skip: SKIP }, async () => {
   const before = gh.tokens().length;
   const j = setup({ FAKE_DOCKER_RUN_MS: "2000" }, { refreshMs: 300 });
   const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
@@ -155,7 +155,9 @@ test("token delivery: file created before docker run with owner-only modes, refr
   assert.ok(runAt.argv.includes("run"));
   assert.ok(await waitFor(() => j.readToken() !== t0, 5000), "the token was rewritten");
   const t1 = j.readToken();
-  assert.equal(fs.statSync(j.tokenFile).ino, st0.ino, "rewritten in place: same inode (no rename)");
+  assert.notEqual(fs.statSync(j.tokenFile).ino, st0.ino, "republished by rename inside the mounted directory: a new inode (round 3)");
+  assert.match(fs.readFileSync(j.tokenFile, "utf8"), /^ghs_[A-Za-z0-9]{36,}\n$/, "always exactly one complete line");
+  assert.deepEqual(fs.readdirSync(path.dirname(j.tokenFile)).filter((f) => f !== "token"), [], "no temp file left in the mounted dir");
   assert.equal(fs.statSync(j.tokenFile).mode & 0o777, 0o600);
   assert.equal(await exited(child), 0);
   const issued = gh.tokens().slice(before);

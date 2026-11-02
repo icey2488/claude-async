@@ -29,7 +29,25 @@ while IFS= read -r line; do
   esac
 done
 [ "$host" = "github.com" ] && [ "$protocol" = "https" ] || exit 0
-[ -r "$file" ] || exit 0
-token="$(cat "$file")"
-[ -n "$token" ] || exit 0
+# Reads the token file (review round 3): it must hold exactly one line, an installation token
+# (ghs_ + at least 36 letters/digits). The runner publishes each generation with an atomic rename, so
+# a reader normally sees one complete file; anything else (a torn in-place rewrite from the runner's
+# fallback path, a foreign value) is retried every 100 ms, 20 times, and then refused. Only the first
+# line is ever used (IFS= read -r), and a second non-empty line makes the content invalid. Sets
+# $token, or leaves it empty and returns 1. A missing file returns 2 at once (nothing to wait for).
+read_token() {
+  local i t1 t2
+  token=""
+  [ -e "$file" ] || return 2
+  for i in $(seq 1 20); do
+    t1=""; t2=""
+    { IFS= read -r t1 || true; IFS= read -r t2 || true; } < "$file" 2>/dev/null
+    t1="${t1%$'\r'}"
+    if [ -z "$t2" ] && [[ "$t1" =~ ^ghs_[A-Za-z0-9]{36,}$ ]]; then token="$t1"; return 0; fi
+    sleep 0.1
+  done
+  echo "${0##*/}: ${file} is not a single valid installation token after 20 attempts; refusing to use it" >&2
+  return 1
+}
+read_token || exit 0
 printf 'username=x-access-token\npassword=%s\n' "$token"

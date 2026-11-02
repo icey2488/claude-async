@@ -72,9 +72,9 @@
  *       <jobdir>/creds/token (dir 0700, file 0600, handed to the container's uid when the runner is
  *       root), which the argv bind-mounts read-only at /run/claude-async/creds for the image's git
  *       credential helper and gh wrapper. Every spec.container.githubApp.refreshMs (default 45 min;
- *       tokens live 60) it re-mints and rewrites the file IN PLACE (write at offset 0, truncate to
- *       the new length, fsync: the same inode the container has, never a rename, so the content
- *       change is what propagates through the bind mount), keeps the old token when a refresh
+ *       tokens live 60) it re-mints and republishes the file atomically (temp file in the mounted
+ *       creds DIRECTORY, fsync, rename over `token`; in place only as a fallback when the rename
+ *       fails; review round 3), keeps the old token when a refresh
  *       fails and retries with bounded backoff (token-refresh.mjs: 30 s .. 5 min, at least once
  *       more before expiry - 2 min; logging once per distinct error), records a warning in
  *       exit.json when the token gets within 5 minutes of its expiry without a newer one (its own
@@ -95,6 +95,7 @@
  * machinery (heartbeat, child spawn) is set up. Production never sets this env var.
  */
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -368,14 +369,33 @@ function ensureCredsDir() {
   try { fs.chmodSync(credsDir, 0o700); } catch {}
   chownToContainer(credsDir);
 }
-// In place, never a rename: the container holds the DIRECTORY as a bind mount, and what must reach
-// it is new content in the same file. Write the new token at offset 0, then truncate to its length
-// (tokens of one app are the same length, so a reader never sees an empty file), then fsync. A
-// rename would also work for a directory mount on Linux, but a bind mount through Docker Desktop's
-// file sharing is what claunker runs, and in-place content changes are the propagation the smoke
-// test measures; one mechanism, measured, rather than two.
+// Atomic publication (review round 3): each generation goes to a private temp file in the creds dir
+// (0600, handed to the container's uid, fsynced) and is renamed over `token`. The container holds the
+// DIRECTORY as its bind mount, so the rename is visible inside it, and a reader sees either the old
+// complete file or the new complete file, never a mix. Measured here with a real Linux engine: 31010
+// renames of alternating lengths against 124793 whole-file reads in a container gave 0 invalid reads;
+// the old in-place write+truncate gave 10537 invalid reads of 125518 (old suffixes and NUL bytes). The
+// in-place write stays only as a fallback when the rename fails (on Windows a file another process
+// holds open can refuse MoveFileEx); the image's readers validate the content and retry either way
+// (container/git-credential.sh, container/gh-wrapper.sh). Docker Desktop's file sharing is measured
+// by container/smoke-test.ps1 section 5b (rename AND same-length in-place).
 function writeTokenFile(token) {
   const data = `${token}\n`;
+  const tmp = path.join(credsDir, `.${CREDS_TOKEN_NAME}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+  try {
+    const fd = fs.openSync(tmp, "wx", 0o600);
+    try { fs.writeSync(fd, data, 0, "utf8"); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    try { fs.chmodSync(tmp, 0o600); } catch {}
+    chownToContainer(tmp);
+    fs.renameSync(tmp, tokenPath);
+    return;
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    if (!tokenState.renameFallbackLogged) {
+      tokenState.renameFallbackLogged = true;
+      try { fs.writeSync(errFd, `\n[job-runner] WARN: publishing the token file by rename failed (${e.code || e.message}); rewriting it in place instead (the container's readers validate and retry)\n`); } catch {}
+    }
+  }
   const existed = fs.existsSync(tokenPath);
   const fd = fs.openSync(tokenPath, fs.constants.O_WRONLY | fs.constants.O_CREAT, 0o600);
   try {

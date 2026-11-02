@@ -27,11 +27,13 @@
        - no Docker socket is visible, no host path is bind-mounted except CLAUDE.md and hooks
          (read-only), /workspace is container-local and empty, the image's git credential helper and
          gh wrapper are in place, and no GH_TOKEN exists anywhere without the creds mount
-       - TOKEN FILE PROPAGATION (section 5b, always): a host file bind-mounted (read-only, as a
-         directory) into a running container is rewritten IN PLACE on the host (open, write, truncate,
-         flush: no rename), and the container must see the new content within 5 s. This is how the
-         runner refreshes the GitHub App installation token every 45 minutes; it is unverified on
-         Docker Desktop's file sharing, so this check is a FAIL if it does not propagate.
+       - TOKEN FILE PROPAGATION (section 5b, always): a host directory bind-mounted (read-only) into a
+         running container gets two same-length updates of its file, each measured on its own: an
+         IN-PLACE rewrite (the runner's fallback; also shows whether WSL2's file sharing notices a
+         content change that keeps st_size) and a RENAME of a temp file over it inside the mounted
+         directory (how the runner publishes every token generation since review round 3). The
+         container must see the renamed file within 5 s, or the check FAILS; an in-place rewrite that
+         does not propagate is a WARN (the fallback would not reach jobs). Both are reported.
        - with -EnvFile and the GitHub App settings (-AppId/-AppKeyFile, or the CLAUDE_ASYNC_GITHUB_APP_ID /
          _KEY_FILE environment variables): CLAUDE_CODE_OAUTH_TOKEN reaches the container as env (only
          the NAME and length are printed), tools/mint-app-token.mjs mints an installation token for
@@ -272,11 +274,12 @@ if ($r.code -eq 0) { Pass "no Docker socket, no host credential paths, only CLAU
 else { Fail "isolation check:`n$($r.out)" }
 
 # --- 5b. Token file propagation through a bind mount (the runner's refresh path) -------------
-# The runner rewrites <jobdir>\creds\token IN PLACE (open the existing file, write at offset 0,
-# truncate, flush; never a rename) every 45 minutes while the container runs. On a Linux engine the
-# container sees the new content at once; through Docker Desktop's Windows file sharing this is
-# UNVERIFIED, so it is measured here: a container tails the file, the host rewrites it the same
-# way, and the new content must show up in the container's output within 5 seconds.
+# The runner publishes each token generation by writing a temp file inside <jobdir>\creds and
+# renaming it over creds\token (atomic: readers never see a torn file); if that rename fails it falls
+# back to rewriting the file in place. Both are measured here, each with SAME-LENGTH content (real
+# tokens all have one length, so st_size never changes; Docker Desktop's WSL2 file sharing could in
+# principle serve a cached copy when only the content changes). The writes are done by node exactly
+# as job-runner.mjs does them. A container tails the file; each new value must show up within 5 s.
 $propDir = Join-Path ([IO.Path]::GetTempPath()) ("claude-async-smoke-creds-" + [IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $propDir | Out-Null
 $propFile = Join-Path $propDir "token"
@@ -285,8 +288,21 @@ $utf8 = New-Object Text.UTF8Encoding($false)
 $propName = "claude-async-smoke-prop-" + [IO.Path]::GetRandomFileName().Replace(".", "")
 $propMount = "type=bind,source=$($propDir -replace '\\','/'),target=/run/claude-async/creds,readonly"
 # base64, like Invoke-InContainer: PowerShell 5.1 would not escape the embedded quotes for docker.exe
-$propScript = 'for i in $(seq 1 60); do echo "SEEN:$(cat /run/claude-async/creds/token 2>/dev/null || echo READ_FAILED)"; sleep 0.5; done'
+$propScript = 'for i in $(seq 1 80); do echo "SEEN:$(cat /run/claude-async/creds/token 2>/dev/null || echo READ_FAILED)"; sleep 0.25; done'
 $propB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($propScript))
+# node one-liners: the in-place rewrite (open r+, write at 0, truncate, fsync) and the rename publication.
+# No double quotes inside them: PowerShell 5.1 does not escape embedded quotes for native commands.
+$jsInPlace = 'const fs=require(''fs'');const [f,v]=process.argv.slice(1);const d=v+String.fromCharCode(10);const fd=fs.openSync(f,''r+'');fs.writeSync(fd,d,0);fs.ftruncateSync(fd,Buffer.byteLength(d));fs.fsyncSync(fd);fs.closeSync(fd)'
+$jsRename = 'const fs=require(''fs'');const [f,v]=process.argv.slice(1);const d=v+String.fromCharCode(10);const t=f+''.tmp-smoke'';const fd=fs.openSync(t,''wx'',0o600);fs.writeSync(fd,d,0);fs.fsyncSync(fd);fs.closeSync(fd);fs.renameSync(t,f)'
+function Wait-Seen([string]$value) {
+  $t0 = Get-Date; $logs = ""
+  while (((Get-Date) - $t0).TotalSeconds -lt 5) {
+    $logs = (& $Docker logs $propName 2>&1 | Out-String)
+    if ($logs -match "SEEN:$value") { return @{ seen = $true; ms = [int]((Get-Date) - $t0).TotalMilliseconds; logs = $logs } }
+    Start-Sleep -Milliseconds 200
+  }
+  return @{ seen = $false; ms = 5000; logs = $logs }
+}
 $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
 try {
   $propArgs = @("run", "-d", "--name", $propName, "--pull=never", "--init", "--user", "1000:1000", "--security-opt", "no-new-privileges",
@@ -298,21 +314,17 @@ try {
     $logs0 = (& $Docker logs $propName 2>&1 | Out-String)
     if ($logs0 -notmatch "SEEN:generation-one") { Fail "token propagation: the container did not read the initial file through the read-only creds mount: $($logs0.Trim())" }
     else {
-      # the in-place rewrite, as job-runner.mjs does it: same file, same inode, no rename
-      $fsm = [IO.File]::Open($propFile, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
-      try {
-        $bytes = $utf8.GetBytes("generation-two`n")
-        $fsm.Position = 0; $fsm.Write($bytes, 0, $bytes.Length); $fsm.SetLength($bytes.Length); $fsm.Flush($true)
-      } finally { $fsm.Close() }
-      $t0 = Get-Date; $seen = $false; $logs = ""
-      while (((Get-Date) - $t0).TotalSeconds -lt 5) {
-        $logs = (& $Docker logs $propName 2>&1 | Out-String)
-        if ($logs -match "SEEN:generation-two") { $seen = $true; break }
-        Start-Sleep -Milliseconds 250
-      }
-      $took = [int]((Get-Date) - $t0).TotalMilliseconds
-      if ($seen) { Pass "token propagation: an in-place rewrite of the host file was visible in the running container after ${took} ms (the runner's 45-minute token refresh will reach jobs)" }
-      else { Fail "token propagation: the container did NOT see the in-place rewrite within 5 s (last lines: $(($logs.Trim() -split "`r?`n" | Select-Object -Last 3) -join ' | ')). Docker Desktop's file sharing is not propagating content changes of a bind-mounted file; container jobs longer than an hour would lose GitHub access. Do not enable container mode until this passes (docs/container-jobs.md, 'Token delivery and refresh')." }
+      # (1) same-length in-place rewrite: generation-one -> generation-two (15 bytes each)
+      & node -e $jsInPlace $propFile "generation-two" 2>&1 | Out-Null
+      $inPlace = Wait-Seen "generation-two"
+      # (2) same-length rename publication: -> generation-333 (15 bytes)
+      & node -e $jsRename $propFile "generation-333" 2>&1 | Out-Null
+      $renamed = Wait-Seen "generation-333"
+      $last = { param($l) (($l.Trim() -split "`r?`n" | Select-Object -Last 3) -join ' | ') }
+      if ($renamed.seen) { Pass "token propagation (rename, what the runner does): a same-length file renamed into the mounted creds dir was visible in the running container after $($renamed.ms) ms" }
+      else { Fail "token propagation (rename): the container did NOT see a file renamed into the mounted creds directory within 5 s (last lines: $(& $last $renamed.logs)). Container jobs longer than an hour would lose GitHub access. Do not enable container mode until this passes (docs/container-jobs.md, 'Token delivery and refresh')." }
+      if ($inPlace.seen) { Pass "token propagation (in-place fallback): a same-length in-place rewrite was visible after $($inPlace.ms) ms" }
+      else { Warn "token propagation (in-place fallback): a same-length in-place rewrite was NOT visible within 5 s (last lines: $(& $last $inPlace.logs)); the runner's fallback (used only when the rename fails) would not reach running jobs" }
     }
   }
 } finally {

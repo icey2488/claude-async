@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -192,3 +192,36 @@ test("C3: job-entry refuses refs / refs/* (any case) with exit 64 before cloning
   assert.equal(runEntry(remote, "refsfoo").status, 70, "a name that merely starts with refs is a normal (unknown) name");
 });
 
+// The token file is published by rename (one complete file at a time), and the readers still refuse
+// anything that is not exactly one line holding an installation token: they retry (100 ms, up to 20
+// times) and then give up, rather than hand git or gh a torn or foreign value.
+const tokenFile = (content) => { const f = path.join(TMP, `tok-${++n}`); fs.writeFileSync(f, content); return f; };
+const T2 = "ghs_READERTEST2222222222222222222222222222";
+test("readers: a torn file (old suffix on a second line), a non-token and an empty file are retried and then refused", { skip: SKIP }, () => {
+  for (const bad of [`${TOKEN}\n0000\n`, "not-a-token\n", "", `ghs_short\n`, `${TOKEN} trailing\n`]) {
+    const f = tokenFile(bad);
+    const t0 = Date.now();
+    const r = helper("protocol=https\nhost=github.com\n\n", { CLAUDE_ASYNC_CREDS_FILE: f });
+    assert.equal(r.status, 0);
+    assert.equal(r.stdout, "", `nothing handed to git for ${JSON.stringify(bad)}`);
+    assert.match(r.stderr, /not a single valid installation token/);
+    assert.ok(Date.now() - t0 >= 1500, "it retried (20 x 100 ms) before giving up");
+  }
+  const fakeGh = path.join(TMP, "fake-gh-r3");
+  fs.writeFileSync(fakeGh, "#!/bin/sh\necho \"GH_TOKEN=${GH_TOKEN:-<unset>}\"\n"); fs.chmodSync(fakeGh, 0o755);
+  const g = spawnSync("bash", [GH_WRAPPER, "x"], { encoding: "utf8", env: { ...process.env, GH_TOKEN: undefined, CLAUDE_ASYNC_CREDS_FILE: tokenFile(`${TOKEN}\nxx\n`), CLAUDE_ASYNC_GH_BIN: fakeGh } });
+  assert.equal(g.status, 1, "gh is not run with a torn token");
+  assert.equal(g.stdout, "");
+  assert.match(g.stderr, /not a single valid installation token/);
+});
+
+test("readers: a file that becomes valid during the retries is used (the next generation)", { skip: SKIP }, async () => {
+  const f = tokenFile(`${TOKEN}\n0000\n`);
+  const child = spawn("bash", [CRED_HELPER, "get"], { env: { ...process.env, CLAUDE_ASYNC_CREDS_FILE: f } });
+  let out = "";
+  child.stdout.on("data", (c) => (out += c));
+  child.stdin.end("protocol=https\nhost=github.com\n\n");
+  setTimeout(() => { const tmp = `${f}.tmp`; fs.writeFileSync(tmp, `${T2}\n`); fs.renameSync(tmp, f); }, 400);
+  await new Promise((r) => child.on("exit", r));
+  assert.equal(out, `username=x-access-token\npassword=${T2}\n`);
+});
