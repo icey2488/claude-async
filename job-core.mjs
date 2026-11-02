@@ -1394,22 +1394,50 @@ const confirmHoldMs = () => Number(process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HO
 // docker.exe does not kill) that could still create the job's container. This is how a client whose
 // pid was never recorded (runner died between spawn and the pid write) is still found. Returns pids;
 // [] when nothing is found; null when the scan itself failed (treated as uncertain by the caller).
+// Review round 3 (B3): the match is the COMPLETE label argument (`--label <l>` or `--label=<l>`,
+// optionally quoted, followed by whitespace or the end), never a substring, so neither the scanner's
+// own command line (the PowerShell script contains the needle) nor a job whose id merely starts with
+// this one's can match; and the scanner excludes itself ($PID and PowerShell processes on win32, the
+// ps child's pid on POSIX) and the calling node process.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+export function processScanMatches(cmdline, jobId) {
+  const label = escapeRe(`${CONTAINER_JOB_LABEL}=${jobId}`);
+  return new RegExp(`(?:^|\\s)--label(?:=|\\s+)(["']?)${label}\\1(?=\\s|$)`).test(String(cmdline || ""));
+}
+export function buildWin32ProcessScanScript(jobId) {
+  const needle = `${CONTAINER_JOB_LABEL}=${jobId}`.replace(/'/g, "''");
+  // Prefilter by substring in PowerShell (cheap), print "<pid>\t<name>\t<command line>"; the exact
+  // token match runs in JS (processScanMatches). $PID is this PowerShell; powershell/pwsh are excluded
+  // by name as well (a scanner started by another check of the same job).
+  return `$n = '${needle}'; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ` +
+    "$_.Name -notmatch '^(powershell|pwsh)(\\.exe)?$' -and $_.CommandLine -and $_.CommandLine.Contains($n) } | " +
+    "ForEach-Object { \"$($_.ProcessId)`t$($_.Name)`t$($_.CommandLine -replace '[\\r\\n]', ' ')\" }";
+}
 export function findDockerClientsForJob(jobId, { spawnSync: run = spawnSync, platform = process.platform } = {}) {
-  const needle = `${CONTAINER_JOB_LABEL}=${jobId}`;
   try {
     if (platform === "win32") {
-      const ps = `Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('${needle.replace(/'/g, "''")}') } | ForEach-Object { $_.ProcessId }`;
-      const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+      const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", buildWin32ProcessScanScript(jobId)],
+                    { encoding: "utf8", timeout: 15_000, windowsHide: true });
       if (r.error || r.status !== 0) return null;
-      return String(r.stdout || "").split(/\r?\n/).map((l) => Number(l.trim())).filter((n) => n > 0 && n !== process.pid);
+      const pids = [];
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const m = /^\s*(\d+)\t([^\t]*)\t(.*)$/.exec(line);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        if (!(pid > 0) || pid === process.pid || pid === r.pid || /^(powershell|pwsh)(\.exe)?$/i.test(m[2].trim())) continue;
+        if (processScanMatches(m[3], jobId)) pids.push(pid);
+      }
+      return pids;
     }
     const r = run("ps", ["-eo", "pid=,args="], { encoding: "utf8", timeout: 15_000 });
     if (r.error || r.status !== 0) return null;
     const pids = [];
     for (const line of String(r.stdout || "").split("\n")) {
-      if (!line.includes(needle)) continue;
-      const pid = Number(line.trim().split(/\s+/)[0]);
-      if (pid > 0 && pid !== process.pid) pids.push(pid);
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (!(pid > 0) || pid === process.pid || pid === r.pid) continue;
+      if (processScanMatches(m[2], jobId)) pids.push(pid);
     }
     return pids;
   } catch { return null; }

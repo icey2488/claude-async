@@ -1165,3 +1165,67 @@ test("B1: container preflight writes the machine-wide container-mode marker befo
     assert.match(bad.error, /container-mode marker/);
   } finally { fs.rmSync(path.dirname(marker), { force: true }); }
 });
+
+// ------------------------------------------------------------ review round 3, finding B3 ---
+// The process scan for a job's surviving docker client must match the complete label argument, never
+// its own scanner (the PowerShell command line contains the needle) and never another job whose id
+// merely starts with this one's.
+const B3_ID = "claunker.scan-20261102-abcd1234";
+test("B3: the label matcher takes only the complete --label argument token", () => {
+  const yes = [
+    `"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe" run --rm --name claude-async-${B3_ID} --label claude-async.job=${B3_ID} --init img`,
+    `com.docker.cli.exe run --rm --label claude-async.job=${B3_ID}`,
+    `docker run --label=claude-async.job=${B3_ID} --init`,
+    `docker run --label "claude-async.job=${B3_ID}" --init`,
+  ];
+  for (const l of yes) assert.equal(core.processScanMatches(l, B3_ID), true, l);
+  const no = [
+    // the scanner itself (the old Windows script, and anything quoting the needle)
+    `powershell.exe -NoProfile -NonInteractive -Command Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains('claude-async.job=${B3_ID}') } | ForEach-Object { $_.ProcessId }`,
+    `ps -eo pid=,args= claude-async.job=${B3_ID}`,
+    // a longer job id sharing the prefix
+    `docker run --rm --label claude-async.job=${B3_ID}0 --init img`,
+    `docker run --rm --label claude-async.job=${B3_ID}-retry --init img`,
+    `docker run --rm --label claude-async.job=${B3_ID}.2`,
+    // a label value that merely contains it
+    `docker run --label other=claude-async.job=${B3_ID}`,
+    `docker run --label claude-async.jobx=${B3_ID}`,
+  ];
+  for (const l of no) assert.equal(core.processScanMatches(l, B3_ID), false, l);
+});
+
+test("B3: the Windows scan script excludes its own $PID and PowerShell processes, and prints pid, name and command line", () => {
+  const ps = core.buildWin32ProcessScanScript(B3_ID);
+  assert.match(ps, /\$_\.ProcessId -ne \$PID/);
+  assert.match(ps, /powershell/i); assert.match(ps, /pwsh/i);
+  assert.ok(ps.includes(`claude-async.job=${B3_ID}`));
+  // findDockerClientsForJob on win32 (seamed spawnSync): only the real client survives the JS-side
+  // filter too, even if the script's own line (or a pwsh one) came back
+  const out = [
+    `4242\tpowershell.exe\t${"powershell.exe -NoProfile -Command " + ps}`,
+    `4343\tpwsh.exe\tpwsh -c "... --label claude-async.job=${B3_ID} ..."`,
+    `5000\tdocker.exe\tdocker.exe run --rm --label claude-async.job=${B3_ID} --init img`,
+    `5001\tcom.docker.cli.exe\tcom.docker.cli.exe run --rm --label claude-async.job=${B3_ID} --init img`,
+    `5002\tdocker.exe\tdocker.exe run --rm --label claude-async.job=${B3_ID}9 --init img`,
+  ].join("\r\n") + "\r\n";
+  const calls = [];
+  const run = (cmd, args) => { calls.push([cmd, args]); return { status: 0, stdout: out, pid: 4242 }; };
+  assert.deepEqual(core.findDockerClientsForJob(B3_ID, { spawnSync: run, platform: "win32" }), [5000, 5001]);
+  assert.equal(calls[0][0], "powershell.exe");
+  // nothing matching -> []
+  assert.deepEqual(core.findDockerClientsForJob(B3_ID, { spawnSync: () => ({ status: 0, stdout: "", pid: 1 }), platform: "win32" }), []);
+  // a failed scan stays uncertain
+  assert.equal(core.findDockerClientsForJob(B3_ID, { spawnSync: () => ({ status: 1, stdout: "" }), platform: "win32" }), null);
+});
+
+test("B3: the POSIX scan matches the exact token and excludes the ps process itself", () => {
+  const out = [
+    `  100 ps -eo pid=,args= --label claude-async.job=${B3_ID}`,
+    `  200 docker run --rm --label claude-async.job=${B3_ID} --init img`,
+    `  300 docker run --rm --label claude-async.job=${B3_ID}0 --init img`,
+    `  400 node fake-docker.mjs __creator x --label claude-async.job=${B3_ID}`,
+  ].join("\n");
+  assert.deepEqual(core.findDockerClientsForJob(B3_ID, { spawnSync: () => ({ status: 0, stdout: out, pid: 100 }), platform: "linux" }), [200, 400]);
+  // the real ps on this machine: no such job -> []
+  if (process.platform !== "win32") assert.deepEqual(core.findDockerClientsForJob(`${B3_ID}-nothing-runs-this`), []);
+});
