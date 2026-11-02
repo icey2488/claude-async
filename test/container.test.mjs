@@ -18,6 +18,9 @@ import { fileURLToPath } from "node:url";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "claude-async-container-test-"));
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
+// The machine-wide container-mode marker (review round 3, B1) lives under the user's home; keep this
+// test run's marker in its own home instead of the real one.
+process.env.HOME = process.env.USERPROFILE = path.join(TMP, "home");
 for (const k of ["CLAUDE_ASYNC_JOB_SANDBOX", "CLAUDE_ASYNC_JOB_TOOL_GATE", "CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS",
                  "CLAUDE_ASYNC_DEPTH"]) delete process.env[k];
 after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
@@ -1128,4 +1131,37 @@ test("SECRET_PATTERNS: installation tokens (ghs_) and their base64 forms are red
   assert.equal(leaks(out, basic).length, 0, out);
   assert.equal(leaks(out, raw64).length, 0, out);
   assert.match(out, /^a \[REDACTED\] b Authorization: Basic \[REDACTED\]=* c \[REDACTED\]=* d$/);
+});
+
+// ------------------------------------------------------------ review round 3, finding B1 ---
+test("B1: container preflight writes the machine-wide container-mode marker before the launch; host jobs never do", async () => {
+  const marker = path.join(os.homedir(), ".claude-async", "container-mode");
+  assert.equal(marker, path.join(TMP, "home", ".claude-async", "container-mode"));
+  fs.rmSync(marker, { force: true });
+  const fx = fixture();
+  await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: jid("b1host") },
+    { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]) });
+  assert.ok(!fs.existsSync(marker), "a host job does not mark the machine");
+  // a refused container start (preflight error) does not mark it either
+  const refused = await core.startJob({ prompt: "p", jobId: jid("b1refused"), sandbox: "container", repo: REPO },
+    ctrOpts(fx, { checkGitHubApp: async () => ({ error: "nope" }) }));
+  assert.ok(refused.error);
+  assert.ok(!fs.existsSync(marker));
+  let seenAtLaunch = null;
+  const r = await core.startJob({ prompt: "p", jobId: jid("b1ctr"), sandbox: "container", repo: REPO },
+    ctrOpts(fx, { launch: async (...a) => { seenAtLaunch = fs.existsSync(marker); return fakeLaunch([])(...a); } }));
+  assert.ok(!r.error, r.error);
+  assert.equal(seenAtLaunch, true, "the marker exists before the runner (and so any container) is launched");
+  const body = fs.readFileSync(marker, "utf8");
+  // later container starts keep the original marker
+  await core.startJob({ prompt: "p", jobId: jid("b1ctr2"), sandbox: "container", repo: REPO }, ctrOpts(fx, { launch: fakeLaunch([]) }));
+  assert.equal(fs.readFileSync(marker, "utf8"), body);
+  // a marker that cannot be written refuses the container start (fail closed)
+  fs.rmSync(path.dirname(marker), { recursive: true, force: true });
+  fs.writeFileSync(path.dirname(marker), "not a dir");
+  try {
+    const bad = await core.startJob({ prompt: "p", jobId: jid("b1bad"), sandbox: "container", repo: REPO }, ctrOpts(fx, { launch: fakeLaunch([]) }));
+    assert.equal(bad.errorCode, "preflight");
+    assert.match(bad.error, /container-mode marker/);
+  } finally { fs.rmSync(path.dirname(marker), { force: true }); }
 });

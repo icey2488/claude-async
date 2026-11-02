@@ -204,7 +204,7 @@ if ($res) {
       $hash = $null
       try { $hash = (Get-Content -Raw -ErrorAction Stop $httpJson | ConvertFrom-Json).tokenSha256 } catch {}
       if ($hash -and $hash -match '^[0-9a-fA-F]{64}$') { Pass "$where not reachable now, and $httpJson holds a tokenSha256 (a bridge started later is token-locked)" }
-      else { Fail "$where not reachable now, but $httpJson holds no 64-hex tokenSha256: a bridge started later would be unauthenticated (it refuses to start when container mode is allowed). Run 'node claude-async-http.mjs --new-token'." }
+      else { Fail "$where not reachable now, but $httpJson holds no 64-hex tokenSha256: the bridge refuses to start without it. Run 'node claude-async-http.mjs --new-token'." }
       continue
     }
     if ($v -eq "CLOSED") { Pass "$where not reachable"; continue }

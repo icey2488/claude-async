@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-/** smoke-http.mjs — connect over HTTP(S) and assert 3 tools. URL via CLAUDE_ASYNC_SMOKE_URL. */
+/** smoke-http.mjs — connect over HTTP(S) and assert 3 tools. URL via CLAUDE_ASYNC_SMOKE_URL. The bridge
+ *  requires its bearer token by default (review round 3): pass it in CLAUDE_ASYNC_SMOKE_TOKEN. */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const PORT = Number(process.env.CLAUDE_ASYNC_HTTP_PORT || 7842);
 const url = new URL(process.env.CLAUDE_ASYNC_SMOKE_URL || `http://127.0.0.1:${PORT}/mcp`);
 const client = new Client({ name: "smoke", version: "1.0.0" });
-const transport = new StreamableHTTPClientTransport(url);
+const token = process.env.CLAUDE_ASYNC_SMOKE_TOKEN;
+const transport = new StreamableHTTPClientTransport(url, token ? { requestInit: { headers: { authorization: `Bearer ${token}` } } } : undefined);
 let ok = false;
 try {
   await client.connect(transport);

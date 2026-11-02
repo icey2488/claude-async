@@ -4,7 +4,7 @@
  * without the entrypoint's listen() side effect; claude-async-http.mjs stays a plain script (pm2
  * and Task Scheduler run it as-is).
  *
- * Bearer-token auth (opt-in): when ~/.claude-async/http.json (CLAUDE_ASYNC_CONFIG_DIR-aware) holds
+ * Bearer-token auth: when ~/.claude-async/http.json (CLAUDE_ASYNC_CONFIG_DIR-aware) holds
  * a "tokenSha256", every /mcp request must carry `Authorization: Bearer <token>`; anything else
  * gets a bare 401. Same scheme as host-api.mjs: only the sha256 is stored, compared in constant
  * time. Loopback alone is not a boundary on a host that runs container jobs: Docker Desktop
@@ -12,15 +12,14 @@
  * port and call claude_start with sandbox:"host". Container mode therefore refuses to start unless
  * this file exists and the running bridge answers an unauthenticated request with 401
  * (container.mjs checkHttpBridgeLocked; docs/container-jobs.md "Host loopback services").
- * Without the file the bridge behaves exactly as before on a host that does NOT allow container
- * mode, so an existing client that cannot send a header keeps working there. On a host that allows
- * container mode (CLAUDE_ASYNC_ALLOWED_SANDBOXES includes container, or CLAUDE_ASYNC_JOB_SANDBOX
- * is container) authentication is a STARTUP REQUIREMENT: with no valid token hash the bridge refuses
- * to start (resolveHttpBridgeAuth), because the preflight probe is a one-time check and a bridge
- * (re)started later under a different config dir, or after its token file went missing or bad,
- * would otherwise reopen this host-job endpoint unauthenticated during a running container job.
- * CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is the explicit, logged opt-out for the host-only case
- * and is rejected (refuses startup) whenever container mode is allowed.
+ * Authentication is a STARTUP REQUIREMENT by default (review round 3, B1): with no valid token hash
+ * the bridge refuses to start (resolveHttpBridgeAuth, exit 78). The decision used to depend on this
+ * process's own CLAUDE_ASYNC_ALLOWED_SANDBOXES / CLAUDE_ASYNC_JOB_SANDBOX, so a bridge launched
+ * with another config dir or without those variables while another process ran containers started
+ * unauthenticated. CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is the explicit, loudly logged opt-out,
+ * and it is refused when this process allows container mode OR the machine-wide container-mode
+ * marker (container.mjs containerModeMarkerPath(), a fixed path under the user's home that container
+ * preflight writes and never removes) exists.
  */
 import express from "express";
 import crypto from "node:crypto";
@@ -30,7 +29,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { registerTools } from "./dispatch.mjs";
 import { hashToken, tokenMatches } from "./host-api.mjs";
-import { httpBridgeConfigPath, parseAllowedSandboxes } from "./container.mjs";
+import { httpBridgeConfigPath, parseAllowedSandboxes, containerModeMarkerPath, containerModeMarkerPresent } from "./container.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 
 const HOST = "127.0.0.1";
@@ -97,25 +96,42 @@ export function newHttpToken(file = httpBridgeConfigPath()) {
 }
 
 // Startup policy (see the header). Returns { tokenSha256 } (auth on), { tokenSha256: null, warning }
-// (unauthenticated, allowed only when container mode is not), or { error } (refuse to start).
+// (unauthenticated: only by explicit opt-out on a machine that has never run container jobs), or
+// { error } (refuse to start). Review round 3 (B1): the decision must not rest on THIS process's
+// environment alone, so a token is required by default, and the opt-out is refused while the
+// machine-wide container-mode marker exists (containerModeMarkerPath(): a fixed path under the
+// user's home, written by container preflight, independent of CLAUDE_ASYNC_CONFIG_DIR). The
+// env-based refusal (this process itself allows container mode) stays as well.
 export function resolveHttpBridgeAuth({ tokenSha256 = null, allowedSandboxes = process.env.CLAUDE_ASYNC_ALLOWED_SANDBOXES,
                                         sandboxDefault = process.env.CLAUDE_ASYNC_JOB_SANDBOX,
                                         allowUnauthenticated = process.env.CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED,
-                                        configFile = httpBridgeConfigPath() } = {}) {
+                                        configFile = httpBridgeConfigPath(), markerFile = containerModeMarkerPath() } = {}) {
   if (tokenSha256) return { tokenSha256 };
-  const pol = parseAllowedSandboxes(allowedSandboxes);
-  if (pol.error) return { error: `${pol.error}; refusing to start the HTTP bridge unauthenticated under an invalid sandbox policy. Run \`node claude-async-http.mjs --new-token\` and fix the policy` };
-  const containerAllowed = pol.allowed.includes("container") || sandboxDefault === "container";
   const fix = `Run \`node claude-async-http.mjs --new-token\` (it writes the hash to ${configFile}; this process reads that same path, ` +
-              "so CLAUDE_ASYNC_CONFIG_DIR must match the one the token was minted under), give the token to the bridge's clients, then restart.";
+              "so CLAUDE_ASYNC_CONFIG_DIR must match the one the token was minted under), give the token to the bridge's clients " +
+              "(Authorization: Bearer <token>), then restart.";
+  const pol = parseAllowedSandboxes(allowedSandboxes);
+  if (pol.error) return { error: `${pol.error}; refusing to start the HTTP bridge unauthenticated under an invalid sandbox policy. ${fix}` };
+  const containerAllowed = pol.allowed.includes("container") || sandboxDefault === "container";
+  const optedOut = allowUnauthenticated === "1";
   if (containerAllowed) {
-    const optOut = allowUnauthenticated === "1" ? " CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is set but is not honoured while container mode is allowed." : "";
+    const optOut = optedOut ? " CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is set but is not honoured while container mode is allowed." : "";
     return { error: `this host allows container jobs (CLAUDE_ASYNC_ALLOWED_SANDBOXES=${JSON.stringify(allowedSandboxes ?? "")}` +
       `${sandboxDefault === "container" ? ", CLAUDE_ASYNC_JOB_SANDBOX=container" : ""}) but ${configFile} holds no valid tokenSha256, so the ` +
       "loopback HTTP MCP bridge would start UNAUTHENTICATED and a container could start host jobs through it. Refusing to start." + optOut + " " + fix };
   }
-  if (allowUnauthenticated === "1") {
-    return { tokenSha256: null, warning: `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1: starting unauthenticated by explicit opt-out (${configFile} holds no token hash; container mode is not allowed on this host)` };
+  if (containerModeMarkerPresent(markerFile)) {
+    return { error: `this machine has run container jobs (the container-mode marker ${markerFile} exists), and ${configFile} holds no valid ` +
+      "tokenSha256. A container can reach this loopback port through host.docker.internal and start host jobs, so the bridge never " +
+      "starts unauthenticated on this machine, whatever this process's own CLAUDE_ASYNC_* environment says" +
+      (optedOut ? " (CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is refused while the marker exists)" : "") + ". Refusing to start. " + fix +
+      " The marker is removed only by hand, after container mode is turned off (docs/container-jobs.md, Rollback)." };
   }
-  return { tokenSha256: null, warning: `no token hash in ${configFile}: starting unauthenticated (container mode is not allowed on this host, so this is the pre-existing loopback behaviour). ${fix}` };
+  if (!optedOut) {
+    return { error: `a bearer token is required: ${configFile} holds no valid tokenSha256. Since review round 3 the bridge no longer ` +
+      "starts unauthenticated by default (a container on this machine could otherwise start host jobs through it). Refusing to start. " + fix +
+      ` To run unauthenticated on a machine that has never run container jobs, set CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 (refused once ${markerFile} exists).` };
+  }
+  return { tokenSha256: null, warning: `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1: starting UNAUTHENTICATED by explicit opt-out. Anything that can ` +
+    `reach 127.0.0.1 on this port can start host jobs. ${configFile} holds no token hash; no container-mode marker at ${markerFile}. ${fix}` };
 }

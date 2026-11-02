@@ -119,11 +119,12 @@ test("A2: resolveHttpBridgeAuth: no valid token hash refuses startup whenever co
     const r2 = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowUnauthenticated: "1", ...pol });
     assert.match(r2.error, /CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED/, "the opt-out is named and rejected");
   }
-  // host-only policy, no token: pre-existing unauthenticated behaviour, with a warning
-  const host = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: undefined });
-  assert.equal(host.tokenSha256, null);
-  assert.match(host.warning, /unauthenticated/);
-  const optOut = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: "host", allowUnauthenticated: "1" });
+  // host-only policy, no token: since round 3 (B1) a refusal too (a token is required by default);
+  // only the explicit opt-out on a machine without the container-mode marker starts unauthenticated
+  const noMarker = path.join(TMP, "a2-no-marker");
+  const host = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: undefined, markerFile: noMarker });
+  assert.match(host.error, /token is required/);
+  const optOut = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: "host", allowUnauthenticated: "1", markerFile: noMarker });
   assert.equal(optOut.tokenSha256, null);
   assert.match(optOut.warning, /CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED/);
   // an invalid policy value refuses too (the bridge would refuse every start anyway)
@@ -149,9 +150,12 @@ test("A2: the bridge script refuses to start unauthenticated when container mode
     assert.match(r.out, /--new-token/, `${label}: points at --new-token: ${r.out}`);
     assert.ok(!r.out.includes("listening"), label);
   }
-  // host-only policy and no token: starts, unauthenticated, exactly as before
+  // host-only policy and no token: since round 3 (B1) it starts unauthenticated only with the explicit
+  // opt-out (and no container-mode marker under its home; see the B1 tests)
   const port = await freePort();
-  const r = await startBridge({ CLAUDE_ASYNC_CONFIG_DIR: none, CLAUDE_ASYNC_HTTP_PORT: String(port), CLAUDE_ASYNC_ALLOWED_SANDBOXES: "host" });
+  const home = path.join(TMP, "a2-home"); fs.mkdirSync(home, { recursive: true });
+  const r = await startBridge({ CLAUDE_ASYNC_CONFIG_DIR: none, CLAUDE_ASYNC_HTTP_PORT: String(port), CLAUDE_ASYNC_ALLOWED_SANDBOXES: "host",
+                                CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED: "1", HOME: home, USERPROFILE: home });
   try {
     assert.equal(r.listening, true, r.out);
     assert.match(r.out, /no token: unauthenticated loopback/);
@@ -215,4 +219,104 @@ test("A2: checkHttpBridgeLocked probes with https when the bridge is configured 
   // the config carries the flag from the same env the bridge reads
   assert.equal(c.loadContainerConfig({ CLAUDE_ASYNC_TLS_CERT: "c", CLAUDE_ASYNC_TLS_KEY: "k" }).httpBridgeTls, true);
   assert.equal(c.loadContainerConfig({}).httpBridgeTls, false);
+});
+
+// ------------------------------------------------------------ review round 3, finding B1 ---
+// The bridge's startup policy must not depend on ITS OWN process environment: a bridge launched with
+// another config dir and no sandbox variables while another process runs containers would otherwise
+// start unauthenticated. Now: a token is required by default; the explicit opt-out
+// CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is refused whenever the machine-wide container-mode
+// marker exists (a fixed path under the user's home, independent of CLAUDE_ASYNC_CONFIG_DIR), which
+// container preflight writes before any container launches and never removes.
+const homeWith = (label, marker) => {
+  const home = path.join(TMP, `b1-home-${label}`);
+  fs.mkdirSync(home, { recursive: true });
+  if (marker) { fs.mkdirSync(path.join(home, ".claude-async"), { recursive: true }); fs.writeFileSync(path.join(home, ".claude-async", "container-mode"), "{}\n"); }
+  return home;
+};
+const b1Env = (home, extra = {}) => {
+  const env = { HOME: home, USERPROFILE: home, CLAUDE_ASYNC_CONFIG_DIR: path.join(TMP, `b1-cfg-${crypto.randomUUID()}`), ...extra };
+  return env;
+};
+import crypto from "node:crypto";
+const unsetSandboxEnv = () => {
+  const saved = {};
+  for (const k of ["CLAUDE_ASYNC_ALLOWED_SANDBOXES", "CLAUDE_ASYNC_JOB_SANDBOX", "CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED"]) { saved[k] = process.env[k]; delete process.env[k]; }
+  return saved;
+};
+
+test("B1: containerModeMarkerPath is under the user's home and ignores CLAUDE_ASYNC_CONFIG_DIR", () => {
+  const p = c.containerModeMarkerPath();
+  assert.equal(p, path.join(os.homedir(), ".claude-async", "container-mode"));
+  assert.ok(!p.startsWith(process.env.CLAUDE_ASYNC_CONFIG_DIR), "not under the configured config dir");
+});
+
+test("B1: resolveHttpBridgeAuth: no token and no opt-out refuses by default; the opt-out is refused while the marker exists", () => {
+  const none = path.join(TMP, "b1-no-marker");
+  const marker = path.join(TMP, "b1-marker"); fs.writeFileSync(marker, "{}\n");
+  const def = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: undefined, markerFile: none });
+  assert.match(def.error || "", /token is required/i, JSON.stringify(def));
+  assert.match(def.error, /--new-token/);
+  assert.match(def.error, /CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1/, "names the opt-out");
+  const withMarker = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: undefined, allowUnauthenticated: "1", markerFile: marker });
+  assert.match(withMarker.error || "", /container-mode/, JSON.stringify(withMarker));
+  const optOut = bridge.resolveHttpBridgeAuth({ tokenSha256: null, allowedSandboxes: undefined, allowUnauthenticated: "1", markerFile: none });
+  assert.equal(optOut.tokenSha256, null);
+  assert.match(optOut.warning, /starting UNAUTHENTICATED/);
+  // a token always wins, marker or not
+  assert.deepEqual(bridge.resolveHttpBridgeAuth({ tokenSha256: hashToken(TOKEN), markerFile: marker }), { tokenSha256: hashToken(TOKEN) });
+  // an unreadable marker location (not ENOENT) counts as present: fail closed
+  const weird = path.join(marker, "child"); // ENOTDIR
+  assert.equal(c.containerModeMarkerPresent(weird), true);
+  assert.equal(c.containerModeMarkerPresent(none), false);
+});
+
+test("B1: the bridge script with no token and no opt-out refuses before listening", async () => {
+  const port = await freePort();
+  const saved = unsetSandboxEnv();
+  try {
+    const r = await startBridge(b1Env(homeWith("default", false), { CLAUDE_ASYNC_HTTP_PORT: String(port) }));
+    if (r.listening) r.kill();
+    assert.equal(r.listening, undefined, `must not listen: ${r.out}`);
+    assert.equal(r.code, 78);
+    assert.match(r.out, /token is required/i);
+  } finally { Object.assign(process.env, Object.fromEntries(Object.entries(saved).filter(([, v]) => v !== undefined))); }
+});
+
+test("B1 (reviewer's scenario): empty config dir, no sandbox env, container-mode marker present: refuses before listening, even with the opt-out", async () => {
+  const saved = unsetSandboxEnv();
+  try {
+    for (const optOut of [false, true]) {
+      const port = await freePort();
+      const r = await startBridge(b1Env(homeWith(`marker-${optOut}`, true),
+        { CLAUDE_ASYNC_HTTP_PORT: String(port), ...(optOut ? { CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED: "1" } : {}) }));
+      if (r.listening) r.kill();
+      assert.equal(r.listening, undefined, `optOut=${optOut}: must not listen: ${r.out}`);
+      assert.equal(r.code, 78);
+      assert.match(r.out, /container-mode/);
+    }
+  } finally { Object.assign(process.env, Object.fromEntries(Object.entries(saved).filter(([, v]) => v !== undefined))); }
+});
+
+test("B1: the opt-out with no marker starts unauthenticated, with a loud warning", async () => {
+  const saved = unsetSandboxEnv();
+  const port = await freePort();
+  const r = await startBridge(b1Env(homeWith("optout", false), { CLAUDE_ASYNC_HTTP_PORT: String(port), CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED: "1" }));
+  try {
+    assert.equal(r.listening, true, r.out);
+    assert.match(r.out, /WARNING: .*starting UNAUTHENTICATED/);
+    const h = await (await fetch(`http://127.0.0.1:${port}/healthz`)).json();
+    assert.equal(h.auth, false);
+  } finally { if (r.kill) r.kill(); Object.assign(process.env, Object.fromEntries(Object.entries(saved).filter(([, v]) => v !== undefined))); }
+});
+
+test("B1: writeContainerModeMarker creates the marker atomically and keeps an existing one", () => {
+  const dir = path.join(TMP, "b1-write", ".claude-async");
+  const file = path.join(dir, "container-mode");
+  assert.deepEqual(c.writeContainerModeMarker(file), { ok: true, created: true });
+  const first = fs.readFileSync(file, "utf8");
+  assert.match(first, /container mode/i);
+  assert.deepEqual(c.writeContainerModeMarker(file), { ok: true, created: false });
+  assert.equal(fs.readFileSync(file, "utf8"), first, "never rewritten");
+  assert.deepEqual(fs.readdirSync(dir), ["container-mode"], "no temp file left behind");
 });

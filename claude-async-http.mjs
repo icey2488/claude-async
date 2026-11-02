@@ -6,11 +6,13 @@
  * server. Register in the app's Connectors UI as: http://127.0.0.1:<port>/mcp
  * (this deployment runs plain HTTP — no TLS cert/key are set; see ecosystem.config.cjs)
  * Security: binds to 127.0.0.1 ONLY + DNS-rebinding protection scoped to loopback, plus
- * bearer-token auth from ~/.claude-async/http.json (see http-bridge.mjs). On a host that allows
+ * bearer-token auth from ~/.claude-async/http.json (see http-bridge.mjs). The token is REQUIRED by
+ * default: with no valid hash this script refuses to start (exit 78). The only way to run without
+ * one is CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1, which is refused when this process allows
  * container jobs (CLAUDE_ASYNC_ALLOWED_SANDBOXES includes container, or CLAUDE_ASYNC_JOB_SANDBOX is
- * container) the token is REQUIRED: this script refuses to start without a valid hash (exit 78),
- * and CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1 is rejected there. On a host-only policy a missing
- * hash still starts the bridge unauthenticated, as before, with a warning on stdout.
+ * container) and when the machine-wide container-mode marker (~/.claude-async/container-mode, fixed
+ * under the user's home whatever CLAUDE_ASYNC_CONFIG_DIR says) exists; when honoured it prints a
+ * WARNING on stdout and stderr.
  * Env: CLAUDE_ASYNC_HTTP_PORT (default 7842), CLAUDE_ASYNC_TLS_CERT, CLAUDE_ASYNC_TLS_KEY,
  *      CLAUDE_ASYNC_ALLOWED_SANDBOXES, CLAUDE_ASYNC_JOB_SANDBOX, CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED.
  *   node claude-async-http.mjs --new-token   mint a token, store its hash in http.json, print it ONCE
@@ -42,7 +44,11 @@ if (auth.error) {
   console.error(`claude-async-http: refusing to start: ${auth.error}`);
   process.exit(78);
 }
-if (auth.warning) console.log(`claude-async-http: WARNING: ${auth.warning}`);
+if (auth.warning) {
+  const line = `claude-async-http: WARNING: ${auth.warning}`;
+  console.log(line);
+  console.error(line);
+}
 const tokenSha256 = auth.tokenSha256;
 const app = createHttpApp({ port: PORT, tokenSha256 });
 

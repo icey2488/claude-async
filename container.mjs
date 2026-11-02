@@ -32,6 +32,7 @@
  * leaves the host; checkEnvFile() returns key names only. Docker reads the env file itself
  * (--env-file).
  */
+import crypto from "node:crypto";
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
@@ -734,6 +735,45 @@ export function extractPrUrl(lines, repo) {
 // refuses.
 export function httpBridgeConfigPath(env = process.env) {
   return path.join(env.CLAUDE_ASYNC_CONFIG_DIR || path.join(os.homedir(), ".claude-async"), "http.json");
+}
+
+// The machine-wide container-mode marker (review round 3, B1). Its existence says "this machine has
+// run container jobs": the HTTP bridge then refuses to start unauthenticated whatever its own
+// environment says. The path is fixed under the user's home (%USERPROFILE% on win32) and does NOT
+// follow CLAUDE_ASYNC_CONFIG_DIR, so a bridge started with a different config dir or without the
+// sandbox variables still finds it. Container preflight (job-core startJob) writes it before any
+// container launches; nothing in the code ever removes it. Removing it is a deliberate owner action,
+// after container mode is turned off (docs/container-jobs.md, "Rollback").
+export function containerModeMarkerPath(home = os.homedir()) {
+  return path.join(home, ".claude-async", "container-mode");
+}
+
+// Present unless the path is definitely absent (ENOENT). Any other error (a path component that is
+// a file, permissions) counts as present: fail closed.
+export function containerModeMarkerPresent(file = containerModeMarkerPath()) {
+  try { fs.lstatSync(file); return true; }
+  catch (e) { return e.code !== "ENOENT"; }
+}
+
+// Creates the marker if it is missing: written to a temp file and hard-linked into place, so the
+// marker is never seen half-written and an existing one is never replaced. Returns { ok, created }
+// or { error }.
+export function writeContainerModeMarker(file = containerModeMarkerPath()) {
+  try {
+    if (fs.existsSync(file)) return { ok: true, created: false };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const tmp = `${file}.tmp-${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+    const body = `${JSON.stringify({ createdAt: new Date().toISOString(), pid: process.pid,
+      note: "claude-async container mode has been used on this machine; the HTTP bridge (127.0.0.1:7842) now refuses to start without its token. " +
+            "Delete this file only after container mode is disabled (docs/container-jobs.md, Rollback)." })}\n`;
+    fs.writeFileSync(tmp, body, { flag: "wx" });
+    try { fs.linkSync(tmp, file); }
+    catch (e) { if (e.code !== "EEXIST") throw e; return { ok: true, created: false }; }
+    finally { try { fs.unlinkSync(tmp); } catch {} }
+    return { ok: true, created: true };
+  } catch (e) {
+    return { error: `could not write the container-mode marker ${file} (${e.code || e.message}); container jobs need it so the HTTP bridge can never start unauthenticated on this machine` };
+  }
 }
 
 export function readHttpBridgeTokenHash(file) {

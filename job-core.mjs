@@ -27,7 +27,8 @@ import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentSt
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues, readTokenFileSecretValues,
-         redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME } from "./container.mjs";
+         redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME,
+         writeContainerModeMarker, containerModeMarkerPath } from "./container.mjs";
 import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
@@ -1001,6 +1002,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     const ga = planned.plan.githubApp;
     const app = await (opts.checkGitHubApp || preflightGitHubApp)({ appId: ga.appId, keyFile: ga.keyFile, repo: planned.plan.repo, apiBase: ga.apiBase });
     if (app.error) return fail("preflight", `preflight failed on ${hostLabel}: ${app.error}`);
+    // Review round 3 (B1): mark the machine as one that runs container jobs, before any container can
+    // launch. The HTTP bridge refuses to start unauthenticated while this marker exists, whatever its
+    // own environment or config dir (container.mjs containerModeMarkerPath). Never removed here.
+    const mk = writeContainerModeMarker(opts.containerModeMarker || containerModeMarkerPath());
+    if (mk.error) return fail("preflight", `preflight failed on ${hostLabel}: ${mk.error}`);
     // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
     containerPlan = { ...planned.plan, imageId: img.imageId, ...resolveGitIdentity(pc, app),
                       githubApp: { ...ga, installationId: app.installationId, slug: app.slug, botUserId: app.botUserId } };
