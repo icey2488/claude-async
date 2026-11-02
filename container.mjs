@@ -30,6 +30,7 @@
  */
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -84,6 +85,7 @@ const DEFAULTS = Object.freeze({
   pidsLimit: "1024",
   network: "bridge",
   ollamaUrl: "http://host.docker.internal:11434",
+  httpBridgePort: 7842,
 });
 
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$/;
@@ -184,6 +186,10 @@ export function loadContainerConfig(env = process.env) {
       ? Number(env.CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS) : DEFAULT_MAX_RUNTIME_MS,
     // Phase 2 egress allowlist (docs/container-jobs.md): an HTTP proxy reachable on the job network.
     egressProxy: env.CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY || null,
+    // The loopback HTTP MCP bridge (claude-async-http.mjs). Container mode refuses to start unless
+    // it is token-locked; see checkHttpBridgeLocked().
+    httpBridgePort: Number(env.CLAUDE_ASYNC_HTTP_PORT || DEFAULTS.httpBridgePort),
+    httpBridgeConfig: httpBridgeConfigPath(env),
   };
 }
 
@@ -594,4 +600,56 @@ export function extractPrUrl(lines, repo) {
     }
   }
   return found;
+}
+
+// ------------------------------------------------------------------ host loopback bridge ---
+
+// claude-async-http.mjs (the loopback HTTP MCP bridge, 127.0.0.1:7842) can start sandbox:"host"
+// jobs, and Docker Desktop forwards host.docker.internal to the Windows host's 127.0.0.1 -- the
+// same path that makes host Ollama reachable. So container mode refuses to start unless the bridge
+// is token-locked: its config file holds a token hash (the bridge then refuses unauthenticated
+// requests, from the next time it starts), AND whatever is listening on the port right now answers
+// an unauthenticated MCP request with 401. Fail-closed: no file, a bad file, or any other answer
+// refuses.
+export function httpBridgeConfigPath(env = process.env) {
+  return path.join(env.CLAUDE_ASYNC_CONFIG_DIR || path.join(os.homedir(), ".claude-async"), "http.json");
+}
+
+export function readHttpBridgeTokenHash(file) {
+  try {
+    const j = JSON.parse(fs.readFileSync(file, "utf8"));
+    const h = j && typeof j === "object" ? String(j.tokenSha256 || "") : "";
+    return /^[0-9a-f]{64}$/i.test(h) ? h.toLowerCase() : null;
+  } catch { return null; }
+}
+
+export async function checkHttpBridgeLocked({ port, configFile, host = "127.0.0.1", timeoutMs = 3000,
+                                              request = http.request } = {}) {
+  if (!readHttpBridgeTokenHash(configFile)) {
+    return { error: `the loopback HTTP MCP bridge is not token-locked (${configFile} has no tokenSha256). A container ` +
+      `can reach 127.0.0.1:${port} through host.docker.internal and start an unsandboxed host job there. Run ` +
+      "`node claude-async-http.mjs --new-token` (and restart the bridge), or see docs/container-jobs.md \"Host loopback services\"" };
+  }
+  const status = await new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    let req;
+    try {
+      req = request({ host, port, method: "POST", path: "/mcp", timeout: timeoutMs,
+                      headers: { "content-type": "application/json", accept: "application/json, text/event-stream",
+                                 "content-length": Buffer.byteLength(body), host: `${host}:${port}` } }, (res) => {
+        res.resume();
+        done({ status: res.statusCode });
+      });
+    } catch (e) { done({ error: e.message }); return; }
+    req.on("timeout", () => { req.destroy(); done({ error: "timeout" }); });
+    req.on("error", (e) => done(e.code === "ECONNREFUSED" ? { refused: true } : { error: e.code || e.message }));
+    req.end(body);
+  });
+  if (status.refused) return { ok: true, listening: false };
+  if (status.status === 401) return { ok: true, listening: true };
+  return { error: `something on 127.0.0.1:${port} answered an unauthenticated MCP request with ` +
+    `${status.status !== undefined ? `HTTP ${status.status}` : status.error}, not 401; restart the HTTP bridge so it ` +
+    "enforces its token (or stop it) before running container jobs" };
 }

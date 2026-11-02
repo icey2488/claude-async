@@ -326,6 +326,13 @@ test("planContainerJob: a missing CLAUDE.md or hooks dir is an error, not a thro
   assert.match(c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, hooksDir: path.join(fx.base, "nohooks") }, resolveBin: (b) => b }).error, /hooks dir/);
 });
 
+test("loadContainerConfig: the HTTP bridge lock check uses CLAUDE_ASYNC_HTTP_PORT and the config dir's http.json", () => {
+  const cfg = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_HTTP_PORT: "7999", CLAUDE_ASYNC_CONFIG_DIR: "/cfgdir" });
+  assert.equal(cfg.httpBridgePort, 7999);
+  assert.equal(cfg.httpBridgeConfig, path.join("/cfgdir", "http.json"));
+  assert.equal(c.loadContainerConfig(BOT).httpBridgePort, 7842);
+});
+
 test("the removed host-mount machinery is gone (no workFolder validation, no allowed roots, no .git audit)", () => {
   for (const name of ["validateWorkFolder", "auditRepoGitState"]) assert.equal(c[name], undefined, name);
   const cfg = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS: "D:\\code" });
@@ -522,7 +529,8 @@ function fakeLaunch(capture) {
 const CAPS = { maxConcurrent: 1000, maxStartsPerMinute: 1000 };
 const jid = (s) => `${s}-${crypto.randomBytes(4).toString("hex")}`;
 // Container-mode startJob seams shared by the tests below.
-const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, allowedSandboxes: BOTH, containerConfig: { ...fx.cfg, dockerBin: process.execPath },
+const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, allowedSandboxes: BOTH, checkHttpBridge: async () => ({ ok: true }),
+                                       containerConfig: { ...fx.cfg, dockerBin: process.execPath },
                                        checkImage: () => ({ ok: true, imageId: `sha256:${"ab".repeat(32)}` }), ...extra });
 
 test("startJob: with container mode off (default), argv/command/env are what they were before container mode", async () => {
@@ -676,12 +684,13 @@ test("startJob: container preflight refusals happen before the job dir exists", 
     [{}, { cfg: { gitName: null } }, /GIT_NAME/],
     [{}, { image: () => ({ error: "docker image claude-async-job:local is not built on this host" }) }, /not built/],
     [{}, { cfg: { dockerBin: path.join(fx.base, "no-docker.exe") } }, /docker binary/],
+    [{}, { bridge: async () => ({ error: "the loopback HTTP MCP bridge is not token-locked" }) }, /not token-locked/],
   ];
   for (const [args, o, re] of cases) {
     const id = jid("pf");
     const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO, ...args },
       ctrOpts(fx, { launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: process.execPath, ...(o.cfg || {}) },
-                    ...(o.image ? { checkImage: o.image } : {}) }));
+                    ...(o.image ? { checkImage: o.image } : {}), ...(o.bridge ? { checkHttpBridge: o.bridge } : {}) }));
     assert.equal(r.errorCode, "preflight", JSON.stringify(r));
     assert.match(r.error, re);
     assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)), "no job dir on refusal");

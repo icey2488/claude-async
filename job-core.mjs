@@ -27,7 +27,7 @@ import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentSt
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues,
-         redactSecrets } from "./container.mjs";
+         redactSecrets, checkHttpBridgeLocked } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -942,7 +942,8 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // for the post-launch meta.json write, see writeNewMeta()). Container-mode seams (tests only):
 // sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), allowedSandboxes (replaces
 // CLAUDE_ASYNC_ALLOWED_SANDBOXES), containerConfig (replaces
-// loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight).
+// loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight), checkHttpBridge
+// (replaces the loopback-bridge lock check).
 // repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
 // start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
@@ -971,6 +972,11 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
     const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
     if (img.error) return fail("preflight", `preflight failed on ${hostLabel}: ${img.error}`);
+    // The loopback HTTP MCP bridge must be token-locked: a container reaches the host's 127.0.0.1
+    // through host.docker.internal and could otherwise start an unsandboxed host job there.
+    const pc = planned.plan.cfg;
+    const br = await (opts.checkHttpBridge || checkHttpBridgeLocked)({ port: pc.httpBridgePort, configFile: pc.httpBridgeConfig });
+    if (br.error) return fail("preflight", `preflight failed on ${hostLabel}: ${br.error}`);
     // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
     containerPlan = { ...planned.plan, imageId: img.imageId };
   }
