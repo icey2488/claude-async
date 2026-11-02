@@ -596,7 +596,7 @@ test("runner lock: a second runner for the same job dir exits without running do
   assert.ok(await waitFor(() => j.containerExists()));
   const lock = path.join(j.dir, "runner.lock");
   assert.ok(fs.existsSync(lock), "runner.lock exists while the runner runs");
-  assert.equal(Number(fs.readFileSync(lock, "utf8")), a.pid);
+  assert.equal(Number(fs.readFileSync(lock, "utf8").split("\n")[0]), a.pid, "runner.lock holds the owner's pid on its first line (then a nonce)");
   const b = runSync(j);
   assert.equal(b.status, 3, `the duplicate exits 3: ${b.stderr}`);
   assert.equal(j.calls().filter((x) => x[0] === "run").length, 1, "exactly one docker run");

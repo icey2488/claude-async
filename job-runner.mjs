@@ -27,8 +27,8 @@
  * still alive. Lets job-core.mjs's checkJob() (and a human reading the job dir after the fact)
  * see whether a runner was ever re-absorbed into a job mid-flight, not just at launch.
  *
- * runner.lock: created with O_EXCL as the very first act, holding this pid; a second runner for the
- * same job dir exits 3 (a stale lock from a dead runner is taken over). One runner per job dir.
+ * runner.lock: taken as the very first act (runner-lock.mjs: published complete with link(2), stale
+ * takeover by verified rename); a second runner for the same job dir exits 3. One runner per job dir.
  *
  * runner.pid: writes its own process.pid to the job dir before doing anything else. On win32,
  * job-core.mjs's launch() may spawn us indirectly through a PowerShell/CreateProcessW shell-out
@@ -105,6 +105,7 @@ import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from
 import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
          redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER } from "./container.mjs";
 import { createMinter } from "./github-app.mjs";
+import { acquireRunnerLock } from "./runner-lock.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -114,30 +115,26 @@ if (pidWriteDelayMs > 0) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pidWriteDelayMs);
 }
 
-// Runner exclusivity (review round 2): exactly one runner per job dir. runner.lock is created with
-// O_EXCL and holds our pid; a second runner for the same spec (a retried launch, a scheduler
-// re-fire, an operator running the spec by hand) finds it and exits 3 before touching docker, the
-// logs or exit.json. A lock whose pid is dead (a runner that was TerminateProcess'ed) is stale and
-// is taken over, since the job dir's next occupant is the retry. win32 pid reuse: a live pid that
-// is not a node/claude process is treated as stale too (same rule as job-core's isOurProcess).
+// Runner exclusivity (review rounds 2 and 3): exactly one runner per job dir. runner.lock holds
+// "<pid>\n<nonce>\n" and is published fully initialised in one step (temp file + link, which fails
+// with EEXIST when the lock exists); a stale lock (dead pid, or on win32 a pid reused by a non-node
+// process, same rule as job-core's isOurProcess; or an empty/unparsable lock older than a few
+// seconds) is taken over only through a verified rename, so two runners can never both proceed. A
+// second runner for the same spec (a retried launch, a scheduler re-fire, an operator running the
+// spec by hand) exits 3 before touching docker, the logs or exit.json. See runner-lock.mjs.
 {
   const lockPath = path.join(path.dirname(specPath), "runner.lock");
-  const takeLock = () => { const fd = fs.openSync(lockPath, "wx"); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); };
-  try { takeLock(); }
-  catch (e) {
-    if (e.code !== "EEXIST") throw e;
-    let holder = null;
-    try { holder = Number(fs.readFileSync(lockPath, "utf8").trim()) || null; } catch {}
-    const live = holder !== null && holder !== process.pid && pidAlive(holder) && isOurProcess(holder);
-    const note = (msg) => { try { fs.appendFileSync(path.join(path.dirname(specPath), "err.log"), `\n[job-runner] ${msg}\n`); } catch {} };
-    if (live) {
-      note(`another runner (pid ${holder}) owns this job dir (runner.lock); this runner (pid ${process.pid}) exits without starting anything`);
-      process.exit(3);
-    }
-    note(`stale runner.lock (pid ${holder === null ? "unreadable" : holder}, not alive); taken over by pid ${process.pid}`);
-    try { fs.unlinkSync(lockPath); takeLock(); }
-    catch (e2) { if (e2.code === "EEXIST") { note("lost the race for runner.lock; exiting"); process.exit(3); } throw e2; }
+  const note = (msg) => { try { fs.appendFileSync(path.join(path.dirname(specPath), "err.log"), `\n[job-runner] ${msg}\n`); } catch {} };
+  const r = acquireRunnerLock(lockPath, { isLive: (pid) => pidAlive(pid) && isOurProcess(pid) });
+  if (!r.acquired) {
+    note(r.reason === "held"
+      ? `another runner (pid ${r.holder}) owns this job dir (runner.lock); this runner (pid ${process.pid}) exits without starting anything`
+      : r.reason === "initialising"
+        ? `runner.lock exists but is still being written by another runner; this runner (pid ${process.pid}) exits without starting anything`
+        : `lost the race for runner.lock (${r.reason}${r.holder ? `, now held by pid ${r.holder}` : ""}); this runner (pid ${process.pid}) exits`);
+    process.exit(3);
   }
+  if (r.tookOverFrom !== undefined) note(`stale runner.lock (pid ${r.tookOverFrom === null ? "unreadable" : r.tookOverFrom}, not alive); taken over by pid ${process.pid}`);
 }
 
 // Written before anything else that could fail. On win32 the runner may be launched via the
