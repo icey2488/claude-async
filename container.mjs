@@ -166,9 +166,11 @@ export function validateContainerConfig(cfg) {
 // realpath that also resolves Windows junctions (fs.realpathSync.native does; the JS fallback
 // does not) and strips a \\?\ long-path prefix so path.win32 math and Docker both see a plain
 // drive path.
+export function stripLongPathPrefix(r) {
+  return typeof r === "string" && r.startsWith("\\\\?\\") && !r.startsWith("\\\\?\\UNC\\") ? r.slice(4) : r;
+}
 function defaultRealpath(p) {
-  const r = fs.realpathSync.native(p);
-  return r.startsWith("\\\\?\\") && !r.startsWith("\\\\?\\UNC\\") ? r.slice(4) : r;
+  return stripLongPathPrefix(fs.realpathSync.native(p));
 }
 
 // Host path -> the `source=` value of a --mount flag. Docker Desktop accepts D:/code/x for a
@@ -192,8 +194,10 @@ export function toDockerMountSource(p, platform = process.platform) {
 // root, which would mount every repo under it -- must not overlap a denied root in either direction,
 // and must be a git top-level with a real .git DIRECTORY: a linked worktree's .git file points at a
 // git dir outside the mount, so git inside the container would not work. Returns { real } or { error }.
+// realpath / fsImpl are test seams (fsImpl: statSync + lstatSync), so the win32 path logic can be
+// exercised on any OS.
 export function validateWorkFolder(workFolder, { allowedRoots, deniedRoots = [], platform = process.platform,
-                                                 realpath = defaultRealpath } = {}) {
+                                                 realpath = defaultRealpath, fsImpl = fs } = {}) {
   const pm = platform === "win32" ? path.win32 : path.posix;
   if (typeof workFolder !== "string" || !workFolder) return { error: "workFolder is required for a container job" };
   if (!pm.isAbsolute(workFolder)) return { error: `workFolder ${JSON.stringify(workFolder)} must be an absolute path for a container job` };
@@ -203,7 +207,7 @@ export function validateWorkFolder(workFolder, { allowedRoots, deniedRoots = [],
   const real = rp(workFolder);
   if (!real) return { error: `workFolder ${JSON.stringify(workFolder)} does not exist` };
   let isDir = false;
-  try { isDir = fs.statSync(real).isDirectory(); } catch {}
+  try { isDir = fsImpl.statSync(real).isDirectory(); } catch {}
   if (!isDir) return { error: `workFolder ${JSON.stringify(workFolder)} is not a directory` };
   const inside = roots.find((r) => isInside(r, real, platform));
   if (!inside) return { error: `workFolder ${real} (realpath of ${workFolder}) is outside the container allowed roots (${roots.join(", ")})` };
@@ -215,7 +219,7 @@ export function validateWorkFolder(workFolder, { allowedRoots, deniedRoots = [],
     }
   }
   let gitStat = null;
-  try { gitStat = fs.lstatSync(pm.join(real, ".git")); } catch {}
+  try { gitStat = fsImpl.lstatSync(pm.join(real, ".git")); } catch {}
   if (!gitStat) return { error: `workFolder ${real} is not a git repository top-level (no .git); container jobs mount exactly one repo` };
   if (!gitStat.isDirectory()) return { error: `workFolder ${real} has a .git FILE (a linked worktree or submodule) whose git dir is outside the mount; use a full clone` };
   return { real };
