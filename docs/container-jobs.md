@@ -3,10 +3,13 @@
 Container jobs run the Claude Code CLI inside a Docker container on claunker instead of on the bare
 Windows host. A container job gets a full shell and runs with `--dangerously-skip-permissions`. It
 names a GitHub repo; the container clones that repo itself, works in container-local storage,
-pushes a branch and opens a PR as a dedicated GitHub machine account (the bot), never as Erick.
-**No host folder is mounted read-write.** Nothing the job writes reaches the host disk except the
-runner's captured stdout/stderr. `main` requires a PR with the owner's approval: the bot opens PRs,
-Erick approves and merges them, and the bot cannot push to or merge into `main`.
+pushes a branch and opens a PR as a **GitHub App** owned by Erick's account and installed only on
+the repos jobs may touch, never as Erick himself. The host mints a one-hour installation token
+scoped to that one repo per job and hands it to the container as a file; there is no bot account
+and no long-lived GitHub token anywhere. **No host folder is mounted read-write.** Nothing the job
+writes reaches the host disk except the runner's captured stdout/stderr. `main` requires a PR with
+the owner's approval: the App opens PRs, Erick approves and merges them, and the App cannot push to
+or merge into `main`.
 
 Container mode is **opt-in, off by default, and gated twice**: the call (or
 `CLAUDE_ASYNC_JOB_SANDBOX`) must ask for it, and the host policy `CLAUDE_ASYNC_ALLOWED_SANDBOXES`
@@ -18,14 +21,15 @@ environment and `spec.json` are unchanged (a test asserts the literal host argv)
 | piece | file |
 |---|---|
 | argv building, validation, cleanup by label, redaction, bridge lock check | `container.mjs` |
-| launch integration (`sandbox`/`repo`/`baseRef`, preflight, `cancelJob`, cleanup state) | `job-core.mjs` |
-| runner: cancel intent, cleanup on every stop, wall-clock limit, redaction, PR URL | `job-runner.mjs` |
+| GitHub App: JWT, installation lookup, token minting, App identity, key-file checks | `github-app.mjs` |
+| launch integration (`sandbox`/`repo`/`baseRef`, preflight incl. the App, `cancelJob`, cleanup state) | `job-core.mjs` |
+| runner: token file mint/refresh/delete, cancel intent, cleanup on every stop, wall-clock limit, redaction, PR URL | `job-runner.mjs` |
 | `claude_start` params, `claude_cancel`, `POST /v1/start`, `POST /v1/cancel` | `dispatch.mjs`, `host-api.mjs` |
 | HTTP bridge token lock | `http-bridge.mjs`, `claude-async-http.mjs` |
-| job image and its entrypoint (the clone) | `container/Dockerfile`, `container/job-entry.sh` |
+| job image, its entrypoint (the clone), the git credential helper and the gh wrapper | `container/Dockerfile`, `container/job-entry.sh`, `container/git-credential.sh`, `container/gh-wrapper.sh` |
 | rules mounted read-only into every job | `container/CLAUDE.md` |
-| image build + checks on claunker | `container/smoke-test.ps1`, `container/probe.sh` |
-| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs`, `test/job-entry.test.mjs` |
+| image build + checks on claunker; a by-hand mint of one installation token | `container/smoke-test.ps1`, `container/probe.sh`, `tools/mint-app-token.mjs` |
+| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/github-app.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs`, `test/job-entry.test.mjs` |
 
 ## Why
 
@@ -35,7 +39,8 @@ account can read is reachable, or in safe mode. Safe mode's pattern rules leak: 
 both modes `git push` would use Erick's own full GitHub credential from Git Credential Manager.
 Container jobs change the boundary from "what the permission rules happen to match" to "what is in
 the container and which credential is present". A job can do anything inside the container. That
-covers one fresh clone and a bot token that can't do anything Erick's repos don't allow the bot to do.
+covers one fresh clone and a one-hour GitHub App installation token that reaches exactly one repo
+with contents and pull-request access, and nothing else of Erick's.
 
 ## The interface
 
@@ -48,7 +53,9 @@ claude_cancel { jobId }        POST /v1/cancel { jobId }   (routed by the job id
 
 - **`repo`** (required for a container job): `owner/repo` on GitHub. It must be listed in the
   executing host's `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` (comma, semicolon or space separated,
-  case-insensitive). There is no default: unset means every container job is refused.
+  case-insensitive), **and the GitHub App must be installed on it** (preflight looks the
+  installation up and refuses otherwise). There is no default: unset means every container job
+  is refused.
 - **`baseRef`** (optional): a branch, tag or commit to start from. Plain names only (no leading
   `-`, no `..`, no `@{`, no `refs/...`). Default: the repo's default branch. It is resolved
   **locally in the fresh clone** (`origin/<ref>`, then `tags/<ref>`, then a 7-40 hex commit the
@@ -61,9 +68,9 @@ claude_cancel { jobId }        POST /v1/cancel { jobId }   (routed by the job id
 
 Why a `repo` parameter rather than a mapping from `workFolder`: a mapping would keep a host path in
 the interface that no longer means anything (nothing is mounted), and would need a second table
-from folders to repos that could drift from the bot's real collaborator list. `owner/repo` is what
-the container actually acts on, it is checked against one explicit allowlist, and it reads the same
-in a prompt, in `meta.json` and on GitHub.
+from folders to repos that could drift from where the App is really installed. `owner/repo` is what
+the container actually acts on, it is checked against one explicit allowlist and against the App's
+installation, and it reads the same in a prompt, in `meta.json` and on GitHub.
 
 ## Threat model
 
@@ -74,19 +81,24 @@ Read this before you count on the container for anything.
 - **Erick's files, repos and credentials.** No host folder is mounted read-write, and nothing from
   `%USERPROFILE%` is mounted at all: not `.ssh`, `.claunker`, `.claude` (Erick's own Claude Code
   login), `.claude-async` (Discord webhook, hosts.json, api.json, http.json), `.claude-async-jobs`
-  (other jobs' logs), Git Credential Manager, the Windows Credential Manager or gh's stored token.
-  No working copy under `D:\code` is visible, and neither is the live chassis (`D:\claunker`). The
-  only host mounts are two read-only ones (CLAUDE.md and hooks/, below). The smoke test checks the
-  mount table.
+  (other jobs' logs), Git Credential Manager, the Windows Credential Manager, gh's stored token or
+  the **GitHub App's private key** (`.claude-async-secrets`, read by the host only). No working copy
+  under `D:\code` is visible, and neither is the live chassis (`D:\claunker`). The only host mounts
+  are three read-only ones (CLAUDE.md, hooks/, and the job's own `creds` dir holding its
+  installation token, below). The smoke test checks the mount table.
 - **The host from the job's git activity.** Earlier drafts bind-mounted a host clone and audited its
   `.git` afterwards. That design is gone: the clone lives and dies in the container, and no host git
   ever runs in a job's repo (the card hook's HEAD lookup is skipped for container jobs). So
   `.git/config` tricks (`core.fsmonitor`, hooks, `commondir`, a `.git` file swap) have nothing on the
   host to act on.
-- **Erick's GitHub identity, and `main`.** The only GitHub credential in the container is the bot's
-  token. A job can push only where the bot is a collaborator (or to the bot's own forks). `main`
-  requires a pull request with 1 approval from the owner, set by a ruleset, so the bot cannot push
-  to `main` or merge into it, even with write access. Erick reviews and merges every PR.
+- **Erick's GitHub identity, his other repos, and `main`.** The only GitHub credential in the
+  container is a GitHub App **installation token**: minted by the host for this job, valid for 60
+  minutes, scoped to this one repo with `contents: write`, `pull_requests: write` and
+  `metadata: read`. It cannot reach any other repo (the App is installed only on the repos jobs may
+  use, and the token is narrowed further to the job's repo), cannot create repos, gists, forks or
+  issues, and cannot change settings, rulesets, secrets, workflows or collaborators. `main` requires
+  a pull request with 1 approval from the owner, set by a ruleset, so the App cannot push to `main`
+  or merge into it. Erick reviews and merges every PR.
 - **The host OS.** The job runs as uid 1000, not root, with `--cap-drop ALL` and
   `--security-opt no-new-privileges`. It has no Docker socket and gets CPU, memory, PID and
   wall-clock limits.
@@ -107,31 +119,36 @@ Read this before you count on the container for anything.
 
 **What it does NOT protect:**
 
-- **The two tokens, in phase 1. This is an accepted risk for a limited pilot.** With open egress a
-  job (or code it runs: `npm install` scripts, test suites, anything from the repo or its
-  dependencies) can send `GH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` anywhere, and use them after the
-  container is gone. The PAT reaches every repo the bot can write to; the OAuth token is a
-  long-lived credential on Erick's subscription. Revocation (see Rollback) helps recovery but does
-  not contain a compromise nobody noticed. Measured detail: Claude Code 2.1.309 already leaves
-  `CLAUDE_CODE_OAUTH_TOKEN` out of the environment of its Bash tool's commands (the env names a
-  Bash call saw were listed in a local run), but the same uid can read it from
-  `/proc/<claude pid>/environ` (also verified), and `GH_TOKEN` is in every command's environment by
-  necessity. The CLI has a `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` mode, but it requires bubblewrap
-  (user namespaces) and forces the permission mode back to default, which defeats
-  skip-permissions; it was not adopted. A wrapper that hides the token somewhere the same uid can
-  still read would not change this. The real mitigation is phase 2 egress. Until then the pilot
-  repo should have no third-party install scripts (no dependencies with `postinstall`, no
-  `prepare`, no build steps pulling code), and the bot should be a collaborator on as few repos as
-  possible.
-- **The bot token, against the bot's own reach.** The job can do anything the token allows: push
-  branches to every repo the bot can write to, open or close issues and PRs, comment. A classic PAT
-  can't be scoped to selected repos (see "Identity"), so the bot's reach is exactly its collaborator
-  list. Keep that list short.
-- **CI on repos the bot can push to.** Leaving the `workflow` scope off stops a push that edits
+- **The OAuth token, in phase 1. This is an accepted risk for a limited pilot, and it is
+  unchanged by the move to a GitHub App.** With open egress a job (or code it runs: `npm install`
+  scripts, test suites, anything from the repo or its dependencies) can send
+  `CLAUDE_CODE_OAUTH_TOKEN` anywhere and use it after the container is gone; it is a long-lived
+  credential on Erick's subscription with no verified per-token revoke. Measured detail: Claude Code
+  2.1.309 already leaves `CLAUDE_CODE_OAUTH_TOKEN` out of the environment of its Bash tool's
+  commands (the env names a Bash call saw were listed in a local run), but the same uid can read it
+  from `/proc/<claude pid>/environ` (also verified). The CLI has a `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`
+  mode, but it requires bubblewrap (user namespaces) and forces the permission mode back to default,
+  which defeats skip-permissions; it was not adopted. The real mitigation is phase 2 egress. Until
+  then the pilot repo should have no third-party install scripts (no dependencies with
+  `postinstall`, no `prepare`, no build steps pulling code).
+- **The installation token, within its scope and its hour.** A stolen one is the smaller problem it
+  used to be: it reaches one repo, with contents and pull requests only, and dies within 60 minutes
+  of minting whatever anyone does (the runner mints a fresh one every 45 minutes while the job runs,
+  so a 4-hour job hands out up to six, each as short-lived). It cannot create repos, gists or
+  forks, cannot read or write any other repo, cannot touch settings, rulesets, secrets or
+  collaborators, and cannot edit `.github/workflows/` (that needs the `workflows` permission, which
+  the App does not have). What it **can** still do, until it expires: push branches to that repo
+  (not `main`), open, edit and close pull requests there, and comment on PRs and their review
+  threads. The `main` ruleset (PR with the owner's approval, no deletion, no force-push) still gates
+  what reaches `main`. The token is readable by the job (same uid, same file), so this is not about
+  hiding it from the job; it is about what a leaked one is worth. There is no long-lived GitHub
+  credential to revoke after a leak: uninstalling the App from the repo ends new mints at once, and
+  outstanding tokens are gone within the hour.
+- **CI on the repos the App is installed on.** The token cannot push a change to
   `.github/workflows/`. It does not stop a job from editing a script, Makefile, test or package
   script that an existing workflow already runs on a PR or branch push. Whether that exposes secrets
   or a self-hosted runner depends on the workflow's triggers, permissions, secrets and runner. **Do
-  not invite the bot to any repo whose CI holds secrets (or runs on a self-hosted runner) until that
+  not install the App on any repo whose CI holds secrets (or runs on a self-hosted runner) until that
   CI has been reviewed for this.**
 - **The network (phase 1).** On the default bridge network a job can reach the whole internet,
   claunker's own LAN and tailnet addresses, and other machines on the LAN and tailnet (Hermes,
@@ -212,12 +229,13 @@ runs as uid 1000, so that check never fires.
 
 ## What is mounted
 
-Two **read-only** bind mounts, nothing else:
+Three **read-only** bind mounts, nothing else:
 
 | host | container |
 |---|---|
 | `container/CLAUDE.md` (or `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD`) | `/home/agent/.claude/CLAUDE.md` |
 | this repo's `hooks/` | `/opt/claude-async/hooks` |
+| `<job dir>\creds\` (the job's installation token file, written by the runner) | `/run/claude-async/creds` |
 
 `/home/agent/.claude/CLAUDE.md` is Claude Code's user-level memory file, so the job rules are in
 every job's instructions. **The repo's own `CLAUDE.md` is NOT loaded** under `--setting-sources user`
@@ -227,11 +245,13 @@ production flags do not), and neither are the clone's `.claude/agents`, `.claude
 the file itself; `container/CLAUDE.md` says so. `/workspace` is container-local (the image's
 writable layer) and starts empty; the entrypoint clones into it.
 
-Mounted vs baked: these two stay mounted so a rules or hook change takes effect on the next job
-without rebuilding the image. The entrypoint (`container/job-entry.sh`) is baked into the image
-instead, because it is tied to the image's tools; **a change to `job-entry.sh` (or the Dockerfile)
-needs an image rebuild** (`container\smoke-test.ps1`). Baking CLAUDE.md and hooks too would remove
-the last host mounts at the cost of a rebuild for every rules or hook edit.
+Mounted vs baked: CLAUDE.md and hooks stay mounted so a rules or hook change takes effect on the
+next job without rebuilding the image; the creds dir is mounted because its content changes while
+the job runs (see "Token delivery and refresh"). The entrypoint (`container/job-entry.sh`), the git
+credential helper and the gh wrapper are baked into the image instead, because they are tied to the
+image's tools; **a change to any of them (or the Dockerfile) needs an image rebuild**
+(`container\smoke-test.ps1`). Baking CLAUDE.md and hooks too would remove two of the three host
+mounts at the cost of a rebuild for every rules or hook edit.
 
 The image makes `/home/agent/.claude` root-owned (0755) **and `/home/agent` itself root-owned
 (0755)**. The second part came out of round 2: `rename(2)` needs write permission on the parent,
@@ -275,13 +295,17 @@ that are on no branch or tag of the allowed repo, and it rejects abbreviated SHA
 found is exit 70 (`baseRef <x> not found in <repo>`).
 
 - **Credentials.** The image's system git config (`/etc/gitconfig`, root-owned) sets
-  `credential.https://github.com.helper = !/usr/local/bin/gh auth git-credential`. git asks gh, and
-  gh answers from `GH_TOKEN` in the environment. The token is never in argv, a remote URL or a
-  file; `gh auth setup-git` is not needed. Verified in the image: the helper answers from the env
-  token, and a clone leaves no token in `.git/config`.
+  `credential.https://github.com.helper = /usr/local/bin/claude-async-git-credential`
+  (`container/git-credential.sh`). For `protocol=https` and `host=github.com` it answers
+  `username=x-access-token` and, as the password, the current content of
+  `/run/claude-async/creds/token`; for any other host, protocol or verb it prints nothing. Every git
+  call reads the file afresh, so a token the runner refreshed is used by the next push without the
+  job doing anything. The token is never in argv, a remote URL, the environment or `.git/config`;
+  `gh auth setup-git` is not needed and `gh auth git-credential` is no longer configured. Verified
+  in the rebuilt image against a local https `github.com` (see "Verified here vs assumed").
 - **Exit codes** of the entrypoint itself: 64 usage/validation, 70 clone failed or `baseRef` not
-  found / not checked out (the runner adds a warning naming the repo), 78 configuration (no
-  `GH_TOKEN`, `/workspace` not empty). `test/job-entry.test.mjs` runs the script on the host against
+  found / not checked out (the runner adds a warning naming the repo), 78 configuration (the token
+  file missing or empty, `/workspace` not empty). `test/job-entry.test.mjs` runs the script on the host against
   a local bare repo (URL rewritten with `url.insteadOf`): branch, tag and 8-char SHA check out,
   `refs/pull/1/head`, an unreachable SHA and an unknown name exit 70, and the fork commit never
   reaches the clone.
@@ -290,12 +314,14 @@ found is exit 70 (`baseRef <x> not found in <repo>`).
 
 ## How secrets reach the container
 
-Only two secrets ever enter a container: the bot's GitHub token (`GH_TOKEN`) and the Claude Code
-OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`). They live in one host file, the "secrets env file", in
-Docker's `--env-file` format:
+Two secrets ever enter a container, by two different routes: the Claude Code OAuth token
+(`CLAUDE_CODE_OAUTH_TOKEN`) as an environment variable from the host's "secrets env file", and the
+job's GitHub App installation token as a **file** the runner writes and refreshes (next section).
+The App's private key never enters the container at all.
+
+The secrets env file holds exactly one line, in Docker's `--env-file` format:
 
 ```
-GH_TOKEN=ghp_...
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
 
@@ -304,21 +330,28 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
   Every non-secret variable goes in as an explicit `-e NAME=value`; a bare `-e NAME` is never used,
   and any `-e` name that looks like a credential throws.
 - **Checked before every job, values never echoed.** `checkEnvFile()` returns key names, never
-  values. It refuses: a key other than the two above (notably `ANTHROPIC_API_KEY`, which outranks
-  `CLAUDE_CODE_OAUTH_TOKEN` and would silently switch billing to the API), a missing, empty or
-  duplicate key, a bare `KEY` line, CRLF line endings, a UTF-8 BOM, a file inside the claude-async
-  checkout or at/under either read-only mount source (the CLAUDE.md file, the hooks dir: as
-  CLAUDE.md the tokens would be in the model's instructions), and any value with quotes, leading/trailing or inner whitespace (how a trailing
-  `# comment` shows up) or control characters, since Docker's `--env-file` keeps all of those
-  literally.
+  values. It refuses: any key other than `CLAUDE_CODE_OAUTH_TOKEN` (notably `ANTHROPIC_API_KEY`,
+  which outranks it and would silently switch billing to the API, and `GH_TOKEN`, the old bot PAT,
+  with a message pointing at the App settings), a missing, empty or duplicate key, a bare `KEY`
+  line, CRLF line endings, a UTF-8 BOM, a file inside the claude-async checkout or at/under a
+  read-only mount source (the CLAUDE.md file, the hooks dir: as CLAUDE.md the token would be in the
+  model's instructions) or equal to the App key file, and any value with quotes, leading/trailing or
+  inner whitespace (how a trailing `# comment` shows up) or control characters, since Docker's
+  `--env-file` keeps all of those literally.
 - **Never in the image.** The Dockerfile takes no secret build args, and nothing in it reads one.
-- **Output redaction.** A job can print its own environment (or read `/proc/*/environ`).
-  `out.log`/`err.log` in the job dir keep exactly what the job printed. Everything that **leaves the
-  runner** is redacted with the env file's two values (read into memory once by
-  `readEnvFileSecretValues()`, never written), their base64 forms (`base64("x-access-token:<GH_TOKEN>")`
-  is the Basic header `GIT_TRACE_CURL`/`GIT_CURL_VERBOSE` print, plus `base64(<value>)`), plus the
-  GitHub (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`) and Anthropic (`sk-ant-`) token
-  shapes with no word-boundary anchor (so `TOKEN_ghp_...` is caught too). Redaction always runs on
+- **Output redaction.** A job can print its own environment, read `/proc/*/environ`, or `cat` the
+  token file. `out.log`/`err.log` in the job dir keep exactly what the job printed. Everything that
+  **leaves the runner** is redacted with the env file's value (read into memory once by
+  `readEnvFileSecretValues()`, never written), **every installation token the runner minted for the
+  job** (all generations, added to the set as each is minted), their base64 forms
+  (`base64("x-access-token:<token>")` is the Basic header `GIT_TRACE_CURL`/`GIT_CURL_VERBOSE`
+  print, plus `base64(<value>)`), plus the GitHub (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`,
+  `github_pat_`) and Anthropic (`sk-ant-`) token shapes with no word-boundary anchor (so
+  `TOKEN_ghp_...` is caught too) and the base64 shapes of a `ghs_` token on its own and inside a
+  Basic header. `checkJob()` runs in another process and cannot know generations the runner has
+  already replaced, so it uses the env file's value, the job's *current* token file (while it
+  exists) and the shape patterns; the `ghs_` base64 patterns are what cover older generations
+  there. Redaction always runs on
   whole lines or on a window wider than the caller sees: `claude_check`'s `tailBytes` is
   caller-controlled, so `readRedactedTail()` reads `tailBytes` plus a margin (at least 512 bytes and
   twice the longest value), redacts that, drops the partial first line, and only then cuts to
@@ -334,10 +367,68 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
   don't), so it needs no redaction.
 - **Who can read the raw logs.** The job dirs live in `%USERPROFILE%\.claude-async-jobs` and inherit
   the profile's ACL: Erick's account, SYSTEM and the local Administrators group. Anything running as
-  Erick (including host-mode jobs) can read them. Treat them as holding the tokens.
+  Erick (including host-mode jobs) can read them, and, while a job runs, its `creds\token`. Treat
+  them as holding the tokens.
 - **Why not Docker secrets?** Docker secrets (`/run/secrets/...`) are a Swarm/Compose feature, and a
-  mounted secrets file would be readable by the same job user anyway. gh and Claude Code read their
-  tokens from environment variables, so the env file is simplest.
+  mounted secrets file would be readable by the same job user anyway. Claude Code reads its token
+  from the environment, so the env file is simplest for it; the GitHub token is a file because it
+  has to change while the job runs (below).
+
+## Token delivery and refresh (the GitHub App installation token)
+
+Installation tokens live 60 minutes; a job may run 4 hours. So the token is not an environment
+variable (fixed at `docker run`) but a file the host keeps current:
+
+- **Before `docker run`** the runner (`job-runner.mjs`) creates `<job dir>\creds\` (mode 0700) and
+  mints the first token through `github-app.mjs` (`createMinter().mint()`: read the key file, build
+  a 9-minute App JWT, `POST /app/installations/<id>/access_tokens` with
+  `{ repositories: [<repo name>], permissions: { contents: "write", pull_requests: "write", metadata: "read" } }`)
+  and writes it to `creds\token` (mode 0600). On a Linux host where the runner is root, both are
+  chowned to the container's uid 1000, since a 0600 root-owned file is unreadable to the job;
+  through Docker Desktop's Windows file sharing the host mode bits are not what the container sees,
+  and the directory's ACL (owner + SYSTEM, inherited from the job dir, see "Who can read the raw
+  logs") is the protection on the host side. If that first mint fails, **no container is started**:
+  the job ends with exit 78 and an `exit.json` warning naming the cause (`could not mint the GitHub
+  App installation token: ...`).
+- **The mount** is the *directory*, read-only, at `/run/claude-async/creds`, so the job cannot change
+  what the next git call will present, and so the file the container sees is the same inode the
+  host rewrites.
+- **Every `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`** (default 45 minutes; 1 to 55 minutes allowed) while
+  the container runs, the runner mints again and rewrites the file **in place**: open the existing
+  file, write the new token at offset 0, truncate to its length, `fsync`, close. Never a rename.
+  Why in place: the container holds the directory as a bind mount, and what has to reach it is new
+  content in the same file. A rename inside the directory would also be visible on a Linux bind
+  mount (the mount is the directory, not the file), so the choice is not forced on Linux; it is
+  made because claunker's mounts go through Docker Desktop's Windows file sharing, where in-place
+  content changes are the one propagation path the smoke test measures (section 5b), and one
+  measured mechanism beats two. Writing at offset 0 before truncating means a reader never sees an
+  empty file (tokens of one App have the same length; a reader racing the write could see a mix of
+  the two for a moment, which costs one failed git call, retried by the job).
+- **On a refresh failure** the runner logs once per distinct error, keeps the old token (still valid
+  until its expiry) and retries on the next tick. If refresh keeps failing and the token is within
+  5 minutes of expiry, or already expired, `exit.json` gets a warning
+  (`the GitHub App installation token could not be refreshed ... within 5 minutes of its expiry`),
+  because git/gh calls late in the job may have failed.
+- **On finish** (any exit: normal, cancel, wall-clock limit, signal, runner error) the file and the
+  directory are deleted, after the container is removed. A container that somehow survived loses
+  its credential rather than keeping one on disk.
+- **Every minted generation** is added to the runner's redaction set as it is minted, with its
+  base64 forms (previous section).
+- **The key** (`CLAUDE_ASYNC_GITHUB_APP_KEY_FILE`) is read by the runner at each mint and by job-core
+  at preflight, never written anywhere, never put in argv, `spec.json`, `meta.json` or a log; the
+  runner's spec carries its **path**. It must be readable only by its owner: on POSIX a group- or
+  world-readable key is refused (`chmod 600`); on Windows the mode bits carry nothing, so the ACL
+  expectation (Erick's account and SYSTEM only, set with `icacls` in the rollout) is documented and
+  not checked. It may not be inside the claude-async checkout, a mount source, or the env file.
+- **Verified** with a real Docker engine on Linux (the runner, `startJob()`'s argv, the rebuilt
+  image, a fake `api.github.com` and a fake https `github.com`): the file is 0600/uid 1000 inside,
+  the mount is read-only, the clone authenticated with generation 1 through the helper, and a
+  `git ls-remote` seven seconds later authenticated with generation 4 after three in-place rewrites,
+  with no restart of anything. **Not verified: propagation of an in-place rewrite through a Docker
+  Desktop bind mount on Windows.** `container\smoke-test.ps1` section 5b measures it (a container
+  tails a mounted file, the host rewrites it in place, the new content must appear within 5 s) and
+  FAILS when it does not. Do not enable container mode until that line passes; a job longer than an
+  hour would otherwise lose GitHub access mid-run.
 
 ## Claude Code authentication inside the container
 
@@ -377,11 +468,16 @@ reachability and that `qwen2.5-coder:7b` is listed.
 
 ## Git identity
 
-job-core sets `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` and `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL`
-from `CLAUDE_ASYNC_CONTAINER_GIT_NAME` and `CLAUDE_ASYNC_CONTAINER_GIT_EMAIL` (required). Use the
-bot's noreply address (`<id>+<login>@users.noreply.github.com`, under the bot's Settings, Emails) so
-commits link to the bot account. The clone is made on Linux inside the container, so the old
-`core.autocrlf` pass-through for Windows checkouts is gone.
+Commits are authored by the App's bot user. At preflight job-core fetches the App's slug
+(`GET /app` with the JWT) and the bot user's id (`GET /users/<slug>[bot]`) once, caches them in the
+plan (and `meta.json.container.githubApp`), and sets `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` to
+`<slug>[bot]` and `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` to
+`<id>+<slug>[bot]@users.noreply.github.com`, which is the address GitHub links to the App's bot
+user (commits show the App's avatar and name). `CLAUDE_ASYNC_CONTAINER_GIT_NAME` /
+`CLAUDE_ASYNC_CONTAINER_GIT_EMAIL` still exist as **optional overrides** of one or both (rarely
+needed: a display name other than the slug, or a GHES address); they are no longer required. The
+clone is made on Linux inside the container, so the old `core.autocrlf` pass-through for Windows
+checkouts is gone.
 
 ## How jobs open PRs
 
@@ -398,59 +494,105 @@ cannot target a tag or a commit. `container/CLAUDE.md` says the same. The job pr
 its final message. The runner records the URL in
 `exit.json.container.prUrl` when it names the job's own repo, so `claude_check` shows what was
 delivered. `scripts/publish-branch.mjs` is not used inside the container: its checks would be
-advisory there, and the real limits are server-side (collaborator list, token scopes, the `main`
-ruleset).
+advisory there, and the real limits are server-side (the installation's repos, the token's
+permissions, the `main` ruleset).
 
-**Cross-owner contributions (forks):** when the bot isn't a collaborator,
-`gh repo fork --remote --remote-name fork`, push to `fork`, and
-`gh pr create --repo <owner>/<repo> --head <bot-login>:<branch>`. That needs a classic token. The
-upstream repo still has to be in `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS`, since that is what is cloned.
+**How `gh` gets the token.** `gh` reads `GH_TOKEN`, and that variable is deliberately not in the
+job's environment. `/usr/local/bin/gh` is a small wrapper (`container/gh-wrapper.sh`) that reads
+`/run/claude-async/creds/token` at each call and exports `GH_TOKEN` for the exec'd real gh
+(`/usr/local/lib/gh/gh`) only, never on its command line. So `gh pr create` just works, a job
+shell's `env` shows no `GH_TOKEN`, and the test suites, `npm` scripts and other children the job
+runs do not inherit it. The job runs as the same uid and can read the file itself, so this is about
+not spraying the token into every child process by default, not about hiding it from the job. A
+`GH_TOKEN` the job sets on purpose is respected. The wrapper and the `env` check are tested on the
+host (`test/job-entry.test.mjs`) and were verified in the rebuilt image.
 
-## Identity: the bot account and its token
+**Cross-owner contributions (forks) are not available to container jobs.** An installation token
+cannot fork (no repository-creation permission) and cannot push to a repo the App is not installed
+on. A job can only work on repos the App is installed on, which is the point. To let jobs work on a
+repo, install the App on it (and add it to `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS`).
 
-### One machine account is allowed
+## Identity: the GitHub App
 
-GitHub's Terms of Service, section B.3 "Account Requirements"
-(<https://docs.github.com/en/site-policy/github-terms/github-terms-of-service>):
+### Why an App and not a bot account
 
-> One person or legal entity may maintain no more than one free Account ... We do permit machine
-> accounts: A machine account is an Account set up by an individual human who accepts the Terms on
-> behalf of the Account, provides a valid email address, and is responsible for its actions. A
-> machine account is used exclusively for performing automated tasks. ... You may maintain no more
-> than one free machine account in addition to your free Personal Account.
+Review round 2 left this as an open question ("Per-job, per-repo credentials"); it is decided now.
+The owner chose **not** to create a machine account. A GitHub App owned by Erick's personal account
+gives what the bot never could:
 
-### Classic PAT, not fine-grained
+- **Per-repo scope.** The App is installed on selected repositories only, and each job's token is
+  narrowed to its one repo. A classic PAT reached every repo the bot was a collaborator on; a
+  fine-grained PAT could not contribute to repos the bot did not own.
+- **Per-job lifetime.** Installation tokens expire 60 minutes after minting. Nothing long-lived
+  exists on the host except the App's private key, which never enters a container and can be
+  revoked and regenerated on the App's settings page in seconds.
+- **Minimal permissions.** The App has exactly three repository permissions; the token cannot ask
+  for more than the App has, and the runner asks for exactly these:
 
-Fine-grained tokens can't "contribute to repositories where the user is an outside or repository
-collaborator" and can't write to public repos the user doesn't own
-(<https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens>).
-The bot is a repository collaborator on Erick's repos, so it needs a **classic** PAT.
+| permission | level | why |
+|---|---|---|
+| Contents | read and write | clone, push branches |
+| Pull requests | read and write | `gh pr create`, PR comments |
+| Metadata | read-only | mandatory for any App; repo lookup |
 
-| scope | why |
-|---|---|
-| `repo` | Push branches and open PRs on Erick's **private** repos where the bot is a collaborator. If every target repo is public, use `public_repo` instead. |
-| `workflow` | **Leave it off.** Without it GitHub rejects pushes that touch `.github/workflows/`. It does not stop a job editing a script an existing workflow runs (see the threat model). |
+Nothing else: no Workflows (so `.github/workflows/` cannot be changed), no Issues, no
+Administration, no account permissions, no webhook. The App is set to **"Only on this account"**, so
+nobody else can install it.
 
-Nothing else: no `delete_repo`, `admin:*`, `write:packages`, `gist` or `user`. A classic `repo`
-token reaches every repo the bot is a collaborator on, so the collaborator list is the token's scope.
-Set an expiration (90 days is reasonable) and rotate.
+### Registration (what the owner does once)
+
+On GitHub as `icey2488`: Settings, Developer settings, GitHub Apps, **New GitHub App**.
+
+- Name: anything (`claunker-jobs` is what the examples use; the slug GitHub derives from it becomes
+  the commit author `<slug>[bot]`). Homepage URL: any URL (the claude-async repo).
+- **Webhook: uncheck "Active".** No webhook URL, no secret.
+- Repository permissions: **Contents: Read and write**, **Pull requests: Read and write**,
+  **Metadata: Read-only** (preselected). Leave every other repository, organization and account
+  permission at "No access".
+- "Where can this GitHub App be installed?": **Only on this account**.
+- Create. Note the **App ID** at the top of the page (a number; not the Client ID).
+- **Private keys: Generate a private key.** GitHub downloads a `.pem` once. Move it to
+  `%USERPROFILE%\.claude-async-secrets\github-app.pem` on claunker (rollout step 6 sets the ACL).
+  If it is ever exposed, delete it on that page and generate a new one; the runner picks the new
+  file up at its next mint.
+- **Install App** (left menu): install on `icey2488`, choose **Only select repositories**, select
+  `icey2488/container-job-scratch` only. Add more repos later the same way (and to
+  `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS`); never "All repositories".
+
+The installation id, the App slug and the bot user id are looked up by preflight, not configured.
+`node tools\mint-app-token.mjs icey2488/container-job-scratch <file>` runs the same preflight by
+hand and prints them.
+
+### What the host does with it
+
+`github-app.mjs`, on the bridge process at preflight and in the runner at each mint:
+
+1. Read the key file (checks: regular file, PEM private key, owner-only mode on POSIX, outside the
+   checkout and the mount sources).
+2. Build the App JWT: RS256, `iat` 60 s in the past, `exp` 9 minutes ahead, `iss` = App ID.
+3. `GET /repos/<owner>/<repo>/installation` (preflight): the installation id, or a refusal naming the
+   repo ("not installed on ...; install the app on that repository") on 404, or "app id and key do
+   not match" on 401.
+4. `GET /app` and `GET /users/<slug>[bot]` (preflight): the commit identity.
+5. `POST /app/installations/<id>/access_tokens` with the one repo and the three permissions (runner,
+   before `docker run` and every 45 minutes): the token the container gets as a file.
 
 ### Server-side backstops
 
-- **`main` requires a PR with 1 approval from the owner** (a repository ruleset on each repo the bot
-  can push to, with Erick as a bypass actor so his own workflow is unchanged). The bot cannot push to
-  `main`, and a PR author can't approve its own PR, so nothing the bot writes reaches `main` without
-  Erick's approval. Plus the existing no-deletion and no-force-push rules. Two details to set in the
-  same ruleset: **"Dismiss stale pull request approvals when new commits are pushed"** and **"Require
-  approval of the most recent reviewable push"**, so the bot can't add commits after Erick approves.
-  Note that with only the approval rule, the bot (write access) could still press merge on a PR
-  Erick has approved; the merged content is then exactly what he approved. If only Erick should ever
-  merge, also turn on **"Restrict updates"** with Erick as the bypass actor (I believe that blocks
-  merges by anyone else too, but have not verified it on GitHub). `container/CLAUDE.md` tells the
-  bot never to merge or approve.
-- **Collaborator permission level.** Personal-account repos have one collaborator level (write), so
-  the bot could otherwise merge PRs and close issues; the approval rule is what stops it merging.
-  (The single-level statement is from prior knowledge; GitHub's page could not be fetched.)
+- **`main` requires a PR with 1 approval from the owner** (a repository ruleset on each repo the App
+  is installed on, with Erick as a bypass actor so his own workflow is unchanged). The App cannot
+  push to `main`, and a PR author can't approve its own PR, so nothing the App writes reaches `main`
+  without Erick's approval. Plus the existing no-deletion and no-force-push rules. Two details to
+  set in the same ruleset: **"Dismiss stale pull request approvals when new commits are pushed"** and
+  **"Require approval of the most recent reviewable push"**, so the App can't add commits after Erick
+  approves. Note that with only the approval rule, a token with `pull_requests: write` and
+  `contents: write` could still press merge on a PR Erick has approved; the merged content is then
+  exactly what he approved. If only Erick should ever merge, also turn on **"Restrict updates"** with
+  Erick as the bypass actor (I believe that blocks merges by anyone else too, but have not verified
+  it on GitHub). `container/CLAUDE.md` tells the job never to merge or approve.
+- **The App's permissions are the ceiling.** A token can never carry more than the App was granted,
+  and the runner asks for the three above. Changing the App's permissions later requires accepting
+  them on the installation, which Erick does on the installation page.
 
 ## Network egress
 
@@ -462,8 +604,9 @@ sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `DISABLE_AUTOUPDATER=1`, s
 makes no telemetry, error-reporting or update calls.
 
 Inter-container traffic: Docker's default `bridge` network allows container-to-container
-connections, so concurrent jobs can reach each other's listening ports (they share the same tokens
-anyway; what this exposes is one job tampering with a service another job started). A dedicated
+connections, so concurrent jobs can reach each other's listening ports (they share the same OAuth
+token anyway, and each has its own repo-scoped GitHub token; what this exposes is one job tampering
+with a service another job started). A dedicated
 user network with ICC off keeps normal egress and removes that:
 
 ```powershell
@@ -683,10 +826,10 @@ limited per container; the clone and everything else live in the writable layer 
 
 | feature | container jobs |
 |---|---|
-| job record (`meta.json`, `spec.json`) | plus `sandbox: "container"` and `container: {name, jobId, image, imageId, dockerBin, repo, baseRef, envFile}` in meta (envFile is a path); `workFolder` is `null` |
+| job record (`meta.json`, `spec.json`) | plus `sandbox: "container"` and `container: {name, jobId, image, imageId, dockerBin, repo, baseRef, envFile, credsDir, githubApp: {appId, slug, botUserId, installationId}}` in meta (envFile and credsDir are paths); `workFolder` is `null` |
 | heartbeat, `runner.pid`, Job Object records | unchanged |
 | stdout/stderr capture | unchanged on disk; redacted in exit.json, claude_check and the ping |
-| `exit.json`, `exit_code`, status | unchanged, plus `exit.container` = `{name, repo, prUrl, cleanup, cancelled, maxRuntimeExceeded}`; 125 = docker run failed, 70 = clone failed, 137 = removed/killed |
+| `exit.json`, `exit_code`, status | unchanged, plus `exit.container` = `{name, repo, prUrl, cleanup, cancelled, maxRuntimeExceeded}` and token warnings in `warnings`; 125 = docker run failed, 78 = the token could not be minted (no container started) or the entrypoint found no token file, 70 = clone failed, 137 = removed/killed |
 | DELEGATION-METRICS completeness | unchanged (read off stdout) |
 | card hook | mint and close unchanged; no HEAD lookup and no delivery check for container jobs (no host git). The PR URL is in `exit.container.prUrl` |
 | Discord ping | unchanged apart from headline redaction |
@@ -712,9 +855,13 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 |---|---|---|
 | `CLAUDE_ASYNC_ALLOWED_SANDBOXES` | `host` | `host`, `container` or `host,container` |
 | `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | exactly `container` makes container mode the default |
-| `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` | **none** (required) | `owner/repo` entries; only repos the bot is a collaborator on |
-| `CLAUDE_ASYNC_CONTAINER_ENV_FILE` | **none** (required) | the host secrets file, outside the claude-async checkout |
-| `CLAUDE_ASYNC_CONTAINER_GIT_NAME` / `_GIT_EMAIL` | **none** (required) | the bot's commit identity |
+| `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` | **none** (required) | `owner/repo` entries; only repos the GitHub App is installed on |
+| `CLAUDE_ASYNC_CONTAINER_ENV_FILE` | **none** (required) | the host secrets file (`CLAUDE_CODE_OAUTH_TOKEN` only), outside the claude-async checkout |
+| `CLAUDE_ASYNC_GITHUB_APP_ID` | **none** (required) | the App's numeric App ID |
+| `CLAUDE_ASYNC_GITHUB_APP_KEY_FILE` | **none** (required) | path of the App's private key `.pem`; owner-readable only, outside every repo |
+| `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS` | `2700000` (45 min) | how often the runner re-mints the installation token (60000 to 3300000) |
+| `CLAUDE_ASYNC_GITHUB_API_BASE` | `https://api.github.com` | the API origin; tests (a loopback fake) or GHES only |
+| `CLAUDE_ASYNC_CONTAINER_GIT_NAME` / `_GIT_EMAIL` | derived from the App | optional overrides of the commit identity (`<slug>[bot]`, `<id>+<slug>[bot]@users.noreply.github.com`); rarely needed |
 | `~/.claude-async/http.json` | absent | **required for container mode**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`); the bridge refuses to start without it once container mode is allowed |
 | `CLAUDE_ASYNC_HTTP_PORT` | `7842` | the bridge port the lock check probes |
 | `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED` | unset | bridge only: explicit, logged opt-out to start without a token; rejected when container mode is allowed |
@@ -732,7 +879,9 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` | `120000` | job-core: how long after a killed docker client an empty listing does not yet confirm cleanup |
 
 Removed in review round 1: `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, `_DENIED_ROOTS` and
-`_GIT_AUTOCRLF` (no host folder is mounted any more).
+`_GIT_AUTOCRLF` (no host folder is mounted any more). Changed with the GitHub App: `GH_TOKEN` is
+no longer an allowed env-file key (preflight refuses a file that still has it), and
+`CLAUDE_ASYNC_CONTAINER_GIT_NAME`/`_EMAIL` went from required to optional.
 
 The `docker run` argv a job gets (sample job; placeholder secrets path and image ID):
 
@@ -748,11 +897,12 @@ docker run --rm --pull=never --name claude-async-claunker.demo-20261101-abcd1234
   -e CLAUDE_ASYNC_DEPTH=1 -e CLAUDE_ASYNC_JOB_EFFORT=medium
   -e CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=7200000 -e CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
   -e BASH_MAX_TIMEOUT_MS=1200000
-  -e GIT_AUTHOR_NAME=claunker-bot -e GIT_COMMITTER_NAME=claunker-bot
-  -e GIT_AUTHOR_EMAIL=<id>+claunker-bot@users.noreply.github.com -e GIT_COMMITTER_EMAIL=<same>
+  -e GIT_AUTHOR_NAME=claunker-jobs[bot] -e GIT_COMMITTER_NAME=claunker-jobs[bot]
+  -e GIT_AUTHOR_EMAIL=<bot user id>+claunker-jobs[bot]@users.noreply.github.com -e GIT_COMMITTER_EMAIL=<same>
   -e OLLAMA_HOST=http://host.docker.internal:11434 -e CLAUDE_ASYNC_OLLAMA_URL=http://host.docker.internal:11434
   --mount type=bind,source=D:/code/claude-async/container/CLAUDE.md,target=/home/agent/.claude/CLAUDE.md,readonly
   --mount type=bind,source=D:/code/claude-async/hooks,target=/opt/claude-async/hooks,readonly
+  --mount type=bind,source=C:/Users/Raide/.claude-async-jobs/claunker.demo-20261101-abcd1234/creds,target=/run/claude-async/creds,readonly
   --workdir /workspace
   sha256:<64 hex>
   /usr/local/bin/claude-async-job-entry icey2488/container-job-scratch "" --
@@ -763,7 +913,9 @@ docker run --rm --pull=never --name claude-async-claunker.demo-20261101-abcd1234
 ```
 
 Each token is one argv element (no shell). The prompt is last, after `--`, and the model is bound
-with `=`.
+with `=`. Nothing about the GitHub App (id, key path, installation, token) is in the argv; the
+runner's `spec.json` carries the app id, the key **path**, the installation id and the repo name,
+and `meta.json.container.githubApp` the app id, slug, bot user id and installation id.
 
 ## The image
 
@@ -771,7 +923,9 @@ with `=`.
 
 - Base: `node:24-bookworm-slim`, pinned to the major tag until the first build records its digest
   (rollout step 7).
-- gh 2.89.0 and uv 0.13.6 from GitHub release tarballs, each checked against a pinned SHA-256.
+- gh 2.89.0 and uv 0.13.6 from GitHub release tarballs, each checked against a pinned SHA-256. gh
+  lives at `/usr/local/lib/gh/gh`; `/usr/local/bin/gh` is the wrapper that reads the token file
+  (see "How jobs open PRs").
 - **Claude Code 2.1.309 from verified bytes, with no `npm install` and no package script.** The
   build `npm pack`s the exact wrapper and linux-x64 tarballs, computes each sha512 itself (openssl,
   base64) and compares it with the pinned integrity before extracting anything, checks the wrapper's
@@ -787,11 +941,15 @@ with `=`.
   @anthropic-ai/claude-code@<v> dist.integrity`, same for `-linux-x64`), ideally checked against a
   second network path.
 - Debian packages aren't version-pinned. Rebuild to pick up security fixes.
-- User `agent`, uid/gid 1000; `~/.claude` root-owned as described above; the entrypoint and the
-  github.com credential helper as described in "The clone inside the container".
+- User `agent`, uid/gid 1000; `~/.claude` root-owned as described above; the entrypoint, the
+  github.com credential helper (`claude-async-git-credential`, a script reading the token file) and
+  the empty mount point `/run/claude-async/creds` as described in "The clone inside the container".
+  `gh auth git-credential` is not configured anywhere.
 - **Built and checked in this sandbox** on a test-only base (Ubuntu noble plus Node 24, because Docker
-  Hub isn't reachable from here). Every other line ran as written. The real `node:24-bookworm-slim`
-  build happens on claunker in the smoke test.
+  Hub isn't reachable from here; for the round-3 rebuild the two Claude Code tarballs came from a
+  local registry serving the previously verified bytes, and the pinned sha512 checks still ran
+  against them). Every other line ran as written. The real `node:24-bookworm-slim` build happens on
+  claunker in the smoke test.
 
 ## Rollout checklist
 
@@ -801,26 +959,35 @@ Do these in order on claunker. Each step says how to check it.
    you sign in" on; **leave "Expose daemon on tcp://localhost:2375 without TLS" off**. Size the VM in
    `%USERPROFILE%\.wslconfig`, then `wsl --shutdown` and restart Docker Desktop.
    Check: `docker version` shows a Server section; `docker run --rm hello-world` works.
-2. **Create the bot account** (one free machine account next to `icey2488`; ToS B.3 above), with its
-   own email and 2FA, "Keep my email address private" on, and note its noreply address.
-3. **Rulesets first, then invite.** On each repo the bot will push to, add a ruleset for the default
+2. **Register the GitHub App** as `icey2488` (details under "Identity: the GitHub App",
+   "Registration"): Settings, Developer settings, GitHub Apps, New GitHub App; name it (e.g.
+   `claunker-jobs`); **webhook off**; repository permissions **Contents: read and write**,
+   **Pull requests: read and write**, **Metadata: read-only**, nothing else; **Only on this
+   account**; create; note the **App ID**. Then **Generate a private key** and keep the downloaded
+   `.pem` for step 6. No bot account is created, no PAT of any kind.
+   Check: the App's page shows the three permissions and "Webhook: inactive".
+3. **Rulesets first, then install.** On each repo jobs will push to, add a ruleset for the default
    branch: require a pull request with **1 approval** (with "dismiss stale approvals" and "require
    approval of the most recent reviewable push"), Erick (`icey2488`) as a bypass actor, plus no
    deletion and no force-push; optionally "Restrict updates" so only Erick can merge (see
-   "Server-side backstops"). Then invite the bot as a collaborator, starting with one scratch
-   repo (`icey2488/container-job-scratch`, private). Don't invite it to any repo whose CI holds
-   secrets or runs on a self-hosted runner until that CI is reviewed.
-   Check: as the bot, `git push origin HEAD:main` to the scratch repo is rejected, and the bot
-   cannot merge a PR it opened.
-4. **Create the classic PAT** as the bot: scopes **`repo`** only (or `public_repo`), no `workflow`,
-   90-day expiry.
+   "Server-side backstops"). Then **install the App** (its page, "Install App", `icey2488`, **Only
+   select repositories**) on `icey2488/container-job-scratch` (private) and nothing else. Don't
+   install it on any repo whose CI holds secrets or runs on a self-hosted runner until that CI is
+   reviewed.
+   Check: after step 6, `node tools\mint-app-token.mjs icey2488/container-job-scratch $env:TEMP\t`
+   prints the slug, bot id and installation; the same command for any other repo of yours says
+   "not installed on"; delete `$env:TEMP\t` afterwards. With the minted token in a container (the
+   smoke test's section 6), `git push origin HEAD:main` to the scratch repo is rejected by the
+   ruleset.
+4. (Removed: no classic PAT. The App's installation tokens are minted per job.)
 5. **Generate the Claude Code token** as Erick: `claude setup-token`; one year; set a reminder.
-6. **Write the host secrets file** outside every repo, readable only by Erick's user (values read
-   as secure strings, never echoed, never on a command line):
+6. **Write the host secrets file and place the App key** outside every repo, readable only by
+   Erick's user (the token is read as a secure string, never echoed, never on a command line):
 
    ```powershell
    $dir  = Join-Path $env:USERPROFILE ".claude-async-secrets"
    $file = Join-Path $dir "container.env"
+   $pem  = Join-Path $dir "github-app.pem"
    New-Item -ItemType Directory -Force -Path $dir | Out-Null
    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
    icacls $dir /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
@@ -829,16 +996,22 @@ Do these in order on claunker. Each step says how to check it.
      $p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
      try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($p) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($p) }
    }
-   $gh = Read-Plain "Bot classic PAT (GH_TOKEN)"
    $cc = Read-Plain "Claude Code token from 'claude setup-token' (CLAUDE_CODE_OAUTH_TOKEN)"
-   # LF endings, no BOM, no quotes or spaces: docker keeps all of those in the values.
-   $body = "GH_TOKEN=$($gh.Trim())`nCLAUDE_CODE_OAUTH_TOKEN=$($cc.Trim())`n"
+   # LF endings, no BOM, no quotes or spaces: docker keeps all of those in the value. ONLY this key.
+   $body = "CLAUDE_CODE_OAUTH_TOKEN=$($cc.Trim())`n"
    [IO.File]::WriteAllText($file, $body, (New-Object Text.UTF8Encoding($false)))
-   Remove-Variable gh, cc, body
+   Remove-Variable cc, body
    icacls $file /inheritance:r /grant:r "${me}:F" "SYSTEM:F" | Out-Null
+   # the App's private key: move the .pem GitHub downloaded in step 2, then lock it down the same way
+   Move-Item "$env:USERPROFILE\Downloads\claunker-jobs.*.private-key.pem" $pem
+   icacls $pem /inheritance:r /grant:r "${me}:F" "SYSTEM:F" | Out-Null
    ```
 
-   Check: `(Get-Content $file | ForEach-Object { ($_ -split '=')[0] })` prints the two key names.
+   Check: `(Get-Content $file | ForEach-Object { ($_ -split '=')[0] })` prints exactly
+   `CLAUDE_CODE_OAUTH_TOKEN`; `icacls $pem` lists only your account and SYSTEM;
+   `Get-Content $pem -First 1` is `-----BEGIN RSA PRIVATE KEY-----`. (On a Linux host the key must
+   be `chmod 600`; preflight refuses a group- or world-readable key there. Windows ACLs are not
+   checked by the code, so this step is the control.)
 7. **Lock the HTTP bridge**: `node claude-async-http.mjs --new-token`, then restart it
    (`pm2 restart claude-async-http`, or stop it if nothing uses it). Give the token to anything that
    still needs the bridge (`Authorization: Bearer <token>`). Check:
@@ -852,12 +1025,17 @@ Do these in order on claunker. Each step says how to check it.
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1
    powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1 -SkipBuild `
-     -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" -RunClaude `
+     -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" `
+     -AppId <App ID> -AppKeyFile "$env:USERPROFILE\.claude-async-secrets\github-app.pem" -RunClaude `
      -LanTargets "<hermes-host>:<port>","<ha-host>:8123"
    ```
 
-   Every line must be PASS or WARN. Read the loopback-forwarding line (it is measured) and every
-   WARN. A FAIL on 7842/2375/2376 means stop. Then pin the base image digest
+   Every line must be PASS or WARN. Read the loopback-forwarding line (it is measured), the **token
+   propagation** line (section 5b: an in-place rewrite of a bind-mounted file must reach a running
+   container within 5 s, or jobs longer than an hour lose GitHub access; a FAIL there means stop)
+   and every WARN. A FAIL on 7842/2375/2376 means stop. Section 6 mints one real installation token
+   through `tools\mint-app-token.mjs` and shows the App's slug, bot id and installation. Then pin
+   the base image digest
    (`docker image inspect node:24-bookworm-slim --format "{{index .RepoDigests 0}}"` into
    `ARG NODE_IMAGE=...@sha256:...`) in a small commit.
 9. **Configure the bridge** (container mode still off), then restart it with
@@ -867,39 +1045,51 @@ Do these in order on claunker. Each step says how to check it.
    CLAUDE_ASYNC_ALLOWED_SANDBOXES=host,container
    CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS=icey2488/container-job-scratch
    CLAUDE_ASYNC_CONTAINER_ENV_FILE=C:\Users\Raide\.claude-async-secrets\container.env
-   CLAUDE_ASYNC_CONTAINER_GIT_NAME=claunker-bot
-   CLAUDE_ASYNC_CONTAINER_GIT_EMAIL=<id>+claunker-bot@users.noreply.github.com
+   CLAUDE_ASYNC_GITHUB_APP_ID=<App ID from step 2>
+   CLAUDE_ASYNC_GITHUB_APP_KEY_FILE=C:\Users\Raide\.claude-async-secrets\github-app.pem
    CLAUDE_ASYNC_DOCKER_BIN=C:\Program Files\Docker\Docker\resources\bin\docker.exe
    ```
 
-   Remove any `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`/`_DENIED_ROOTS`/`_GIT_AUTOCRLF` from an earlier
-   draft; they are ignored now. No job clones under `D:\code\jobs` are needed any more.
+   `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS` (45 min) and `CLAUDE_ASYNC_CONTAINER_GIT_NAME`/`_EMAIL`
+   (derived from the App) need no setting. Remove any `GH_TOKEN` line from the env file and any
+   `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`/`_DENIED_ROOTS`/`_GIT_AUTOCRLF` from an earlier draft; the
+   first is refused, the rest are ignored. No job clones under `D:\code\jobs` are needed any more.
 10. **Run one container job end to end**: `claude_start` with `host: "claunker"`,
     `sandbox: "container"`, `repo: "icey2488/container-job-scratch"`, and a prompt like "Create a
     branch docs/container-smoke, add a README line saying hello from the container, commit, push the
     branch, open a PR to main and print its URL. Delegate the README wording to qwen2.5-coder:7b
     through $OLLAMA_HOST. End with the delegation report." Check: `claude_check` shows
     `sandbox: "container"`, status `completed`, `containerCleanup: "confirmed"` and
-    `exit.container.prUrl`; the commit author and PR opener are the bot; the delegation report shows
-    an Ollama call; the card and the Discord ping arrived; `docker ps -a --filter
-    label=claude-async.job` is empty. Then start a long job and `claude_cancel` it: it reports
-    `failed`, `exitReason: "cancelled"`, cleanup confirmed. Review and merge the PR yourself.
-11. **Widen slowly.** Add one real repo to the allowlist (and the ruleset on it) once the scratch runs
-    are routine. Schedule phase 2 before any repo with third-party install scripts.
+    `exit.container.prUrl`; `exit.json` has no token warning; the commit author is
+    `<slug>[bot]` and the PR opener is the App; the delegation report shows an Ollama call; the card
+    and the Discord ping arrived; `docker ps -a --filter label=claude-async.job` is empty; the
+    job dir has no `creds` folder left. Then start a long job and `claude_cancel` it: it reports
+    `failed`, `exitReason: "cancelled"`, cleanup confirmed. Review and merge the PR yourself. Before
+    widening, run one job that takes more than an hour (a prompt that sleeps, then pushes a second
+    commit): the second push must succeed, which proves the refreshed token reached the container
+    on Docker Desktop.
+11. **Widen slowly.** Install the App on one real repo, add it to the allowlist (and the ruleset on
+    it) once the scratch runs are routine. Schedule phase 2 before any repo with third-party install
+    scripts.
 
 ### Rollback
 
 - **Stop using it:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host` (or unset it) and restart the bridge.
   Every container start is then refused before anything is written.
 - **Cut off the credentials:**
-  - Bot PAT: as the bot, Settings, Developer settings, Personal access tokens, Tokens (classic),
-    Delete. Remove the bot as a collaborator on each repo.
+  - GitHub App: **uninstall the App from the repo(s)** (the App's page, Install App, the gear next
+    to `icey2488`, Uninstall, or per repo under "Only select repositories"). New mints fail from
+    that moment (preflight refuses: "not installed on"), and every outstanding installation token
+    expires within the hour on its own; nothing else needs revoking. Then **delete the private key**
+    on the App's settings page (Private keys, Delete) and remove
+    `%USERPROFILE%\.claude-async-secrets\github-app.pem`. Deleting the App itself is optional.
   - Claude Code setup-token: **unverified**. I could not confirm a per-token revoke procedure for
     `claude setup-token` tokens (Anthropic's docs pages could not be fetched this time, and the CLI
     has no revoke command). Look in the claude.ai account settings for the Claude Code / authorized
     apps or sessions list and revoke it there; if no per-token control exists, ask Anthropic support,
     and treat the token as live until it expires (one year).
-  - Then delete `%USERPROFILE%\.claude-async-secrets\container.env`. Container jobs fail in preflight.
+  - Then delete `%USERPROFILE%\.claude-async-secrets\container.env`. Container jobs fail in preflight
+    (the App key or the env file missing is refused before anything is written).
 - **Remove the code:** revert this PR's merge commit. Host mode is the same with or without it.
 - **Remove Docker:** `docker image rm claude-async-job:local`, then uninstall Docker Desktop if
   nothing else uses it.
@@ -908,12 +1098,13 @@ Do these in order on claunker. Each step says how to check it.
 
 - **Can concurrent jobs share a clone?** No. Each container clones its own copy into its own
   writable layer, and nothing is shared or mounted read-write.
-- **Token values in out.log?** A job can print `$GH_TOKEN` (or read the OAuth token from `/proc`), and
-  `out.log` keeps it. The job dirs are readable by Erick's account, SYSTEM and Administrators. What
-  leaves the runner (exit.json tails, the Discord ping, `claude_check`) is redacted; the card never
-  carries output. See "Output redaction".
-- **`workflow` scope?** Omitting it doesn't stop a job editing a script an existing workflow runs.
-  Don't invite the bot to repos whose CI holds secrets until reviewed.
+- **Token values in out.log?** A job can `cat` its token file (or read the OAuth token from
+  `/proc`), and `out.log` keeps it. The job dirs are readable by Erick's account, SYSTEM and
+  Administrators. What leaves the runner (exit.json tails, the Discord ping, `claude_check`) is
+  redacted; the card never carries output. See "Output redaction".
+- **`workflow` scope?** The App has no Workflows permission, so `.github/workflows/` cannot be
+  pushed; that doesn't stop a job editing a script an existing workflow runs. Don't install the App
+  on repos whose CI holds secrets until reviewed.
 - **Does `findUnsafeConfig()` / the `.git` audit cover enough?** Moot: there is no host clone and no
   audit any more.
 - **Mount-path races, NTFS junctions, container-created symlinks?** Moot for the repo: nothing
@@ -924,12 +1115,13 @@ Do these in order on claunker. Each step says how to check it.
 - **Repo-local Claude settings, `apiKeyHelper`?** Ignored (`--setting-sources user`), verified.
 - **Wall-clock limit?** Yes now: 4h default, runner-enforced.
 - **Phase 1 risk.** Phase 1 is an accepted credential-theft risk for a limited pilot (one scratch repo
-  first, no third-party install scripts, short collaborator list), with the revoke steps above.
-  Round 2 objection, accepted: this must not be described as quickly reversible until the
-  setup-token revocation is verified. The bot PAT can be deleted and the bot uninvited in minutes;
-  the one-year `CLAUDE_CODE_OAUTH_TOKEN` has no verified per-token revoke, so a stolen one must be
-  assumed usable until it expires or Anthropic support revokes it. Rollback is quick for the GitHub
-  side only.
+  first, no third-party install scripts, the App installed on as few repos as possible), with the
+  revoke steps above. Round 2 objection, accepted: this must not be described as quickly reversible
+  until the setup-token revocation is verified. The GitHub side is now self-limiting (a stolen
+  installation token reaches one repo and dies within the hour; the App can be uninstalled in
+  seconds); the one-year `CLAUDE_CODE_OAUTH_TOKEN` has no verified per-token revoke, so a stolen one
+  must be assumed usable until it expires or Anthropic support revokes it. Rollback is quick for the
+  GitHub side only.
 
 ## Review round 2: questions
 
@@ -994,17 +1186,20 @@ on the test-only base, real Docker engine on Linux, Claude Code 2.1.309 against 
   in-flight create. Confirm on claunker by killing a runner mid-launch and checking
   `claude_check` reports `unconfirmed` until the client is gone.
 
-### Open design questions (not acted on in this PR)
+### Open design questions
 
-- **Per-job, per-repo credentials (Argon).** `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` is enforced
-  only on the clone; the bot's classic PAT reaches every repo the bot can write to and can create
-  public repos or gists under the bot, which phase 2's `github.com`/`api.github.com` allowlist
-  still permits. A GitHub App installed on the target repo (or an organization), with the host
-  minting a one-hour installation token scoped to that one repo (`contents: write`,
-  `pull_requests: write`) per job, would shrink both the blast radius and the exposure window.
-  Noted for a later phase; the pilot keeps the classic PAT on one scratch repo.
-- **Setup-token revocation (Astra).** See above: until a revoke path is verified, the one-year
-  OAuth token is the part of a compromise that cannot be undone quickly.
+- **Per-job, per-repo credentials (Argon): decided and implemented (round 3).** The owner chose not
+  to create a bot account at all. Container jobs now act as a GitHub App owned by `icey2488`,
+  installed only on the allowed repos; the host mints a one-hour installation token scoped to the
+  job's one repo (`contents: write`, `pull_requests: write`, `metadata: read`) before `docker run`,
+  delivers it as a read-only mounted file, refreshes it in place every 45 minutes and deletes it on
+  finish (see "Identity: the GitHub App" and "Token delivery and refresh"). The blast radius of a
+  leaked GitHub token is one repo's branches and PRs for at most an hour; it cannot create repos or
+  gists even through phase 2's `github.com`/`api.github.com` allowlist. Still open on this path:
+  whether an in-place rewrite propagates through a Docker Desktop bind mount (the smoke test
+  measures it; a FAIL blocks rollout).
+- **Setup-token revocation (Astra): still open.** Until a revoke path is verified, the one-year
+  OAuth token is the part of a compromise that cannot be undone quickly. Unchanged by round 3.
 
 ## Verified here vs assumed
 
@@ -1021,21 +1216,41 @@ Verified in this sandbox (Linux, a real Docker engine, a test-only base image):
   a local bare repo (host-side test);
 - the Bash tool's environment lacks `CLAUDE_CODE_OAUTH_TOKEN` but `/proc/<pid>/environ` has it;
   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` needs bubblewrap;
-- the entrypoint's clone, base-ref and failure paths (against a local repo via a git URL rewrite),
-  and the gh credential helper answering from `GH_TOKEN`;
+- the entrypoint's clone, base-ref and failure paths (against a local repo via a git URL rewrite);
+  the round-1/2 check of `gh auth git-credential` answering from `GH_TOKEN` is superseded (that
+  helper is gone);
 - run-by-ID after a tag retarget, and `--pull=never` with a missing tag (exit 125);
 - cancel at launch, cancel while running, SIGTERM, the wall-clock limit and cleanup confirmation with
   the real runner and engine; `docker rm -f` semantics;
 - `container/probe.sh` against open, closed and unresolvable targets in a hardened container;
-- the HTTP bridge script with and without a token (401 / 200).
+- the HTTP bridge script with and without a token (401 / 200);
+- round 3 (the GitHub App), in a rebuilt image (`claude-async-job:r3`, test-only base) with the real
+  engine, the real `startJob()` argv and the real runner, against a fake `api.github.com` (which
+  verified every App JWT with the test key) and a fake https `github.com` serving a bare repo with
+  Basic auth checked against the tokens the fake issued: the creds dir arrives read-only at
+  `/run/claude-async/creds` with the token file 0600 and owned by uid 1000; `env` and
+  `/proc/self/environ` in the job shell have no `GH_TOKEN`; `gh auth token` (the wrapper) returns
+  the file's token; the entrypoint's clone authenticated through the credential helper with
+  generation 1; a `git ls-remote` after three in-place rewrites authenticated with generation 4 (the
+  rewrite propagated into the running container through the Linux bind mount); `.git/config` holds
+  no token; `exit.json` tails show `[REDACTED]` for every generation; the creds dir is gone on
+  finish; cleanup confirmed; no container left. The unit tests cover the JWT (`crypto.verify`), the
+  request bodies, the error paths, the key-file permission check, the runner's modes/inode/refresh/
+  failure/delete paths, the credential helper via `git credential fill`, and the gh wrapper.
 
 Not verified here:
 
 - Docker Desktop on Windows, the real `node:24-bookworm-slim` base, host Ollama, and whether
   `host.docker.internal` reaches the Windows host's `127.0.0.1` (the smoke test measures it);
+- **whether an in-place rewrite of the token file propagates through a Docker Desktop bind mount**
+  (Linux bind mounts do; the smoke test's section 5b measures it and fails if it does not);
+- the real GitHub App endpoints (installation lookup, `access_tokens`, `/app`, `/users/<slug>[bot]`)
+  and that GitHub links `<id>+<slug>[bot]@users.noreply.github.com` commits to the App: the request
+  and response shapes follow GitHub's REST documentation from memory and were exercised only against
+  the fake; `tools\mint-app-token.mjs` on claunker is the first real call;
 - `container/smoke-test.ps1` itself: no PowerShell was available, so its PowerShell logic was
   reviewed but never run;
-- a real `claude -p` on the subscription token, and real GitHub clone/push/PR as the bot;
+- a real `claude -p` on the subscription token, and real GitHub clone/push/PR as the App;
 - the ICC-off phase-1 network and the phase-2 proxy;
 - whether the app's Connectors UI can send a bearer header to the HTTP bridge;
 - a revoke path for `claude setup-token` tokens; GitHub's collaborator-level page; Anthropic's

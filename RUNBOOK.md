@@ -445,12 +445,27 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
 - **Preflight refusals name the cause.** `errorCode: "invalid"` for a sandbox the policy doesn't
   allow; `errorCode: "preflight"` with "not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS", "do not take
   workFolder", "docker image ... is not built" (run `container\smoke-test.ps1`), "is Docker Desktop
-  running?", "env file ...", "HTTP MCP bridge is not token-locked" (`node claude-async-http.mjs
-  --new-token`, restart the bridge), or a missing `CLAUDE_ASYNC_CONTAINER_GIT_NAME/_EMAIL`. Nothing is
-  written for a refused start.
+  running?", "env file ..." (it may hold only `CLAUDE_CODE_OAUTH_TOKEN`; a `GH_TOKEN` line is
+  refused), "HTTP MCP bridge is not token-locked" (`node claude-async-http.mjs --new-token`, restart
+  the bridge), or the GitHub App: "CLAUDE_ASYNC_GITHUB_APP_ID is not set", "key file ... does not
+  exist / readable by group or others (chmod 600) / is not a PEM private key", "the GitHub App is not
+  installed on <repo> ... install the app on that repository", or "CLAUDE_ASYNC_GITHUB_APP_ID and
+  CLAUDE_ASYNC_GITHUB_APP_KEY_FILE do not match" (401). `node tools\mint-app-token.mjs <owner/repo>
+  <tmpfile>` runs the same App preflight by hand and prints the slug, bot id and installation.
+  Nothing is written for a refused start.
 - **Exit codes:** 125 is `docker run` itself failing (daemon down, image missing; it never pulls);
-  70 is the entrypoint failing to clone `repo` or check out `baseRef`; 137 is a removed container
-  (`claude_cancel`, the wall-clock limit, OOM at `--memory`, or the runner's own stop on SIGTERM).
+  78 with the warning "could not mint the GitHub App installation token" is the runner failing to
+  get the first token (no container was started; check the App settings, the key file and that
+  api.github.com is reachable from the host); 70 is the entrypoint failing to clone `repo` or check
+  out `baseRef`; 137 is a removed container (`claude_cancel`, the wall-clock limit, OOM at
+  `--memory`, or the runner's own stop on SIGTERM).
+- **GitHub token refresh:** the runner re-mints the one-hour installation token every 45 minutes
+  (`CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`) and rewrites `<job dir>\creds\token` in place. A refresh
+  failure is a `WARN: GitHub App installation token refresh failed` line in `err.log` (once per
+  distinct error; the old token stays until it expires) and, if it keeps failing within 5 minutes
+  of expiry, a warning in `exit.json`; git/gh calls late in such a job may have failed with auth
+  errors. The `creds` folder is deleted when the job ends; one left behind means the runner died
+  hard (delete it by hand; the token in it expires within the hour anyway).
 - **Cancel = `claude_cancel`.** It writes `cancel_requested` in the job dir, then removes the job's
   containers by label. Killing the runner or `docker.exe` with `taskkill /F` does NOT stop the
   container; `claude_check` cleans up when it classifies the job `died`/`timed_out`. By hand:
@@ -458,8 +473,9 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
 - **`containerCleanup: "unconfirmed"`** on a finished job means something with the job's label may
   still exist (usually the daemon was unreachable at the end). Every `claude_check` or
   `claude_cancel` retries; it turns `confirmed` once docker lists nothing.
-- **Tokens in logs:** `out.log`/`err.log` are raw and may hold the bot PAT or OAuth token if a job
-  printed them; exit.json, `claude_check` and the Discord ping are redacted.
+- **Tokens in logs:** `out.log`/`err.log` are raw and may hold the installation token or the OAuth
+  token if a job printed them; exit.json, `claude_check` and the Discord ping are redacted (every
+  token generation the runner minted, plus token shapes).
 - **The HTTP bridge won't start** (`claude-async-http: refusing to start: this host allows container
   jobs ... holds no valid tokenSha256`, exit 78): once `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes
   `container` (or `CLAUDE_ASYNC_JOB_SANDBOX=container`) the bridge requires its token hash at
@@ -467,8 +483,9 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
   claude-async-http.mjs --new-token` under the same `CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes
   (the message prints the `http.json` path it read), give the token to the bridge's clients, restart.
   `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` only works on a host-only policy and is logged.
-- **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; revoke the bot PAT and the setup-token for
-  a full cut-off. See the doc's "Rollback".
+- **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; uninstall the GitHub App from the repo(s)
+  (outstanding tokens die within the hour), delete its private key, and revoke the setup-token for a
+  full cut-off. See the doc's "Rollback".
 
 ## Dispatch defaults (model + effort)
 

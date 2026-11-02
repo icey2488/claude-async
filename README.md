@@ -131,7 +131,7 @@ Optional environment variables:
 | `CLAUDE_ASYNC_PING_MAX_MISSES` | `3` | Consecutive misses before the watchdog exits, if the parent also looks gone |
 | `CLAUDE_ASYNC_PING_HARD_CAP_MISSES` | `6` | Consecutive misses before the watchdog exits unconditionally |
 | `CLAUDE_ASYNC_ALLOWED_SANDBOXES` | `host` | Which modes this host runs at all: `host`, `container` or `host,container`. Container jobs need `container` in it |
-| `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | Exactly `container` makes container jobs the default. The `CLAUDE_ASYNC_CONTAINER_*` settings container jobs need are listed in [docs/container-jobs.md](docs/container-jobs.md#configuration-reference) |
+| `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | Exactly `container` makes container jobs the default. The `CLAUDE_ASYNC_CONTAINER_*` and `CLAUDE_ASYNC_GITHUB_APP_*` settings container jobs need (the GitHub App they act as, its private key file, the OAuth env file) are listed in [docs/container-jobs.md](docs/container-jobs.md#configuration-reference) |
 | `CLAUDE_ASYNC_PING_RESUME_FACTOR` | `2` | A tick-to-tick gap bigger than this many ping intervals is treated as a sleep/resume, forgiving that tick's miss |
 
 ## Discord notifications
