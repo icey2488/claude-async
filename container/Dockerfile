@@ -108,11 +108,26 @@ RUN set -eu; \
 # backups, projects, session-env, sessions, shell-snapshots. The rest are created up front because
 # other code paths write them (todos/plans/file-history/debug/statsig/paste-cache/ide); an
 # unlisted directory the CLI can't create shows up as a CLI error, not as a security hole.
+#
+# /home/agent itself is ROOT-owned too (review round 2): rename(2) needs write permission on the
+# PARENT, not on the directory being renamed, so an agent-owned $HOME would let a job
+# `mv ~/.claude ~/.old && mkdir ~/.claude` and write its own settings.json. (On the overlayfs
+# builds tested here that rename happens to fail with EXDEV because ~/.claude is a lower-layer
+# directory; that is a storage-driver detail, not a permission.) So only the top-level entries the
+# job's tools need are agent-owned: .claude.json (the CLI's state file), .cache / .config / .local
+# (gh, uv, pip, misc XDG; git's global config lives at .config/git/config, which git uses for
+# writes when ~/.gitconfig does not exist, since `git config --global` needs to create a lock file
+# next to it), .npm, .bash_history. Anything else a job tries to create directly under $HOME fails
+# with EACCES, visibly (an `npm config set` that wants ~/.npmrc, for one).
 RUN set -eu; \
     chown root:root /home/agent/.claude && chmod 0755 /home/agent/.claude; \
     for d in backups projects session-env sessions shell-snapshots todos plans file-history debug statsig paste-cache ide; do \
       install -d -o agent -g agent -m 0700 "/home/agent/.claude/$d"; \
-    done
+    done; \
+    for d in .cache .config .config/git .local .npm; do install -d -o agent -g agent -m 0700 "/home/agent/$d"; done; \
+    for f in .config/git/config .bash_history; do install -o agent -g agent -m 0600 /dev/null "/home/agent/$f"; done; \
+    chown agent:agent /home/agent/.claude.json; \
+    chown root:root /home/agent && chmod 0755 /home/agent
 
 # Defaults for every job. None of these is a secret.
 #   DISABLE_AUTOUPDATER: the CLI version is the image's; a job must not change it.

@@ -219,9 +219,13 @@ Two **read-only** bind mounts, nothing else:
 | `container/CLAUDE.md` (or `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD`) | `/home/agent/.claude/CLAUDE.md` |
 | this repo's `hooks/` | `/opt/claude-async/hooks` |
 
-`/home/agent/.claude/CLAUDE.md` is Claude Code's user-level memory file, so the job rules apply in
-addition to the repo's own `CLAUDE.md`. `/workspace` is container-local (the image's writable layer)
-and starts empty; the entrypoint clones into it.
+`/home/agent/.claude/CLAUDE.md` is Claude Code's user-level memory file, so the job rules are in
+every job's instructions. **The repo's own `CLAUDE.md` is NOT loaded** under `--setting-sources user`
+(Claude Code 2.1.309, measured in round 2: the control run without the flag loads it, the
+production flags do not), and neither are the clone's `.claude/agents`, `.claude/skills` or
+`.claude/commands` (see "Review round 2: questions"). A job that needs repo conventions has to read
+the file itself; `container/CLAUDE.md` says so. `/workspace` is container-local (the image's
+writable layer) and starts empty; the entrypoint clones into it.
 
 Mounted vs baked: these two stay mounted so a rules or hook change takes effect on the next job
 without rebuilding the image. The entrypoint (`container/job-entry.sh`) is baked into the image
@@ -229,13 +233,25 @@ instead, because it is tied to the image's tools; **a change to `job-entry.sh` (
 needs an image rebuild** (`container\smoke-test.ps1`). Baking CLAUDE.md and hooks too would remove
 the last host mounts at the cost of a rebuild for every rules or hook edit.
 
-The image makes `/home/agent/.claude` root-owned (0755). Only the directories the CLI writes during
-a headless run are agent-owned: `backups`, `projects`, `session-env`, `sessions` and
-`shell-snapshots` were observed in a local run with a Bash tool call; `todos`, `plans`,
-`file-history`, `debug`, `statsig`, `paste-cache` and `ide` are created up front for other code
-paths (not observed). A job can't create `~/.claude/settings.json`, `agents/`, `commands/` or
-`skills/`. `~/.claude.json` (the CLI's own state file in `$HOME`) stays writable, because the CLI
-writes it.
+The image makes `/home/agent/.claude` root-owned (0755) **and `/home/agent` itself root-owned
+(0755)**. The second part came out of round 2: `rename(2)` needs write permission on the parent,
+not on the directory being moved, so with an agent-owned `$HOME` a job could `mv ~/.claude ~/.old;
+mkdir ~/.claude` and plant its own `settings.json` (the one source `--setting-sources user` still
+loads). On the overlayfs engine tested here that rename happened to fail with `EXDEV` because
+`~/.claude` is a lower-layer directory; that is a storage-driver detail, not a permission, so the
+parent is now root-owned and the refusal is `EACCES` (verified in the rebuilt image, and the smoke
+test checks the rename, a new entry under `$HOME`, and that `$HOME` is root-owned). Only the
+directories the CLI writes during a headless run are agent-owned under `~/.claude`: `backups`,
+`projects`, `session-env`, `sessions` and `shell-snapshots` were observed in a local run with a
+Bash tool call; `todos`, `plans`, `file-history`, `debug`, `statsig`, `paste-cache` and `ide` are
+created up front for other code paths (not observed). Directly under `$HOME` the agent owns only
+`.claude.json` (the CLI's state file; a full headless turn with a Bash tool call still runs and
+writes only `.claude.json` and the `~/.claude` subdirs above), `.cache`, `.config` (git's global
+config is `~/.config/git/config`, which git writes to when `~/.gitconfig` does not exist;
+`git config --global` works), `.local`, `.npm` and `.bash_history`. Anything else a job creates
+directly under `$HOME` (`~/.npmrc`, `~/.ssh`, `~/.gitconfig`) fails with `EACCES`, visibly. A job
+can't create `~/.claude/settings.json`, `agents/`, `commands/` or `skills/`, and can't replace
+`~/.claude`.
 
 ## The clone inside the container
 
@@ -642,6 +658,11 @@ limited per container; the clone and everything else live in the writable layer 
 - Verified with a real Docker engine (Linux, not Docker Desktop): cancel right after launch never
   started the container; cancel while running and SIGTERM gave exit 137 with cleanup confirmed; the
   wall-clock limit gave `timed_out`; a normal run confirmed cleanup; no labelled container was left.
+  Re-run in round 2 with the launch-state code, plus: a runner SIGKILLed between the spawn and the
+  pid write left `docker_launch` = `pending`; the first `claude_check` found no container yet but
+  reported `unconfirmed` (the process scan found the orphaned `docker run` by its label), the next
+  one removed the container the daemon had created meanwhile, and the one after confirmed once the
+  client was gone.
   `docker rm -f` of a running attached container makes the client exit 137, and `docker rm -f` of a
   missing container exits 0 on Docker 29, which is why absence is confirmed by listing, not by exit
   status.
@@ -898,11 +919,92 @@ Do these in order on claunker. Each step says how to check it.
 - **Mount-path races, NTFS junctions, container-created symlinks?** Moot for the repo: nothing
   writable is mounted. The two read-only mounts are files in the claude-async checkout.
 - **Duplicate runners, name reuse?** Cleanup acts only on containers carrying this job's
-  `claude-async.job` label, by immutable ID. A duplicate start is refused by the job-dir check.
+  `claude-async.job` label, by immutable ID. A duplicate start is refused by the job-dir check, and
+  since round 2 the runner itself takes `runner.lock` with O_EXCL (see "Review round 2").
 - **Repo-local Claude settings, `apiKeyHelper`?** Ignored (`--setting-sources user`), verified.
 - **Wall-clock limit?** Yes now: 4h default, runner-enforced.
 - **Phase 1 risk.** Phase 1 is an accepted credential-theft risk for a limited pilot (one scratch repo
   first, no third-party install scripts, short collaborator list), with the revoke steps above.
+  Round 2 objection, accepted: this must not be described as quickly reversible until the
+  setup-token revocation is verified. The bot PAT can be deleted and the bot uninvited in minutes;
+  the one-year `CLAUDE_CODE_OAUTH_TOKEN` has no verified per-token revoke, so a stolen one must be
+  assumed usable until it expires or Anthropic support revokes it. Rollback is quick for the GitHub
+  side only.
+
+## Review round 2: questions
+
+Answers established from the code and, where marked, from the rebuilt image (`claude-async-job:r2`
+on the test-only base, real Docker engine on Linux, Claude Code 2.1.309 against a local fake API).
+
+- **What prevents duplicate runner execution for the same job dir?** Before round 2: only the
+  launch side (the job dir is created once with a non-recursive `mkdir`, `startJob` refuses a
+  duplicate id, and the Windows task launcher withdraws its ticket before falling back to the
+  breakaway path, so one launch yields one runner). The runner itself had no exclusivity. Now
+  `job-runner.mjs` creates `runner.lock` with O_EXCL as its first act, holding its pid; a second
+  runner for the same spec exits 3 before touching docker, the logs or `exit.json`, and logs
+  `another runner (pid N) owns this job dir`. A lock whose pid is dead (or, on Windows, reused by a
+  non-node process) is stale and taken over. Test: two runners on one spec give exactly one
+  `docker run`; a stale lock is taken over. This applies to host jobs too (one more file in the job
+  dir; argv, env and spec.json are unchanged).
+- **Are job-directory ACLs enforced in code?** No. `%USERPROFILE%\.claude-async-jobs` is created
+  with `fs.mkdirSync` and inherits the profile's ACL (Erick, SYSTEM, Administrators). Nothing in
+  job-core sets or checks an ACL; the "Who can read the raw logs" paragraph describes inheritance,
+  not enforcement. The secrets file's ACL is set by the rollout script (`icacls`), also not checked
+  at run time. If a stricter ACL is wanted, it is an operator step, not something the code asserts.
+- **Can the agent rename or replace the root-owned `~/.claude` through its parent?** On the
+  round-1 image, in principle yes (`/home/agent` was agent-owned), and in practice no only because
+  overlayfs returned `EXDEV` for the lower-layer directory. Measured on the round-1 image: the
+  rename fails `EXDEV`, `mv` falls back to copy and cannot delete the root-owned entries, so
+  `~/.claude` survives. Fixed anyway: `/home/agent` is root-owned now, the rename is `EACCES`, and
+  the smoke test checks it (above). On an image built before round 1 (`~/.claude` agent-owned) the
+  agent could simply write `settings.json`; that image must not be used.
+- **Does the bridge supervisor use the same config dir and port as the admitting process?** On
+  claunker both come from `ecosystem.config.cjs` (pm2) or the Task Scheduler entry, which is also
+  where `CLAUDE_ASYNC_ALLOWED_SANDBOXES` lives; the bridge now refuses to start when that policy
+  allows container mode and its own `http.json` (under its own `CLAUDE_ASYNC_CONFIG_DIR`) has no
+  hash, and prints the path it read, so a mismatch shows up as a refusal at the next restart
+  rather than as an open port. Not verified on claunker from here.
+- **Verified setup-token revocation?** Still unverified. No per-token revoke procedure for
+  `claude setup-token` tokens could be confirmed from here (no CLI command, docs not fetchable).
+  Treat a leaked token as live until it expires; see Rollback and the objection above.
+- **What does the CLI still load from the clone under `--setting-sources user`?** Measured in the
+  rebuilt image with a hostile repo fixture (`CLAUDE.md` with a marker, `.claude/settings.json`
+  with a SessionStart hook and an `ANTHROPIC_BASE_URL` redirect, `.claude/agents/hostile-agent.md`
+  and `.claude/skills/hostileskill/SKILL.md` each with a frontmatter `PreToolUse` hook,
+  `.claude/commands/hostilecmd.md`, `.mcp.json`), driving the model through a fake API that
+  requests `Skill`, `Agent` or `Bash` calls and logs every request body:
+  - **Control (no flag):** the repo `CLAUDE.md` is in the system prompt; the agent, skill and
+    command descriptions are advertised; `Skill hostileskill` launches it (its body reaches the
+    model); `/hostilecmd` expands; `Agent hostile-agent` runs (its body reaches the subagent); the
+    settings SessionStart hook runs; the `ANTHROPIC_BASE_URL` redirect takes effect (the run hangs
+    on the dead port).
+  - **Production flags (`--setting-sources user --strict-mcp-config --mcp-config '{"mcpServers":{}}'`):**
+    none of it. The repo `CLAUDE.md` is not in any request; no agent, skill or command marker
+    appears anywhere; `Skill hostileskill` returns `Unknown skill`; `Agent hostile-agent` returns
+    `not found` (available: the built-ins only); `/hostilecmd` is sent as literal text; no hook
+    marker file is created (the frontmatter hooks never had a chance to run because their owners
+    never loaded); no request leaves for the repo's URL. Only the mounted user `CLAUDE.md` loads.
+  So under the production flags the clone contributes nothing to the CLI's configuration or
+  instructions. The flip side is the repo `CLAUDE.md` correction above.
+- **Argon Q2, `com.docker.cli.exe`:** unverified (no Windows here). Docker Desktop's `docker.exe`
+  may hand its work to a `com.docker.cli.exe` child that `TerminateProcess` on `docker.exe` does
+  not kill. The cleanup design does not depend on killing it: a client that survives is found by
+  the label-based process scan (its command line carries `--label claude-async.job=<id>`) and
+  whatever it creates is found by the label-based listing; the hold after a kill covers the
+  in-flight create. Confirm on claunker by killing a runner mid-launch and checking
+  `claude_check` reports `unconfirmed` until the client is gone.
+
+### Open design questions (not acted on in this PR)
+
+- **Per-job, per-repo credentials (Argon).** `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` is enforced
+  only on the clone; the bot's classic PAT reaches every repo the bot can write to and can create
+  public repos or gists under the bot, which phase 2's `github.com`/`api.github.com` allowlist
+  still permits. A GitHub App installed on the target repo (or an organization), with the host
+  minting a one-hour installation token scoped to that one repo (`contents: write`,
+  `pull_requests: write`) per job, would shrink both the blast radius and the exposure window.
+  Noted for a later phase; the pilot keeps the classic PAT on one scratch repo.
+- **Setup-token revocation (Astra).** See above: until a revoke path is verified, the one-year
+  OAuth token is the part of a compromise that cannot be undone quickly.
 
 ## Verified here vs assumed
 
@@ -912,6 +1014,11 @@ Verified in this sandbox (Linux, a real Docker engine, a test-only base image):
   not; `claude --version` and a full headless turn with a Bash tool call run in the image;
 - `--setting-sources user` ignores a hostile repo's settings, hooks, `apiKeyHelper` and `.mcp.json`
   (fake API, control run included); `~/.claude` is unwritable; the CLI writes only the listed dirs;
+- round 2, in the rebuilt image: `/home/agent` root-owned, `~/.claude` cannot be renamed (EACCES),
+  `git config --global` still works, a full headless turn with a Bash tool call still runs; the
+  clone's `CLAUDE.md`, `.claude/agents`, `.claude/skills`, `.claude/commands` do not load under
+  `--setting-sources user` (control run loads all of them); `job-entry.sh` baseRef resolution against
+  a local bare repo (host-side test);
 - the Bash tool's environment lacks `CLAUDE_CODE_OAUTH_TOKEN` but `/proc/<pid>/environ` has it;
   `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` needs bubblewrap;
 - the entrypoint's clone, base-ref and failure paths (against a local repo via a git URL rewrite),

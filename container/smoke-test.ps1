@@ -10,7 +10,8 @@
      limits, host-gateway) and checks:
        - git, gh, node, python3, uv, rg, claude run (versions printed)
        - the job user is uid 1000, not root, and cannot gain privileges
-       - ~/.claude is not writable (no user settings.json, agents/, commands/ a job could plant)
+       - ~/.claude is not writable and not replaceable (root-owned HOME): no user settings.json,
+         agents/, commands/ a job could plant or swap in
        - host Ollama answers at http://host.docker.internal:11434/api/tags
        - NETWORK BOUNDARY (section 4b; every probe must actually run, see below):
            * loopback forwarding, MEASURED: a temporary TcpListener on the host's 127.0.0.1:<random>
@@ -123,12 +124,17 @@ Write-Host "image id: $($script:imageRef)"
 $r = Invoke-InContainer @() 'set -e; git --version; gh --version | head -1; node --version; python3 --version; uv --version; rg --version | head -1; claude --version'
 if ($r.code -eq 0) { Pass "tools run:`n$($r.out.Trim())" } else { Fail "tools: $($r.out)" }
 
-# --- 3. Non-root, no privilege gain, ~/.claude unwritable ----------------------------------
-$r = Invoke-InContainer @() 'id -u; grep -E "^(NoNewPrivs|CapEff):" /proc/self/status; (sudo -n true 2>/dev/null && echo SUDO_OK) || echo NO_SUDO; touch /home/agent/.claude/settings.json 2>/dev/null && echo SETTINGS_WRITABLE || echo SETTINGS_REFUSED; mkdir /home/agent/.claude/agents 2>/dev/null && echo AGENTS_WRITABLE || echo AGENTS_REFUSED'
+# --- 3. Non-root, no privilege gain, ~/.claude unwritable AND not replaceable ----------------
+# Direct writes into ~/.claude, and (round 2) a rename of ~/.claude or a new entry under $HOME: both
+# need write permission on the PARENT, which is root-owned in the image. A rename that merely fails
+# with EXDEV (overlayfs lower-layer directory) would be a storage-driver accident; the check below
+# requires the parent itself to be root-owned, so the refusal is a permission.
+$r = Invoke-InContainer @() 'id -u; grep -E "^(NoNewPrivs|CapEff):" /proc/self/status; (sudo -n true 2>/dev/null && echo SUDO_OK) || echo NO_SUDO; touch /home/agent/.claude/settings.json 2>/dev/null && echo SETTINGS_WRITABLE || echo SETTINGS_REFUSED; mkdir /home/agent/.claude/agents 2>/dev/null && echo AGENTS_WRITABLE || echo AGENTS_REFUSED; python3 -c "import os; os.rename(\"/home/agent/.claude\", \"/home/agent/.claude.old\")" 2>/dev/null && echo RENAME_OK || echo RENAME_REFUSED; mkdir /home/agent/.smoke-new 2>/dev/null && echo HOME_WRITABLE || echo HOME_REFUSED; stat -c "HOME_OWNER=%U" /home/agent; git config --global smoke.ok 1 2>/dev/null && echo GITCONFIG_OK || echo GITCONFIG_REFUSED'
 if ($r.code -eq 0 -and $r.out -match "(?m)^1000\s*$" -and $r.out -match "NoNewPrivs:\s+1" -and $r.out -match "CapEff:\s+0+\s" -and $r.out -match "NO_SUDO" -and
-    $r.out -match "SETTINGS_REFUSED" -and $r.out -match "AGENTS_REFUSED") {
-  Pass "uid 1000, NoNewPrivs=1, no effective capabilities, no sudo, ~/.claude not writable"
-} else { Fail "privileges / ~/.claude: $($r.out)" }
+    $r.out -match "SETTINGS_REFUSED" -and $r.out -match "AGENTS_REFUSED" -and $r.out -match "RENAME_REFUSED" -and $r.out -match "HOME_REFUSED" -and
+    $r.out -match "HOME_OWNER=root" -and $r.out -match "GITCONFIG_OK") {
+  Pass "uid 1000, NoNewPrivs=1, no effective capabilities, no sudo, ~/.claude not writable and not replaceable (root-owned HOME), git global config still writable"
+} else { Fail "privileges / ~/.claude / HOME: $($r.out)" }
 
 # --- 4. Host Ollama --------------------------------------------------------------------------
 $r = Invoke-InContainer @() 'curl -fsS --max-time 10 http://host.docker.internal:11434/api/tags | head -c 400'

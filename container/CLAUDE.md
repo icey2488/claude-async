@@ -1,7 +1,9 @@
 # claude-async container job rules
 
 This file is mounted read-only at `~/.claude/CLAUDE.md` inside every claude-async container job.
-The repo's own `CLAUDE.md` (if it has one) still applies on top of it.
+The CLI runs with `--setting-sources user`, so the repo's own `CLAUDE.md`, `.claude/agents`,
+`.claude/skills` and `.claude/commands` are NOT loaded automatically. If the repo has a `CLAUDE.md`
+(or `AGENTS.md`, `CONTRIBUTING.md`), read it before you start and follow its conventions.
 
 ## Where you are
 
