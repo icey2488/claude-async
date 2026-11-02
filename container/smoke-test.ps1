@@ -341,7 +341,8 @@ if ($EnvFile -or $AppId -or $AppKeyFile) {
   elseif (-not (Test-Path -LiteralPath $AppKeyFile)) { Fail "GitHub App key file $AppKeyFile not found" }
   else {
     # the env file may hold only CLAUDE_CODE_OAUTH_TOKEN now (GH_TOKEN is refused by job-core)
-    $keys = @(Get-Content -LiteralPath $EnvFile | Where-Object { $_ -match "=" } | ForEach-Object { ($_ -split "=", 2)[0] })
+    # blank and '#' comment lines are skipped, as container.mjs checkEnvFile() does (review round 3, C2)
+    $keys = @(Get-Content -LiteralPath $EnvFile | Where-Object { $_.Trim() -ne "" -and -not $_.TrimStart().StartsWith("#") -and $_ -match "=" } | ForEach-Object { ($_ -split "=", 2)[0] })
     if (($keys -join ",") -eq "CLAUDE_CODE_OAUTH_TOKEN") { Pass "env file holds exactly CLAUDE_CODE_OAUTH_TOKEN" }
     else { Fail "env file keys are '$($keys -join ',')'; container jobs accept only CLAUDE_CODE_OAUTH_TOKEN (GitHub credentials come from the App; remove GH_TOKEN)" }
     $envArgs = @("--env-file", $EnvFile)
@@ -354,6 +355,8 @@ if ($EnvFile -or $AppId -or $AppKeyFile) {
     New-Item -ItemType Directory -Path $credsDir | Out-Null
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     icacls $credsDir /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" *> $null
+    # the caller's own values are saved and put back afterwards, never deleted (review round 3, C2)
+    $prevAppId = $env:CLAUDE_ASYNC_GITHUB_APP_ID; $prevAppKey = $env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE
     try {
       $env:CLAUDE_ASYNC_GITHUB_APP_ID = $AppId; $env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE = $AppKeyFile
       $prev = $ErrorActionPreference; $ErrorActionPreference = "Continue"
@@ -379,7 +382,8 @@ if ($EnvFile -or $AppId -or $AppKeyFile) {
       }
     } finally {
       Remove-Item -Recurse -Force $credsDir -ErrorAction SilentlyContinue
-      Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_ID -ErrorAction SilentlyContinue; Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE -ErrorAction SilentlyContinue
+      if ($null -eq $prevAppId) { Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_ID -ErrorAction SilentlyContinue } else { $env:CLAUDE_ASYNC_GITHUB_APP_ID = $prevAppId }
+      if ($null -eq $prevAppKey) { Remove-Item Env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE -ErrorAction SilentlyContinue } else { $env:CLAUDE_ASYNC_GITHUB_APP_KEY_FILE = $prevAppKey }
     }
   }
 }
