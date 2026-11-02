@@ -1,25 +1,31 @@
 # Container jobs (`sandbox: "container"`)
 
 Container jobs run the Claude Code CLI inside a Docker container on claunker instead of on the bare
-Windows host. A container job gets a full shell and runs with `--dangerously-skip-permissions`, but
-it can see only the one repository it was given. It commits, pushes a branch and opens a PR as a
-dedicated GitHub machine account (the bot), never as Erick. Erick then reviews and merges the PR.
+Windows host. A container job gets a full shell and runs with `--dangerously-skip-permissions`. It
+names a GitHub repo; the container clones that repo itself, works in container-local storage,
+pushes a branch and opens a PR as a dedicated GitHub machine account (the bot), never as Erick.
+**No host folder is mounted read-write.** Nothing the job writes reaches the host disk except the
+runner's captured stdout/stderr. `main` requires a PR with the owner's approval: the bot opens PRs,
+Erick approves and merges them, and the bot cannot push to or merge into `main`.
 
-Container mode is **opt-in per job and off by default**. Windows-admin jobs (scheduled tasks,
-services, firewall checks) stay on the host under the existing modes: skip-permissions, or safe
-mode (`CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1`). When container mode is off, every job's argv,
-environment and `spec.json` are unchanged.
+Container mode is **opt-in, off by default, and gated twice**: the call (or
+`CLAUDE_ASYNC_JOB_SANDBOX`) must ask for it, and the host policy `CLAUDE_ASYNC_ALLOWED_SANDBOXES`
+must allow it (default: `host` only). Windows-admin jobs (scheduled tasks, services, firewall checks)
+stay on the host under the existing modes: skip-permissions, or safe mode
+(`CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1`). When container mode is not used, every job's argv,
+environment and `spec.json` are unchanged (a test asserts the literal host argv).
 
 | piece | file |
 |---|---|
-| argv building, validation, kill, `.git` audit | `container.mjs` |
-| launch integration (`sandbox` param, preflight, `cancelJob`, reap) | `job-core.mjs` |
-| runner: kill on signal, kill in `finish()`, post-run `.git` audit | `job-runner.mjs` |
-| `sandbox` on `claude_start` / `POST /v1/start`, new `claude_cancel` | `dispatch.mjs`, `host-api.mjs` |
-| job image | `container/Dockerfile` |
+| argv building, validation, cleanup by label, redaction, bridge lock check | `container.mjs` |
+| launch integration (`sandbox`/`repo`/`baseRef`, preflight, `cancelJob`, cleanup state) | `job-core.mjs` |
+| runner: cancel intent, cleanup on every stop, wall-clock limit, redaction, PR URL | `job-runner.mjs` |
+| `claude_start` params, `claude_cancel`, `POST /v1/start`, `POST /v1/cancel` | `dispatch.mjs`, `host-api.mjs` |
+| HTTP bridge token lock | `http-bridge.mjs`, `claude-async-http.mjs` |
+| job image and its entrypoint (the clone) | `container/Dockerfile`, `container/job-entry.sh` |
 | rules mounted read-only into every job | `container/CLAUDE.md` |
-| image build + checks on claunker | `container/smoke-test.ps1` |
-| tests | `test/container.test.mjs`, `test/container-runner.test.mjs` |
+| image build + checks on claunker | `container/smoke-test.ps1`, `container/probe.sh` |
+| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs` |
 
 ## Why
 
@@ -27,9 +33,34 @@ Today a job either runs with `--dangerously-skip-permissions`, where everything 
 account can read is reachable, or in safe mode. Safe mode's pattern rules leak: `node -e`,
 `python -c` and `git -C x push` all get past them (see `docs/publishing.md`, "Threat model"). In
 both modes `git push` would use Erick's own full GitHub credential from Git Credential Manager.
-Container jobs change the boundary from "what the permission rules happen to match" to "what is
-mounted and what credential is present". A job can do anything inside the container. That covers
-only one repo and a bot token that can't do anything Erick's repos don't allow the bot to do.
+Container jobs change the boundary from "what the permission rules happen to match" to "what is in
+the container and which credential is present". A job can do anything inside the container. That
+covers one fresh clone and a bot token that can't do anything Erick's repos don't allow the bot to do.
+
+## The interface
+
+```
+claude_start { host, prompt, sandbox: "container", repo: "owner/repo", baseRef?: "branch|tag|sha",
+               model?, effort?, intent?, jobId? }
+POST /v1/start  (same body; forwarded by claude_start for a remote host)
+claude_cancel { jobId }        POST /v1/cancel { jobId }   (routed by the job id's host prefix)
+```
+
+- **`repo`** (required for a container job): `owner/repo` on GitHub. It must be listed in the
+  executing host's `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` (comma, semicolon or space separated,
+  case-insensitive). There is no default: unset means every container job is refused.
+- **`baseRef`** (optional): a branch, tag or commit to start from. Plain names only (no leading
+  `-`, no `..`, no `@{`). Default: the repo's default branch.
+- **`workFolder` is refused** for a container job ("container jobs do not take workFolder"), and
+  **`repo`/`baseRef` are refused** for a host job. So no call can mean two things, and every
+  existing host-mode call is unaffected. `repo`, `baseRef` and `sandbox` are only forwarded to a
+  remote host when given, so a forwarded host-mode body is byte-for-byte what it was.
+
+Why a `repo` parameter rather than a mapping from `workFolder`: a mapping would keep a host path in
+the interface that no longer means anything (nothing is mounted), and would need a second table
+from folders to repos that could drift from the bot's real collaborator list. `owner/repo` is what
+the container actually acts on, it is checked against one explicit allowlist, and it reads the same
+in a prompt, in `meta.json` and on GitHub.
 
 ## Threat model
 
@@ -37,119 +68,179 @@ Read this before you count on the container for anything.
 
 **What the container boundary protects:**
 
-- **Erick's files and credentials.** Nothing from `%USERPROFILE%` is mounted. That includes
-  `.ssh`, `.claunker`, `.claude` (Erick's own Claude Code login), `.claude-async` (Discord
-  webhook, hosts.json, api.json), `.claude-async-jobs` (other jobs' logs), Git Credential Manager,
-  the Windows Credential Manager and gh's stored token. No other repo under `D:\code` is mounted,
-  and neither is the live chassis (`D:\claunker`). The container's mount table holds exactly three
-  bind mounts. The smoke test checks this.
-- **Erick's GitHub identity.** The only GitHub credential in the container is the bot's token. A
-  job can push only where the bot is a collaborator (or to the bot's own forks). Main stays
-  protected by the existing rules: no deletion, no force-push.
+- **Erick's files, repos and credentials.** No host folder is mounted read-write, and nothing from
+  `%USERPROFILE%` is mounted at all: not `.ssh`, `.claunker`, `.claude` (Erick's own Claude Code
+  login), `.claude-async` (Discord webhook, hosts.json, api.json, http.json), `.claude-async-jobs`
+  (other jobs' logs), Git Credential Manager, the Windows Credential Manager or gh's stored token.
+  No working copy under `D:\code` is visible, and neither is the live chassis (`D:\claunker`). The
+  only host mounts are two read-only ones (CLAUDE.md and hooks/, below). The smoke test checks the
+  mount table.
+- **The host from the job's git activity.** Earlier drafts bind-mounted a host clone and audited its
+  `.git` afterwards. That design is gone: the clone lives and dies in the container, and no host git
+  ever runs in a job's repo (the card hook's HEAD lookup is skipped for container jobs). So
+  `.git/config` tricks (`core.fsmonitor`, hooks, `commondir`, a `.git` file swap) have nothing on the
+  host to act on.
+- **Erick's GitHub identity, and `main`.** The only GitHub credential in the container is the bot's
+  token. A job can push only where the bot is a collaborator (or to the bot's own forks). `main`
+  requires a pull request with 1 approval from the owner, set by a ruleset, so the bot cannot push
+  to `main` or merge into it, even with write access. Erick reviews and merges every PR.
 - **The host OS.** The job runs as uid 1000, not root, with `--cap-drop ALL` and
-  `--security-opt no-new-privileges`. It has no Docker socket and gets CPU, memory and PID limits.
+  `--security-opt no-new-privileges`. It has no Docker socket and gets CPU, memory, PID and
+  wall-clock limits.
+- **Concurrent jobs from each other's files.** Each container has its own clone. Two jobs never
+  share a working tree or a `.git`, so one can't change another's repo mid-run.
+- **Repo-controlled Claude settings.** A hostile repo's `.claude/settings.json`,
+  `.claude/settings.local.json` or `.mcp.json` could set env (`ANTHROPIC_BASE_URL`), an
+  `apiKeyHelper`, hooks or MCP servers, all of which act at CLI startup before the model sees the
+  prompt. The CLI runs with `--setting-sources user` (only user settings plus our `--settings`) and
+  `--strict-mcp-config` with an empty config, and the image makes `~/.claude` root-owned so a job
+  can't create user settings either. Verified in a local build against a fake API: with the flag a
+  repo carrying all of the above sends nothing to its endpoint and runs none of its hooks or its
+  `apiKeyHelper`; without the flag (control) the repo's `ANTHROPIC_BASE_URL` beat the process
+  environment, its SessionStart hook and `apiKeyHelper` ran, and the OAuth bearer went to the
+  repo's endpoint. That control also shows why `ANTHROPIC_BASE_URL` is **not** set in the container
+  env: a settings file outranks the process environment, so it would not have helped, and with
+  project/local settings off no remaining source can change it.
 
 **What it does NOT protect:**
 
-- **The mounted repo.** The repo is mounted read-write, including `.git`. A confused job can wreck
-  the working tree, delete branches locally, rewrite local history, or delete `.git` entirely.
-  Unpushed work in that clone is at risk. Mitigation: give container jobs **dedicated clones**
-  (for example `D:\code\jobs\<repo>`), not the working copies Erick edits by hand.
-  `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS` should point at that folder only.
-- **Code that runs on the host later.** The host runs git in the same repo after the job: the
-  card hook's `git rev-parse HEAD`, and later Erick himself. A job can plant `.git/config` entries
-  that execute on the host (`core.fsmonitor`, `core.hooksPath`, filter drivers, `include.path`,
-  `credential.helper`), or a `.git/hooks/*` script. Mitigation: job-core records the repo's
-  host-executing config keys and hooks before the job (`auditRepoGitState()`, using the same
-  allowlist as `publish-branch.mjs`). After the container exits, the runner compares the repo
-  against that list and reports anything new in `exit.json` (`container.newGitFindings` plus a
-  warning) and in `err.log`. When there are findings, it also skips the card hook's host git
-  call. **It reports. It does not clean up.** If `claude_check` shows that warning, inspect the repo
-  before you run git in it. Planted files in the working tree, such as a `Makefile`,
-  `package.json` scripts or a `.vscode/tasks.json`, also run on the host if Erick runs them there.
-  Review the PR before you build it locally.
-- **The bot token, against the bot's own reach.** The job holds the bot's token and can use it for
-  anything that token allows: push branches to every repo the bot can write to, open or close
-  issues and PRs, and comment. A classic PAT can't be scoped to selected repos (see "Identity"
-  below), so the bot's reach is exactly its collaborator list. Keep that list short.
-- **The network (phase 1).** On the default bridge network a job can reach the whole internet, so
-  it can exfiltrate the repo's contents and the two tokens in its environment. Phase 2 (below)
-  narrows egress to an allowlist.
-- **Host loopback services.** `host.docker.internal` reaches the Windows host. That is how host
-  Ollama is reachable, and the same path can reach other services listening on the host (whether
-  that includes services bound only to `127.0.0.1` is unverified; assume it does). Two of them
-  would be a way out of the sandbox:
-  - `claude-async-http.mjs` on `127.0.0.1:7842` is an unauthenticated MCP endpoint. A job that
-    reached it could start a `sandbox: "host"` job with skip-permissions.
-  - The Docker Engine TCP API on `2375` exists if "Expose daemon on tcp://localhost:2375 without
-    TLS" is ever turned on in Docker Desktop settings.
-
-  The smoke test probes both ports and fails if either is reachable. Never enable the 2375 setting.
-  If 7842 turns out to be reachable on claunker, the fix is to stop running the HTTP bridge (or
-  front it with an auth token) before enabling container mode. Phase 2's internal network removes
-  this path entirely, because the job then has no route to the host except through the proxy.
+- **The two tokens, in phase 1. This is an accepted risk for a limited pilot.** With open egress a
+  job (or code it runs: `npm install` scripts, test suites, anything from the repo or its
+  dependencies) can send `GH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` anywhere, and use them after the
+  container is gone. The PAT reaches every repo the bot can write to; the OAuth token is a
+  long-lived credential on Erick's subscription. Revocation (see Rollback) helps recovery but does
+  not contain a compromise nobody noticed. Measured detail: Claude Code 2.1.309 already leaves
+  `CLAUDE_CODE_OAUTH_TOKEN` out of the environment of its Bash tool's commands (the env names a
+  Bash call saw were listed in a local run), but the same uid can read it from
+  `/proc/<claude pid>/environ` (also verified), and `GH_TOKEN` is in every command's environment by
+  necessity. The CLI has a `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` mode, but it requires bubblewrap
+  (user namespaces) and forces the permission mode back to default, which defeats
+  skip-permissions; it was not adopted. A wrapper that hides the token somewhere the same uid can
+  still read would not change this. The real mitigation is phase 2 egress. Until then the pilot
+  repo should have no third-party install scripts (no dependencies with `postinstall`, no
+  `prepare`, no build steps pulling code), and the bot should be a collaborator on as few repos as
+  possible.
+- **The bot token, against the bot's own reach.** The job can do anything the token allows: push
+  branches to every repo the bot can write to, open or close issues and PRs, comment. A classic PAT
+  can't be scoped to selected repos (see "Identity"), so the bot's reach is exactly its collaborator
+  list. Keep that list short.
+- **CI on repos the bot can push to.** Leaving the `workflow` scope off stops a push that edits
+  `.github/workflows/`. It does not stop a job from editing a script, Makefile, test or package
+  script that an existing workflow already runs on a PR or branch push. Whether that exposes secrets
+  or a self-hosted runner depends on the workflow's triggers, permissions, secrets and runner. **Do
+  not invite the bot to any repo whose CI holds secrets (or runs on a self-hosted runner) until that
+  CI has been reviewed for this.**
+- **The network (phase 1).** On the default bridge network a job can reach the whole internet,
+  claunker's own LAN and tailnet addresses, and other machines on the LAN and tailnet (Hermes,
+  Spine, AgentGlass, Home Assistant and so on) with claunker's source address. Anything that trusts
+  "it came from claunker" or "it came from the LAN/tailnet" is exposed. The smoke test probes
+  claunker's own addresses and any `-LanTargets` you give it; reachable LAN services are WARNs, not
+  failures, because phase 1 accepts this. Phase 2 (below) removes these routes.
+- **Host loopback services.** `host.docker.internal` reaches the Windows host, which is how host
+  Ollama is reachable. On Docker Desktop that path forwards to the host's `127.0.0.1` as well; the
+  smoke test measures it directly with a temporary listener on a random loopback port. So assume
+  every loopback service is reachable from a job:
+  - `claude-async-http.mjs` on `127.0.0.1:7842` is an MCP endpoint that can start host jobs.
+    **Container mode refuses to start unless that bridge is token-locked**: `~/.claude-async/http.json`
+    must hold a token hash (`node claude-async-http.mjs --new-token`), and whatever listens on the
+    port must answer an unauthenticated MCP request with 401 (so an old bridge that was not restarted
+    also refuses). The bridge itself keeps working unauthenticated when no token file exists,
+    because its documented client (the app's Connectors UI) cannot, as far as I know, send a static
+    header; on claunker that means container mode requires either giving the bridge's clients the
+    token or stopping the bridge.
+  - The host API on `7850` is bearer-token gated and binds only to the tailnet address. A job can
+    reach it (WARN in the smoke test) but can't use it without the token, which is not in the
+    container.
+  - The Docker Engine TCP API on `2375`/`2376` exists only if "Expose daemon on tcp://localhost:2375
+    without TLS" is turned on in Docker Desktop. Never enable it; the smoke test fails if it is
+    reachable.
+  - **Ollama's write endpoints** (`/api/pull`, `/api/create`, `/api/copy`, `/api/delete`,
+    `/api/push`) are unauthenticated and reachable. A job could delete or replace host models.
+    Phase 1 accepts this; `container/CLAUDE.md` tells jobs to use only generate/chat/tags/show, and
+    phase 2's proxy allows only those.
 - **The Docker daemon itself.** Anyone who can talk to the Docker daemon controls the host:
   `docker run -v C:\:/host` mounts the whole disk. So a job must **never** get the Docker socket
-  (`//./pipe/docker_engine`, `/var/run/docker.sock`), `DOCKER_HOST`, or the TCP API above.
-  `container.mjs` mounts nothing beyond its three fixed mounts, and the tests assert that the argv
-  never mentions a socket or pipe. This also means a container job can't run Docker itself
-  (no docker-in-docker). Jobs that need Docker stay on the host.
+  (`//./pipe/docker_engine`, `/var/run/docker.sock`), `DOCKER_HOST`, or the TCP API. The tests
+  assert the argv never mentions a socket or pipe. A container job therefore can't run Docker
+  itself (no docker-in-docker). Jobs that need Docker stay on the host.
 - **Container escapes.** The container shares a Linux kernel with Docker Desktop's WSL2 VM. A
-  kernel or runtime escape would land in that VM, which can reach the Windows filesystem through
-  its file-sharing mounts. Non-root, no capabilities and no-new-privileges make that much harder.
-  They don't make it impossible. This is a sandbox for confused or over-eager jobs, not for
-  hostile code.
+  kernel or runtime escape would land in that VM, which can reach the Windows filesystem through its
+  file-sharing mounts. Non-root, no capabilities and no-new-privileges make that much harder. They
+  don't make it impossible. This is a sandbox for confused or over-eager jobs, not for hostile code.
 - **Prompt injection still steers the job.** Content the job reads (issues, web pages, dependency
-  READMEs) can still steer what it does inside the sandbox, including what it pushes. Branch
-  protection and Erick's review of every PR are the backstop.
+  READMEs) can steer what it does inside the sandbox, including what it pushes. The PR rule on
+  `main` and Erick's review of every PR are the backstop. Review the PR before you build or run it
+  locally: files in it (a `Makefile`, `package.json` scripts, `.vscode/tasks.json`, `.envrc`) run on
+  whatever machine runs them.
 
 ### Why `--dangerously-skip-permissions` inside
 
-Inside the container, the permission system has nothing left worth guarding. A job could already
-run arbitrary code through `node`, `python`, `uv` or `npm`, and the leaks safe mode documented
+Inside the container the permission system has nothing left worth guarding. A job could already run
+arbitrary code through `node`, `python`, `uv` or `npm`, and the leaks safe mode documented
 (`node -e`, `git -C x push`) go away because there is nothing else on the box to reach. What a job
-can touch is decided by the mounts, the token and the network, not by pattern rules. So container
-jobs use skip-permissions, which gives them the full shell Erick wants. The **no-background hook
-still runs**: it is mounted read-only from this repo's `hooks/` and wired by
-`buildContainerSettings()`. The job-tool-gate and Ollama-guard hooks stay host-only. The gate
-needs the host's claunker-hermes checkout. The Ollama guard exists for dontAsk mode, which
-container jobs don't use.
+can touch is decided by what is in the container, the token and the network, not by pattern rules.
 
-Claude Code refuses `--dangerously-skip-permissions` when it runs as root outside a recognized
-sandbox. The string "--dangerously-skip-permissions cannot be used with root/sudo privileges" is in
-the 2.1.309 binary. The image runs as uid 1000, so that check never fires.
+The **no-background hook still runs**, from the read-only hooks mount, as
+`env -u NODE_OPTIONS /usr/local/bin/node /opt/claude-async/hooks/no-background-hook.mjs`, so neither
+a `PATH` entry nor `NODE_OPTIONS` the job sets can replace it. It is a **reliability guard** (it
+keeps jobs from backgrounding work and ending their turn early), **not a security boundary**: a job
+already runs arbitrary code in its own container. The job-tool-gate and Ollama-guard hooks stay
+host-only (the gate needs the host's claunker-hermes checkout; the Ollama guard exists for dontAsk
+mode, which container jobs don't use).
+
+Claude Code refuses `--dangerously-skip-permissions` as root outside a recognized sandbox. The image
+runs as uid 1000, so that check never fires.
 
 ## What is mounted
 
-Exactly three bind mounts, built by `buildDockerRunArgv()`:
+Two **read-only** bind mounts, nothing else:
 
-| host | container | mode |
-|---|---|---|
-| the job's `workFolder` (realpath) | `/workspace` (also the working dir) | read-write |
-| `container/CLAUDE.md` (or `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD`) | `/home/agent/.claude/CLAUDE.md` | read-only |
-| this repo's `hooks/` | `/opt/claude-async/hooks` | read-only |
+| host | container |
+|---|---|
+| `container/CLAUDE.md` (or `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD`) | `/home/agent/.claude/CLAUDE.md` |
+| this repo's `hooks/` | `/opt/claude-async/hooks` |
 
 `/home/agent/.claude/CLAUDE.md` is Claude Code's user-level memory file, so the job rules apply in
-addition to the repo's own `CLAUDE.md`. Because the file is read-only, a job can't rewrite its
-own rules.
+addition to the repo's own `CLAUDE.md`. `/workspace` is container-local (the image's writable layer)
+and starts empty; the entrypoint clones into it.
 
-**`workFolder` validation** (`validateWorkFolder()`, run before the job dir exists):
+Mounted vs baked: these two stay mounted so a rules or hook change takes effect on the next job
+without rebuilding the image. The entrypoint (`container/job-entry.sh`) is baked into the image
+instead, because it is tied to the image's tools; **a change to `job-entry.sh` (or the Dockerfile)
+needs an image rebuild** (`container\smoke-test.ps1`). Baking CLAUDE.md and hooks too would remove
+the last host mounts at the cost of a rebuild for every rules or hook edit.
 
-- It must be absolute and must exist. It is resolved with `fs.realpathSync.native`, which follows
-  symlinks *and* Windows junctions, and a `\\?\` long-path prefix is stripped. The **target** is
-  judged, so `D:\code\jobs\innocent` that is a junction to `C:\Users\Raide` is refused.
-- It must be strictly inside one of `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, using the same
-  `isInside()` check as `publish-branch.mjs` (case-insensitive on win32, and `D:\code-private`
-  doesn't count as inside `D:\code`). It can't be the root itself, which would mount every repo
-  under it. There is **no default root**: if the variable is unset, every container job is refused.
-- It must not overlap a denied path in either direction. The claude-async checkout is always
-  denied, because a job editing it would be editing the code the bridge runs on the host.
-  `CLAUDE_ASYNC_CONTAINER_DENIED_ROOTS` adds more (for example `D:\claunker`).
-- It must be a git top-level with a real `.git` **directory**. A linked worktree or submodule has a
-  `.git` file pointing at a git dir outside the mount, so git wouldn't work inside the container.
-  Those are refused with a message saying to use a full clone.
-- Paths with a comma, a double quote or a control character are refused, because `--mount` is a
-  CSV field list. UNC paths are refused too, since Docker Desktop shares local drives.
+The image makes `/home/agent/.claude` root-owned (0755). Only the directories the CLI writes during
+a headless run are agent-owned: `backups`, `projects`, `session-env`, `sessions` and
+`shell-snapshots` were observed in a local run with a Bash tool call; `todos`, `plans`,
+`file-history`, `debug`, `statsig`, `paste-cache` and `ide` are created up front for other code
+paths (not observed). A job can't create `~/.claude/settings.json`, `agents/`, `commands/` or
+`skills/`. `~/.claude.json` (the CLI's own state file in `$HOME`) stays writable, because the CLI
+writes it.
+
+## The clone inside the container
+
+`docker run ... <image id> /usr/local/bin/claude-async-job-entry <owner/repo> <baseRef or ""> -- claude <args>`
+
+`job-entry.sh` re-validates the repo and ref with the same rules as `container.mjs`, refuses a
+non-empty `/workspace`, then:
+
+```
+git clone -- https://github.com/<owner/repo>.git /workspace
+git fetch origin <baseRef> && git checkout --detach FETCH_HEAD     # only when baseRef is given
+exec claude ...
+```
+
+- **Credentials.** The image's system git config (`/etc/gitconfig`, root-owned) sets
+  `credential.https://github.com.helper = !/usr/local/bin/gh auth git-credential`. git asks gh, and
+  gh answers from `GH_TOKEN` in the environment. The token is never in argv, a remote URL or a
+  file; `gh auth setup-git` is not needed. Verified in the image: the helper answers from the env
+  token, and a clone leaves no token in `.git/config`.
+- **Exit codes** of the entrypoint itself: 64 usage/validation, 70 clone or checkout failed (the
+  runner adds a warning naming the repo), 78 configuration (no `GH_TOKEN`, `/workspace` not empty).
+  The entrypoint's success and failure paths were exercised in the image against a local repo.
+- `CLAUDE_ASYNC_REPO` and `CLAUDE_ASYNC_BASE_REF` are set in the container so the job knows what it
+  cloned and what to open its PR against.
 
 ## How secrets reach the container
 
@@ -162,32 +253,43 @@ GH_TOKEN=ghp_...
 CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 ```
 
-- **By path, never by value.** job-core passes `--env-file <path>` and Docker reads the file
-  itself. Neither the docker argv nor `spec.json` nor `meta.json` ever holds a value (the tests
-  assert this). Every non-secret variable goes in as an explicit `-e NAME=value`. A bare `-e NAME`
-  is never used, because it would copy the host's own value in. Any `-e` name that looks like a
-  credential throws.
-- **Checked before every job, values never echoed.** `checkEnvFile()` reads the file only to
-  check its shape. It returns key names, never values. It refuses: a key other than the two above
-  (notably `ANTHROPIC_API_KEY`, which outranks `CLAUDE_CODE_OAUTH_TOKEN` and would silently switch
-  billing from the subscription to the API), a missing or empty key, a duplicate, a bare `KEY` line,
-  CRLF line endings or a UTF-8 BOM (Docker would keep the `\r` in the value or put the BOM in the
-  first key name), and a file inside the repo or any allowed root.
-- **Never in the image.** `container/Dockerfile` takes no secret build args, and nothing in it
-  reads one.
-- **Never logged by claude-async.** The job itself can print its own environment, and
-  `container/CLAUDE.md` tells it not to. A job that does anyway writes the tokens into `out.log` in
-  the job dir on the host. That leak is bounded by what the tokens can do, which is why both are
-  dedicated (bot-only GitHub token, revocable Claude Code token).
-- **Why not Docker secrets?** Docker secrets (`/run/secrets/...`) are a Swarm/Compose feature. A
-  plain `docker run` can't use them without Swarm. Mounting a secrets *file* read-only would be
-  equivalent to `--env-file` here, because the job runs as the user that reads it either way. And
-  gh and Claude Code read their tokens from environment variables, so the env file is simplest.
+- **By path, never by value.** job-core passes `--env-file <path>` and Docker reads the file itself.
+  Neither the docker argv nor `spec.json` nor `meta.json` ever holds a value (the tests assert this).
+  Every non-secret variable goes in as an explicit `-e NAME=value`; a bare `-e NAME` is never used,
+  and any `-e` name that looks like a credential throws.
+- **Checked before every job, values never echoed.** `checkEnvFile()` returns key names, never
+  values. It refuses: a key other than the two above (notably `ANTHROPIC_API_KEY`, which outranks
+  `CLAUDE_CODE_OAUTH_TOKEN` and would silently switch billing to the API), a missing, empty or
+  duplicate key, a bare `KEY` line, CRLF line endings, a UTF-8 BOM, a file inside the claude-async
+  checkout, and any value with quotes, leading/trailing or inner whitespace (how a trailing
+  `# comment` shows up) or control characters, since Docker's `--env-file` keeps all of those
+  literally.
+- **Never in the image.** The Dockerfile takes no secret build args, and nothing in it reads one.
+- **Output redaction.** A job can print its own environment (or read `/proc/*/environ`).
+  `out.log`/`err.log` in the job dir keep exactly what the job printed. Everything that **leaves the
+  runner** is redacted with the env file's two values (read into memory once by
+  `readEnvFileSecretValues()`, never written) plus the GitHub (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`,
+  `github_pat_`) and Anthropic (`sk-ant-`) token shapes:
+  - `exit.json`'s `stdoutTail`/`stderrTail` (the runner redacts before writing);
+  - the Discord ping: its headline is the first meaningful stdout line, and every candidate line is
+    redacted before one is picked;
+  - `claude_check` and `GET /v1/check`: `checkJob()` redacts a container job's stdout/stderr tails
+    and exit tails before returning them (they go to a chat session, or to another host).
+  The dispatch card never carries job output: it holds the intent or prompt summary from the
+  dispatcher and a done/fail disposition (host jobs also get a delivery HEAD sha; container jobs
+  don't), so it needs no redaction.
+- **Who can read the raw logs.** The job dirs live in `%USERPROFILE%\.claude-async-jobs` and inherit
+  the profile's ACL: Erick's account, SYSTEM and the local Administrators group. Anything running as
+  Erick (including host-mode jobs) can read them. Treat them as holding the tokens.
+- **Why not Docker secrets?** Docker secrets (`/run/secrets/...`) are a Swarm/Compose feature, and a
+  mounted secrets file would be readable by the same job user anyway. gh and Claude Code read their
+  tokens from environment variables, so the env file is simplest.
 
 ## Claude Code authentication inside the container
 
 Verified against Anthropic's authentication docs
-(<https://code.claude.com/docs/en/authentication>, section "Generate a long-lived token"):
+(<https://code.claude.com/docs/en/authentication>, section "Generate a long-lived token"; fetched
+by an earlier run of this work, not re-fetched this time):
 
 > For CI pipelines, scripts, or other environments where interactive browser login isn't
 > available, generate a one-year OAuth token with `claude setup-token` ... copy it and set it as
@@ -197,104 +299,55 @@ Verified against Anthropic's authentication docs
 
 The same page's precedence list ranks `ANTHROPIC_AUTH_TOKEN`, then `ANTHROPIC_API_KEY`, then
 `apiKeyHelper`, then `CLAUDE_CODE_OAUTH_TOKEN`, then `/login` credentials. That is why the env file
-may not carry `ANTHROPIC_API_KEY`. The page also notes that `--bare` mode does not read
-`CLAUDE_CODE_OAUTH_TOKEN`, so container jobs never pass `--bare`.
+may not carry `ANTHROPIC_API_KEY`, and why a repo-supplied `apiKeyHelper` mattered (it outranks the
+OAuth token). `--bare` mode does not read `CLAUDE_CODE_OAUTH_TOKEN`, so container jobs never pass
+`--bare`.
 
-So: run `claude setup-token` once on claunker, in a browser session logged in to Erick's
-subscription, and put the printed token in the secrets file. It lasts one year. Put a calendar
-reminder to regenerate it before then. The container never sees `%USERPROFILE%\.claude`, so
-Erick's interactive login is untouched.
-
-The image sets `hasCompletedOnboarding` in `/home/agent/.claude.json`, so the first `claude -p`
-run doesn't stop at first-run setup. Without a token, the image's CLI prints
-`Not logged in · Please run /login` (observed in this sandbox). The end-to-end headless call with
-a real token could not be run here. `container/smoke-test.ps1 -EnvFile ... -RunClaude` does it on
-claunker.
+Run `claude setup-token` once on claunker, in a browser session logged in to Erick's subscription,
+and put the printed token in the secrets file. It lasts one year; set a reminder to regenerate it.
+The container never sees `%USERPROFILE%\.claude`, so Erick's interactive login is untouched. The
+image sets `hasCompletedOnboarding` in `/home/agent/.claude.json`, so `claude -p` doesn't stop at
+first-run setup.
 
 ## Ollama delegation
 
-Jobs are expected to delegate eligible work to `qwen2.5-coder:7b` on the host's Ollama. Inside the
-container, `localhost:11434` is the container itself, so:
+Jobs delegate eligible work to `qwen2.5-coder:7b` on the host's Ollama. Inside the container,
+`localhost:11434` is the container itself, so `--add-host host.docker.internal:host-gateway` is
+passed (phase 1) and `OLLAMA_HOST`/`CLAUDE_ASYNC_OLLAMA_URL` are set to
+`http://host.docker.internal:11434` (override: `CLAUDE_ASYNC_CONTAINER_OLLAMA_URL`). Erick's global
+CLAUDE.md names `127.0.0.1:11434`, which is wrong inside the container; the container's CLAUDE.md
+overrides it, and job prompts should say "use `$OLLAMA_HOST`". If Ollama is reachable on the host
+but not from the container, set `OLLAMA_HOST=0.0.0.0:11434` for the Ollama service and allow the
+port through Windows Firewall for the WSL/Docker virtual adapter only. The smoke test checks
+reachability and that `qwen2.5-coder:7b` is listed.
 
-- `--add-host host.docker.internal:host-gateway` is always passed. Docker Desktop already provides
-  that name, and the flag makes it explicit and also works on a plain Linux engine.
-- `OLLAMA_HOST` and `CLAUDE_ASYNC_OLLAMA_URL` are set to `http://host.docker.internal:11434`
-  (override: `CLAUDE_ASYNC_CONTAINER_OLLAMA_URL`). `container/CLAUDE.md` tells jobs to use
-  `$OLLAMA_HOST`. The `ollama` CLI isn't in the image. Use the HTTP API with curl.
-- **Erick's global CLAUDE.md names `127.0.0.1:11434`.** Inside the container that address is wrong,
-  and the container's `CLAUDE.md` overrides it. Job prompts written from the host's template should
-  say "use `$OLLAMA_HOST`", or leave the URL out.
-- Docker's docs say `host.docker.internal` "resolves to the internal IP address of your host" and
-  show a container reaching a host service through it
-  (<https://docs.docker.com/desktop/features/networking/networking-how-tos/>). They don't say
-  whether a service bound only to the host's `127.0.0.1` is reachable that way. My understanding is
-  that Docker Desktop forwards it, but that is unverified, and the smoke test checks it. If Ollama
-  is reachable on the host but not from the container, set
-  `OLLAMA_HOST=0.0.0.0:11434` for the Ollama service and allow the port through Windows Firewall
-  for the WSL/Docker virtual adapter only. The smoke test checks reachability and that
-  `qwen2.5-coder:7b` is listed.
-- Phase 2 keeps this path through the proxy's allowlist (see below).
+## Git identity
 
-## Git identity and credentials inside
-
-- **Identity.** job-core sets `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` and
-  `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` from `CLAUDE_ASYNC_CONTAINER_GIT_NAME` and
-  `CLAUDE_ASYNC_CONTAINER_GIT_EMAIL`, which are required. Environment variables beat the repo's
-  `user.name`/`user.email`, so every commit is the bot's even in a repo whose local config names
-  Erick. Use the bot's noreply address (`<id>+<login>@users.noreply.github.com`, shown under the
-  bot's Settings, Emails) so commits link to the bot account.
-- **Credentials.** `gh` reads `GH_TOKEN` directly. For `git push` over https, the job runs
-  `gh auth setup-git` once, which registers gh as git's credential helper in the container's
-  `~/.gitconfig`. That file lives in the container's own home and dies with `--rm`. It never
-  touches the repo's `.git/config`, so the host never sees it. `container/CLAUDE.md` says to do
-  this. There is no SSH key in the container, so remotes must be https (an `git@github.com:` origin
-  needs `git remote set-url origin https://github.com/<o>/<r>.git` once, in the job clone).
-- **Ownership.** The bind-mounted repo is owned by the Windows user, and git refuses a repo owned
-  by someone else, so the image sets `safe.directory=/workspace` (system config, that one path only).
-- **Line endings.** Git for Windows defaults to `core.autocrlf=true` in the host's *global*
-  config, which the container doesn't see. A clone checked out on Windows has CRLF in the working
-  tree, and Linux git without the same setting would show every text file as modified. job-core
-  passes `core.autocrlf` through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0`
-  (default `true`, override `CLAUDE_ASYNC_CONTAINER_GIT_AUTOCRLF`), so the container matches the
-  host. Repos with a `.gitattributes` (this one has `* text=auto` plus CRLF for `*.ps1`) behave
-  the same either way. Observed in this sandbox: a file the job wrote with LF got git's "LF will be
-  replaced by CRLF" note, which is the expected behavior with autocrlf=true.
+job-core sets `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` and `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL`
+from `CLAUDE_ASYNC_CONTAINER_GIT_NAME` and `CLAUDE_ASYNC_CONTAINER_GIT_EMAIL` (required). Use the
+bot's noreply address (`<id>+<login>@users.noreply.github.com`, under the bot's Settings, Emails) so
+commits link to the bot account. The clone is made on Linux inside the container, so the old
+`core.autocrlf` pass-through for Windows checkouts is gone.
 
 ## How jobs open PRs
-
-Inside the container the job uses `git` and `gh` directly, as the bot:
 
 ```
 git switch -c feat/short-slug
 ... work, commit ...
-gh auth setup-git
 git push -u origin feat/short-slug
-gh pr create --fill            # or --title/--body
+gh pr create --base "${CLAUDE_ASYNC_BASE_REF:-<default branch>}" --fill
 ```
 
-**Should jobs use `scripts/publish-branch.mjs` inside the container?** No, not by default. That
-script exists because safe mode can't allow raw `git push`, so it wraps one validated push and PR
-behind an allow rule. Inside the container nothing stops a job from running `git push` itself, so
-the script's checks would be advisory only. The real limits are server-side: the bot's
-collaborator list, the token's scopes and branch protection. It isn't mounted today. If Erick
-later wants its strict branch-name rule and idempotent PR step, mount `scripts/` read-only and set
-`PUBLISH_ALLOWED_ROOTS=/workspace` and `PUBLISH_ALLOWED_OWNERS=<owners>` in the container. Its
-audit log would also need a host mount, or it would vanish with `--rm`. For now, the runner's
-`out.log` and GitHub's own event history are the audit trail for container jobs.
+The job prints `PR: <url>` in its final message. The runner records the URL in
+`exit.json.container.prUrl` when it names the job's own repo, so `claude_check` shows what was
+delivered. `scripts/publish-branch.mjs` is not used inside the container: its checks would be
+advisory there, and the real limits are server-side (collaborator list, token scopes, the `main`
+ruleset).
 
-### Cross-owner contributions (forks)
-
-When the repo belongs to someone else and the bot isn't a collaborator:
-
-```
-gh repo fork --remote --remote-name fork       # creates <bot>/<repo>, adds remote "fork"
-git push -u fork feat/short-slug
-gh pr create --repo <owner>/<repo> --head <bot-login>:feat/short-slug --fill
-```
-
-The bot forks the upstream under its own account, pushes to its fork, and opens the PR against the
-upstream. That needs a classic token (next section). `container/CLAUDE.md` describes exactly this
-flow.
+**Cross-owner contributions (forks):** when the bot isn't a collaborator,
+`gh repo fork --remote --remote-name fork`, push to `fork`, and
+`gh pr create --repo <owner>/<repo> --head <bot-login>:<branch>`. That needs a classic token. The
+upstream repo still has to be in `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS`, since that is what is cloned.
 
 ## Identity: the bot account and its token
 
@@ -309,358 +362,331 @@ GitHub's Terms of Service, section B.3 "Account Requirements"
 > machine account is used exclusively for performing automated tasks. ... You may maintain no more
 > than one free machine account in addition to your free Personal Account.
 
-So Erick may run **one** free machine account next to `icey2488`. He is responsible for its
-actions, it needs its own valid email, and it must be used only for automated tasks.
-
 ### Classic PAT, not fine-grained
 
-GitHub's token docs
-(<https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens>)
-list what fine-grained tokens can't do. Among the gaps: "contribute to repositories where the user
-is an outside or repository collaborator", "contribute to public repos where the user is not a
-member", and "access multiple organizations at once". They also say: "Only personal access tokens
-(classic) have write access for public repositories that are not owned by you." A fine-grained
-token's resource owner is a single account, so a token owned by the bot can't target `icey2488`'s
-repos at all. The bot is a *repository collaborator* on Erick's repos, which is exactly the
-unsupported case. So the bot needs a **classic** PAT.
-
-Minimum scopes (scope text from <https://docs.github.com/en/enterprise-cloud@latest/developers/apps/scopes-for-oauth-apps>):
+Fine-grained tokens can't "contribute to repositories where the user is an outside or repository
+collaborator" and can't write to public repos the user doesn't own
+(<https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens>).
+The bot is a repository collaborator on Erick's repos, so it needs a **classic** PAT.
 
 | scope | why |
 |---|---|
-| `repo` | "Grants full access to public, internal, and private repositories including read and write access to code". Needed to push branches and open PRs on Erick's **private** repos where the bot is a collaborator. If every target repo is public, use `public_repo` instead ("Limits access to public repositories"): it covers pushing, forking and cross-owner PRs on public repos. |
-| `workflow` (only if needed) | "Grants the ability to add and update GitHub Actions workflow files." Without it, GitHub rejects any push that touches `.github/workflows/`. **Leave it off** unless jobs are meant to edit CI. That is a useful guard: a job can't change what CI runs with repo secrets. |
-| `read:org` | Not needed for personal-account repos. Add it only if a job must see org team membership. |
+| `repo` | Push branches and open PRs on Erick's **private** repos where the bot is a collaborator. If every target repo is public, use `public_repo` instead. |
+| `workflow` | **Leave it off.** Without it GitHub rejects pushes that touch `.github/workflows/`. It does not stop a job editing a script an existing workflow runs (see the threat model). |
 
-Nothing else. Specifically: no `delete_repo`, no `admin:*`, no `write:packages`, no `gist`, no
-`user`. A classic `repo` token can reach **every** repo the bot is a collaborator on, so the bot's
-collaborator list *is* the token's scope. Invite it only where jobs should push. Set an
-expiration (90 days is reasonable) and rotate.
+Nothing else: no `delete_repo`, `admin:*`, `write:packages`, `gist` or `user`. A classic `repo`
+token reaches every repo the bot is a collaborator on, so the collaborator list is the token's scope.
+Set an expiration (90 days is reasonable) and rotate.
 
-Server-side backstops that still apply:
+### Server-side backstops
 
-- **Branch protection on main** (already there): no deletion, no force-push. Erick decided not to
-  add a "require a PR" rule. Note what that means: the bot has write access, so a job *could* push
-  directly to main (fast-forward only). `container/CLAUDE.md` forbids it. Nothing on GitHub
-  enforces it. If that ever matters, a ruleset that restricts pushes to main to Erick (or requires
-  a PR, with Erick as a bypass actor) closes it without changing his own workflow.
-- **Collaborator permission level.** Personal-account repos have only one collaborator permission
-  level (write: push, manage issues and PRs). There is no finer role there, so the bot can also
-  merge PRs and close issues. Only branch protection, rulesets and Erick's review limit that.
+- **`main` requires a PR with 1 approval from the owner** (a repository ruleset on each repo the bot
+  can push to, with Erick as a bypass actor so his own workflow is unchanged). The bot cannot push to
+  `main`, and a PR author can't approve its own PR, so nothing the bot writes reaches `main` without
+  Erick's approval. Plus the existing no-deletion and no-force-push rules. Two details to set in the
+  same ruleset: **"Dismiss stale pull request approvals when new commits are pushed"** and **"Require
+  approval of the most recent reviewable push"**, so the bot can't add commits after Erick approves.
+  Note that with only the approval rule, the bot (write access) could still press merge on a PR
+  Erick has approved; the merged content is then exactly what he approved. If only Erick should ever
+  merge, also turn on **"Restrict updates"** with Erick as the bypass actor (I believe that blocks
+  merges by anyone else too, but have not verified it on GitHub). `container/CLAUDE.md` tells the
+  bot never to merge or approve.
+- **Collaborator permission level.** Personal-account repos have one collaborator level (write), so
+  the bot could otherwise merge PRs and close issues; the approval rule is what stops it merging.
+  (The single-level statement is from prior knowledge; GitHub's page could not be fetched.)
 
 ## Network egress
 
 ### Phase 1 (implemented): default bridge network
 
 `--network bridge` (configurable with `CLAUDE_ASYNC_CONTAINER_NETWORK`; `host` and `none` are
-refused). The job can reach the whole internet. **Documented risk:** a job can exfiltrate the
-repo, `GH_TOKEN` and `CLAUDE_CODE_OAUTH_TOKEN` to anywhere. That is acceptable only because both
-tokens are dedicated and revocable, and the repo is one Erick chose to mount. The image sets
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `DISABLE_AUTOUPDATER=1`, so the CLI itself makes
-no telemetry, error-reporting or update calls.
+refused). The job can reach the internet, the LAN and the tailnet (see the threat model). The image
+sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `DISABLE_AUTOUPDATER=1`, so the CLI itself
+makes no telemetry, error-reporting or update calls.
+
+Inter-container traffic: Docker's default `bridge` network allows container-to-container
+connections, so concurrent jobs can reach each other's listening ports (they share the same tokens
+anyway; what this exposes is one job tampering with a service another job started). A dedicated
+user network with ICC off keeps normal egress and removes that:
+
+```powershell
+docker network create -o com.docker.network.bridge.enable_icc=false claude-jobs-p1
+# then: CLAUDE_ASYNC_CONTAINER_NETWORK=claude-jobs-p1
+```
+
+This is recommended but was not tested on Docker Desktop here.
 
 ### Phase 2 (designed, not implemented): egress allowlist
 
-The job runs on an **internal** Docker network, which has no route out at all. A small proxy
-container is the only thing attached to both that network and a normal one, and it allows a fixed
-list of hosts.
+The job runs on an **internal** Docker network with no route out. A small proxy container is the
+only thing attached to both that network and a normal one, and it allows a fixed list of hosts.
 
 ```
-            claude-jobs  (docker network create --internal claude-jobs)
+            claude-jobs  (internal, 172.30.0.0/24, ICC off)
   +--------------------+          +--------------------------+       bridge
   |  job container     | -------> | egress-proxy (squid)     | ----> internet (allowlisted hosts)
   |  HTTPS_PROXY=      |  :3128   | on claude-jobs + bridge  | ----> host.docker.internal:11434
-  |  http://egress-    |          +--------------------------+
+  |  http://egress-    |          +--------------------------+       (GET/POST to 4 Ollama paths)
   |  proxy:3128        |
   +--------------------+   no other route out, no host gateway
 ```
 
-Setup (one time, on claunker):
+One-time setup on claunker (an explicit subnet, so the squid ACL can name it exactly):
 
 ```powershell
-docker network create --internal claude-jobs
+docker network create --internal --subnet 172.30.0.0/24 `
+  -o com.docker.network.bridge.enable_icc=false claude-jobs
 docker run -d --name egress-proxy --restart unless-stopped `
   --network bridge --add-host host.docker.internal:host-gateway `
   -v D:\claude-async-proxy\squid.conf:/etc/squid/squid.conf:ro ubuntu/squid:<pinned>
-docker network connect claude-jobs egress-proxy
+docker network connect --ip 172.30.0.2 claude-jobs egress-proxy
 ```
 
-`squid.conf` (CONNECT-only for TLS; squid never decrypts, it only sees the hostname):
+`squid.conf` (CONNECT-only for TLS, so squid sees hostnames, never content; Ollama is plain HTTP, so
+it is never a CONNECT target and is limited to the four read/generate paths):
 
 ```
 http_port 3128
-acl jobs src 172.16.0.0/12
+acl jobs src 172.30.0.0/24
 acl ssl_ports port 443
-acl ollama_port port 11434
 acl CONNECT method CONNECT
 acl allowed_tls dstdomain github.com api.github.com codeload.github.com uploads.github.com
 acl allowed_tls dstdomain objects.githubusercontent.com release-assets.githubusercontent.com raw.githubusercontent.com
 acl allowed_tls dstdomain registry.npmjs.org pypi.org files.pythonhosted.org
 acl allowed_tls dstdomain api.anthropic.com
-acl ollama dstdomain host.docker.internal
+acl ollama_host dstdomain host.docker.internal
+acl ollama_port port 11434
+acl ollama_methods method GET POST
+acl ollama_paths urlpath_regex ^/api/(generate|chat|tags|show)$
 http_access allow jobs CONNECT ssl_ports allowed_tls
-http_access allow jobs ollama ollama_port
+http_access allow jobs !CONNECT ollama_host ollama_port ollama_methods ollama_paths
 http_access deny all
 access_log stdio:/proc/self/fd/1
 ```
 
-Then set, on the bridge:
+Then on the bridge: `CLAUDE_ASYNC_CONTAINER_NETWORK=claude-jobs` and
+`CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY=http://172.30.0.2:3128` (or `http://egress-proxy:3128`).
+With the proxy set, `container.mjs` adds `HTTPS_PROXY`/`HTTP_PROXY` (both cases) and `NO_PROXY`, and
+**omits** `--add-host host.docker.internal:host-gateway`, so the only way to the host is through the
+proxy's Ollama rule. The CLI's proxy support is unverified (its network-config page could not be
+fetched); the smoke test should confirm one real call through the proxy. With the two traffic
+variables set, Claude Code should need only `api.anthropic.com`; verify with squid's access log.
 
-```
-CLAUDE_ASYNC_CONTAINER_NETWORK=claude-jobs
-CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY=http://egress-proxy:3128
-```
-
-`container.mjs` already supports this. With `CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY` set it adds
-`HTTPS_PROXY`/`HTTP_PROXY` (both cases) and `NO_PROXY=localhost,127.0.0.1` to the container, and
-`OLLAMA_HOST` keeps pointing at `host.docker.internal`, which goes through the proxy. `npm`,
-`pip`, `uv`, `git`, `gh`, `curl` and Claude Code all honor `HTTPS_PROXY`. The string `HTTPS_PROXY`
-appears 70 times in the 2.1.309 binary, but its docs page
-(<https://code.claude.com/docs/en/network-config>) could not be fetched from here, so the CLI's
-proxy support is unverified. The smoke test should confirm one real call through the proxy.
-
-Which hosts Claude Code needs: the 2.1.309 binary references `api.anthropic.com` (inference),
-`platform.claude.com`/`claude.ai` (login and OAuth, not needed with a setup-token),
-`downloads.claude.ai` and a `storage.googleapis.com` bucket (updates, disabled by
-`DISABLE_AUTOUPDATER`), `mcp-proxy.anthropic.com` (claude.ai connectors, which the setup-token
-can't use), and Datadog/GrowthBook endpoints (telemetry and flags, disabled by
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`). With those two variables set, the allowlist needs only
-`api.anthropic.com`. Verify by running one job with squid's access log on and adding anything it
-denies that is legitimate. Anthropic's network-config page lists the required hosts but could not
-be fetched from here (see "Not verified").
-
-Trade-offs: the proxy sees hostnames, not content, so `github.com` allows pushing to *any* repo on
-GitHub. The token's reach limits that, not the proxy. A job can still exfiltrate through an
-allowed host (a gist, a PR comment, an npm publish if it had a token, which it doesn't). Phase 2
-removes the "send it anywhere" channel. It doesn't remove "send it to GitHub". It also closes the
-host-loopback path (see the threat model), since the internal network has no host gateway.
+Trade-offs: the proxy sees hostnames, not content, so `github.com` allows pushing to any repo the
+token can reach, and a job can still exfiltrate through an allowed host (a gist, a PR comment).
+Phase 2 removes "send it anywhere", the LAN/tailnet routes and the host-loopback path. It doesn't
+remove "send it to GitHub".
 
 ## Resource limits
 
 | flag | default | env override |
 |---|---|---|
-| `--cpus` | `4` (clamped to the CPUs the host reports; docker refuses more) | `CLAUDE_ASYNC_CONTAINER_CPUS` |
-| `--memory` and `--memory-swap` (same value, so no swap on top) | `8g` | `CLAUDE_ASYNC_CONTAINER_MEMORY` |
-| `--pids-limit` | `1024` (stops fork bombs; plenty for npm/pytest) | `CLAUDE_ASYNC_CONTAINER_PIDS_LIMIT` |
+| `--cpus` | `4` (clamped to the CPUs the host reports) | `CLAUDE_ASYNC_CONTAINER_CPUS` |
+| `--memory` and `--memory-swap` (same value, no swap on top) | `8g` | `CLAUDE_ASYNC_CONTAINER_MEMORY` |
+| `--pids-limit` | `1024` | `CLAUDE_ASYNC_CONTAINER_PIDS_LIMIT` |
+| wall-clock limit (runner-enforced) | 4h | `CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS` (60000 to 604800000) |
 
-These apply inside Docker Desktop's WSL2 VM, whose own size is set in `%USERPROFILE%\.wslconfig`
-(`[wsl2] memory=..., processors=...`). Give the VM enough for the concurrency cap
-(`CLAUDE_ASYNC_MAX_CONCURRENT`, default 4) times the per-job memory, or lower one of them.
-Disk isn't limited per container (the writable layer is ephemeral and `--rm`'d). The bind-mounted
-repo is on the host disk.
+The runner's heartbeat never goes stale while it is alive, so `CLAUDE_ASYNC_JOB_TIMEOUT_MS` alone
+would never stop a hung container. Past the wall-clock limit the runner removes the container, and
+the job reads `status: "timed_out"` with `exit.exitReason: "container_max_runtime"`. These limits
+apply inside Docker Desktop's WSL2 VM, whose size is set in `%USERPROFILE%\.wslconfig`. Disk isn't
+limited per container; the clone and everything else live in the writable layer and go with `--rm`.
 
 ## Lifecycle, cancel and cleanup
 
-- `--rm`: the container is deleted when it exits. Nothing a job writes outside `/workspace`
-  survives, including `~/.gitconfig` and the `gh auth setup-git` state.
-- `--name claude-async-<jobId>`: one container per job, named after the job id. The job id is
-  already restricted to `[A-Za-z0-9._-]`, which is also valid for container names. A duplicate
-  start is refused by the job dir check first. `--label claude-async.job=<jobId>` allows
-  `docker ps --filter label=claude-async.job` to list them.
-- `--init`: tini as PID 1 reaps the CLI's children and forwards signals.
-- **Cancel:** the new `claude_cancel` tool calls `cancelJob()`, which runs
-  `docker kill claude-async-<jobId>`. Killing the docker *client* process alone doesn't stop the
-  container (a Windows `TerminateProcess` on `docker.exe` sends nothing to the daemon). So every
-  path kills **by name**:
-  1. `cancelJob()` kills the container. The docker client then exits with the container's status
-     (137), and the runner records `exit.json`, `exit_code`, the card close and the Discord ping
-     through its normal path. claude_check reports `failed` with exit code 137.
-  2. The runner kills the container by name on SIGTERM/SIGINT/SIGHUP (and SIGBREAK on Windows),
-     then waits up to 30s for the client to exit before recording.
-  3. The runner's `finish()` always runs `docker kill <name>` too. Normally it gets
-     "No such container", which is treated as success.
-  4. `checkJob()` kills the container (once, `meta.containerReaped`) when it classifies a container
-     job as `died` or `timed_out`, which covers a runner killed by `TerminateProcess`.
-- Verified end to end in this sandbox with a real Docker engine: cancel during a run gave exit 137
-  and status `failed`; SIGTERM to the runner killed the container and recorded 137; no containers
-  were left over in either case.
+- `--rm`, `--init`, `--name claude-async-<jobId>` (for humans) and
+  **`--label claude-async.job=<jobId>`, the identity every cleanup uses.** Job ids are unique per job
+  dir, so the label is too.
+- **Cleanup = remove by label.** `docker ps -a --filter label=claude-async.job=<jobId>` lists the
+  job's containers by immutable ID, `docker rm -f <id>` removes each (a running one is killed first;
+  one still in the Created state is removed, which `docker kill` would miss), and the list is taken
+  again. Nothing is ever killed by name, and a container named like ours without the label is never
+  touched.
+- **Cleanup state is separate from the CLI's exit.** `exit_code` says the docker client exited; it
+  does not say nothing is running (the client can exit, or be killed, while its container keeps
+  going, and the final removal can fail while the daemon is unreachable). Cleanup is **confirmed**
+  only when docker lists nothing with the label AND no launch can still be pending (the runner
+  finished, or the docker client pid it recorded in `docker_client.pid` is gone). The runner records
+  its result in `exit.json.container.cleanup.confirmed`; job-core records a later confirmation in
+  `meta.json.containerCleanup`. `claude_check` shows `containerCleanup: "confirmed" | "unconfirmed"`
+  for a finished job and retries an unconfirmed cleanup on every call. The concurrency-cap count
+  never does docker housekeeping.
+- **Cancel = `claude_cancel`** (routed by host prefix; `POST /v1/cancel` on a remote host):
+  1. The cancel intent is written first, as `cancel_requested` in the job dir.
+  2. The job's containers are removed by label. If none exists yet, the answer says so
+     (`cleanup: "pending"`), never "done".
+  3. The runner checks `cancel_requested` before `docker run` (the container is then never started)
+     and polls it while the client runs, so a container that was still being created when the cancel
+     arrived is removed the moment it exists. The client then exits 137 and the runner records
+     `exitReason: "cancelled"`, the card close and the Discord ping through its normal path.
+  4. On a job that already finished, `claude_cancel` is the cleanup retry: it returns
+     `alreadyFinished: true` only once cleanup is confirmed.
+- **SIGTERM/SIGINT/SIGHUP/SIGBREAK to the runner**: remove by label, then wait for the client up to
+  `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` (30 s). If it never exits (a wedged daemon), the runner kills
+  the client and records the cleanup as NOT confirmed; `claude_check` confirms it later.
+- **A runner that died** (`taskkill /F`, `TerminateProcess`): `claude_check` classifies the job
+  `died`/`timed_out`, writes `cancel_requested` (so a slow runner never starts docker), removes by
+  label, and confirms only if the recorded docker client is gone.
+- Verified with a real Docker engine (Linux, not Docker Desktop): cancel right after launch never
+  started the container; cancel while running and SIGTERM gave exit 137 with cleanup confirmed; the
+  wall-clock limit gave `timed_out`; a normal run confirmed cleanup; no labelled container was left.
+  `docker rm -f` of a running attached container makes the client exit 137, and `docker rm -f` of a
+  missing container exits 0 on Docker 29, which is why absence is confirmed by listing, not by exit
+  status.
 
 ## Windows specifics
 
-- **Bind mount paths.** `toDockerMountSource()` turns `D:\code\jobs\x` into `D:/code/jobs/x`,
-  which Docker Desktop accepts as a bind source. Spaces are fine, because each `--mount` value is
-  one argv element and no shell is involved. Commas and quotes are refused. UNC paths are refused.
-- **The drive must be shared.** With the WSL2 backend, every local drive is available by default.
-  If `D:` was excluded under Docker Desktop's Resources, File sharing, mounts fail with exit 125.
-  The runner flags that in `exit.json` warnings ("docker run itself failed").
-- **Performance.** A bind mount from NTFS into the WSL2 VM is noticeably slower than the VM's own
-  filesystem for many small files (`npm install`, big test suites). It's acceptable for typical
-  jobs. If it hurts, a later change can clone into a volume instead of bind-mounting, at the cost of
-  the host not seeing the working tree.
-- **Line endings:** see "Git identity and credentials inside".
-- **The docker binary.** `CLAUDE_ASYNC_DOCKER_BIN` (default `docker`) is resolved the same way the
-  `claude` binary is. Under Task Scheduler, PATH may not include Docker Desktop's
-  `C:\Program Files\Docker\Docker\resources\bin`, so set the full path to `docker.exe`.
-- **Docker Desktop must be running** and its engine started. Preflight runs
-  `docker image inspect <image>` and refuses the job with "is Docker Desktop running?" otherwise.
-  Docker Desktop starts at sign-in by default. Jobs started right after a reboot, before sign-in
-  or before the engine is up, fail fast in preflight rather than mid-run.
+- **Mount paths** (only the two read-only ones now): `toDockerMountSource()` turns `D:\code\x` into
+  `D:/code/x`. Commas, quotes and UNC paths are refused.
+- **The docker binary.** `CLAUDE_ASYNC_DOCKER_BIN` (default `docker`). Under Task Scheduler, PATH
+  may not include Docker Desktop's `C:\Program Files\Docker\Docker\resources\bin`, so set the full
+  path to `docker.exe`.
+- **Docker Desktop must be running.** Preflight runs `docker image inspect` and refuses the job with
+  "is Docker Desktop running?" otherwise.
+- **Line endings.** `.gitattributes` keeps `*.sh` and the Dockerfile LF in a Windows checkout, and the
+  Dockerfile strips CRs from the entrypoint as a belt.
 
 ## What keeps working, and how
 
-The runner still owns the child process. The child is now `docker run` (attached, not `-d`),
-whose stdout/stderr are the container's. So:
-
 | feature | container jobs |
 |---|---|
-| job record (`meta.json`, `spec.json`) | unchanged, plus `sandbox: "container"` and `container: {name, image, dockerBin}` in meta, and `container: {name, dockerBin, repo, gitBaseline}` in spec |
-| heartbeat, `runner.pid`, Job Object records | unchanged (the runner is the same process) |
-| stdout/stderr capture | unchanged: docker's stdout/stderr are the container's, written to `out.log`/`err.log` |
-| `exit.json`, `exit_code`, status | unchanged: docker exits with the CLI's exit code. 125 means docker itself failed (warning added), 137 means killed. Plus `exit.container` = `{name, newGitFindings}` |
-| DELEGATION-METRICS completeness | unchanged (read off stdout). Verified end to end |
-| card hook | mint and close unchanged. The delivery check's host `git rev-parse HEAD` is skipped when the post-run `.git` audit found new host-executing config |
-| Discord ping | unchanged (runs in the runner, on the host) |
-| concurrency and rate caps, depth guard | unchanged. `CLAUDE_ASYNC_DEPTH` is forwarded into the container |
-| `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, `BASH_MAX_TIMEOUT_MS`, bg-wait ceiling | forwarded into the container |
-| HERMES_HOME isolation | not applied: nothing from the host env reaches the container except an allowlist, so the job never sees `HERMES_HOME` at all |
-| job-tool-gate, Ollama guard hooks | not wired (host-only, see above) |
-| multi-host | `sandbox` is forwarded to a receiver when given. A Linux receiver can run container jobs with a plain Docker Engine (`--add-host ...:host-gateway` makes `host.docker.internal` work there too). `claude_cancel` is local-only for now |
+| job record (`meta.json`, `spec.json`) | plus `sandbox: "container"` and `container: {name, jobId, image, imageId, dockerBin, repo, baseRef, envFile}` in meta (envFile is a path); `workFolder` is `null` |
+| heartbeat, `runner.pid`, Job Object records | unchanged |
+| stdout/stderr capture | unchanged on disk; redacted in exit.json, claude_check and the ping |
+| `exit.json`, `exit_code`, status | unchanged, plus `exit.container` = `{name, repo, prUrl, cleanup, cancelled, maxRuntimeExceeded}`; 125 = docker run failed, 70 = clone failed, 137 = removed/killed |
+| DELEGATION-METRICS completeness | unchanged (read off stdout) |
+| card hook | mint and close unchanged; no HEAD lookup and no delivery check for container jobs (no host git). The PR URL is in `exit.container.prUrl` |
+| Discord ping | unchanged apart from headline redaction |
+| concurrency and rate caps, depth guard | unchanged; `CLAUDE_ASYNC_DEPTH` is forwarded into the container |
+| HERMES_HOME isolation | not applied (the container never sees the host env) |
+| multi-host | `sandbox`/`repo`/`baseRef` are forwarded when given; `claude_cancel` routes by host prefix |
 
-## What stays on the host, and why
+## Sandbox policy
 
-- **Windows-admin jobs**: scheduled tasks, services, firewall rules, registry, Task Scheduler
-  checks, anything with PowerShell `Get-Service`/`schtasks`. A Linux container can't see or change
-  any of that.
-- **Jobs that need Docker**, or GPU access, or several repos at once (for example a
-  cross-repo refactor). Mount several repos only after a design change. Today's rule is one repo
-  per job.
-- **Jobs on the live chassis** (`D:\claunker`): they stay forbidden in any mode.
-- **The bridge, runner, launcher, card hook and Discord ping.** They run on the host and must,
-  because they hold the host-side state and secrets (the webhook) that jobs must not see.
+`CLAUDE_ASYNC_ALLOWED_SANDBOXES` lists the modes a host runs at all: `host` (default),
+`container`, or `host,container`. The mode a job ends up with (requested, or from
+`CLAUDE_ASYNC_JOB_SANDBOX`) must be in the list; an invalid value refuses every start. It is checked
+in `startJob()` before the job dir exists, so the local MCP tools and `POST /v1/start` are covered
+alike. A host with `CLAUDE_ASYNC_JOB_SANDBOX=container` and `CLAUDE_ASYNC_ALLOWED_SANDBOXES=container`
+refuses `sandbox: "host"` from any caller; a host on the default policy refuses `sandbox: "container"`.
 
 ## Configuration reference
 
-All set on the bridge process (ecosystem.config.cjs `env`, or the user environment that Task
-Scheduler gives job-launcher.mjs). Only names starting `CLAUDE_` reach the runner through the
-launch ticket. These are only read by job-core at start time, so they don't need to.
+All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop MCP server entry's
+`env`). They are read by job-core at start time.
 
 | variable | default | notes |
 |---|---|---|
-| `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | exactly `container` makes container mode the default. A per-call `sandbox: "host"` still wins |
-| `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS` | **none** (required) | `;`-separated on win32. Recommended: one folder of dedicated job clones |
-| `CLAUDE_ASYNC_CONTAINER_DENIED_ROOTS` | none | extra paths never mountable (the claude-async checkout is always denied) |
-| `CLAUDE_ASYNC_CONTAINER_ENV_FILE` | **none** (required) | the host secrets file, outside every repo |
+| `CLAUDE_ASYNC_ALLOWED_SANDBOXES` | `host` | `host`, `container` or `host,container` |
+| `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | exactly `container` makes container mode the default |
+| `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` | **none** (required) | `owner/repo` entries; only repos the bot is a collaborator on |
+| `CLAUDE_ASYNC_CONTAINER_ENV_FILE` | **none** (required) | the host secrets file, outside the claude-async checkout |
 | `CLAUDE_ASYNC_CONTAINER_GIT_NAME` / `_GIT_EMAIL` | **none** (required) | the bot's commit identity |
-| `CLAUDE_ASYNC_CONTAINER_IMAGE` | `claude-async-job:local` | built on claunker, never pulled |
+| `~/.claude-async/http.json` | absent | **required for container mode**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`) |
+| `CLAUDE_ASYNC_HTTP_PORT` | `7842` | the bridge port the lock check probes |
+| `CLAUDE_ASYNC_CONTAINER_IMAGE` | `claude-async-job:local` | built on claunker, never pulled; jobs run its inspected ID |
 | `CLAUDE_ASYNC_DOCKER_BIN` | `docker` | set the full path to `docker.exe` |
 | `CLAUDE_ASYNC_CONTAINER_CPUS` / `_MEMORY` / `_PIDS_LIMIT` | `4` / `8g` / `1024` | |
+| `CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS` | `14400000` (4h) | runner-enforced wall-clock limit |
 | `CLAUDE_ASYNC_CONTAINER_NETWORK` | `bridge` | `host` and `none` are refused |
 | `CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY` | unset | phase 2 |
 | `CLAUDE_ASYNC_CONTAINER_OLLAMA_URL` | `http://host.docker.internal:11434` | |
-| `CLAUDE_ASYNC_CONTAINER_GIT_AUTOCRLF` | `true` | match the host's `core.autocrlf` |
-| `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD` | `container/CLAUDE.md` | must be outside the mounted repo |
+| `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD` | `container/CLAUDE.md` | |
+| `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` | `30000` | runner: how long to wait for the client after a signal |
 
-The `docker run` argv a job gets (sample job; placeholder secrets path):
+Removed in review round 1: `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, `_DENIED_ROOTS` and
+`_GIT_AUTOCRLF` (no host folder is mounted any more).
+
+The `docker run` argv a job gets (sample job; placeholder secrets path and image ID):
 
 ```
-docker run --rm --name claude-async-claunker.demo-20261101-abcd1234
+docker run --rm --pull=never --name claude-async-claunker.demo-20261101-abcd1234
   --label claude-async.job=claunker.demo-20261101-abcd1234 --init --user 1000:1000
   --security-opt no-new-privileges --cap-drop ALL
   --cpus 4 --memory 8g --memory-swap 8g --pids-limit 1024
   --network bridge --add-host host.docker.internal:host-gateway
   --env-file C:\Users\Raide\.claude-async-secrets\container.env
   -e CLAUDE_ASYNC_JOB_ID=claunker.demo-20261101-abcd1234 -e CLAUDE_ASYNC_SANDBOX=container
+  -e CLAUDE_ASYNC_REPO=icey2488/container-job-scratch
   -e CLAUDE_ASYNC_DEPTH=1 -e CLAUDE_ASYNC_JOB_EFFORT=medium
   -e CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=7200000 -e CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1
   -e BASH_MAX_TIMEOUT_MS=1200000
   -e GIT_AUTHOR_NAME=claunker-bot -e GIT_COMMITTER_NAME=claunker-bot
   -e GIT_AUTHOR_EMAIL=<id>+claunker-bot@users.noreply.github.com -e GIT_COMMITTER_EMAIL=<same>
-  -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=core.autocrlf -e GIT_CONFIG_VALUE_0=true
   -e OLLAMA_HOST=http://host.docker.internal:11434 -e CLAUDE_ASYNC_OLLAMA_URL=http://host.docker.internal:11434
-  --mount type=bind,source=D:/code/jobs/scratch-repo,target=/workspace
   --mount type=bind,source=D:/code/claude-async/container/CLAUDE.md,target=/home/agent/.claude/CLAUDE.md,readonly
   --mount type=bind,source=D:/code/claude-async/hooks,target=/opt/claude-async/hooks,readonly
   --workdir /workspace
-  claude-async-job:local
-  claude -p --dangerously-skip-permissions --strict-mcp-config --mcp-config {"mcpServers":{}}
-    --model=claude-sonnet-5 --effort medium
-    --settings {"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"node /opt/claude-async/hooks/no-background-hook.mjs","timeout":5}]}]}}
+  sha256:<64 hex>
+  /usr/local/bin/claude-async-job-entry icey2488/container-job-scratch "" --
+  claude -p --dangerously-skip-permissions --setting-sources user --strict-mcp-config
+    --mcp-config {"mcpServers":{}} --model=claude-sonnet-5 --effort medium
+    --settings {"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"env -u NODE_OPTIONS /usr/local/bin/node /opt/claude-async/hooks/no-background-hook.mjs","timeout":5}]}]}}
     -- <prompt>
 ```
 
-Each token above is one argv element (no shell). The prompt is last, after `--`, and the model is
-bound with `=`, the same argument-injection rule as the host path.
+Each token is one argv element (no shell). The prompt is last, after `--`, and the model is bound
+with `=`.
 
 ## The image
 
 `container/Dockerfile`, built on claunker (never pulled):
 
-- Base: `node:24-bookworm-slim`. Node 24 is the bridge's own major (README, "Linux receiver"), and
-  the hooks run on the image's node. The tag is pinned to the major, not a digest, because the
-  digest couldn't be checked from where this was written. Pin it after the first build (rollout
-  step 7).
-- gh 2.89.0 and uv 0.13.6 come from GitHub release tarballs, each checked against a pinned
-  SHA-256 taken from the release's own checksum file. Debian's gh is too old, and a third-party
-  apt repo would be one more thing to trust.
-- Claude Code 2.1.309 is installed with `npm install -g` (the method in the package's own README)
-  after the registry's `dist.integrity` for the wrapper and its linux-x64 native package is
-  compared with pinned sha512 values. 2.1.309 was npm's `stable` tag on 2026-11-01. Anthropic's
-  install page could not be fetched from here to confirm which method it currently recommends
-  (see "Not verified"). The package's postinstall copies the native binary into place, so no Node
-  process stays resident. `DISABLE_AUTOUPDATER=1` keeps it at the pinned version. Bump it
-  deliberately by changing `CLAUDE_CODE_VERSION` and the two integrity args (`npm view
-  @anthropic-ai/claude-code@<v> dist.integrity`, and the same for `-linux-x64`).
-- Debian packages (git, python3, python3-venv, ripgrep, curl, jq, procps, openssh-client) aren't
-  version-pinned. Rebuild to pick up security fixes.
-- User `agent`, uid/gid 1000, home `/home/agent`. Any existing uid-1000 user (the base image's
-  `node`) is removed first.
-- Size: about 1.46 GB in this sandbox's test build. About 290 MB of that is the Claude Code native
-  binary and about 300 MB is the apt layer. Most of the rest is the Node/Ubuntu test base, and
-  bookworm-slim is smaller.
-- **Built and checked in this sandbox** on a test-only base (Ubuntu noble via debootstrap, plus
-  this sandbox's Node 24), because Docker Hub isn't reachable from here. Every other line of the
-  Dockerfile ran as written. The real `node:24-bookworm-slim` build happens on claunker in the
-  smoke test.
+- Base: `node:24-bookworm-slim`, pinned to the major tag until the first build records its digest
+  (rollout step 7).
+- gh 2.89.0 and uv 0.13.6 from GitHub release tarballs, each checked against a pinned SHA-256.
+- **Claude Code 2.1.309 from verified bytes, with no `npm install` and no package script.** The
+  build `npm pack`s the exact wrapper and linux-x64 tarballs, computes each sha512 itself (openssl,
+  base64) and compares it with the pinned integrity before extracting anything, checks the wrapper's
+  package.json names the same version and pins the same linux-x64 version, and places the native
+  binary at `/usr/local/lib/claude-code/claude` (root-owned) with a `/usr/local/bin/claude` link.
+  That is exactly what the wrapper's `install.cjs` postinstall does, so neither it nor npm's
+  optional-dependency fetch ever runs. `NPM_CONFIG_REGISTRY` may name a mirror; the hashes decide.
+  Verified in local builds against a controlled registry that serves the pinned metadata first and a
+  self-consistent malicious wrapper afterwards: the previous Dockerfile passed both `npm view` checks,
+  installed the substitute and ran its postinstall; this one fails with `INTEGRITY MISMATCH` before
+  extraction and produces no image; against the real registry it verifies both tarballs and builds.
+  To bump: change `CLAUDE_CODE_VERSION` and the two integrity args (`npm view
+  @anthropic-ai/claude-code@<v> dist.integrity`, same for `-linux-x64`), ideally checked against a
+  second network path.
+- Debian packages aren't version-pinned. Rebuild to pick up security fixes.
+- User `agent`, uid/gid 1000; `~/.claude` root-owned as described above; the entrypoint and the
+  github.com credential helper as described in "The clone inside the container".
+- **Built and checked in this sandbox** on a test-only base (Ubuntu noble plus Node 24, because Docker
+  Hub isn't reachable from here). Every other line ran as written. The real `node:24-bookworm-slim`
+  build happens on claunker in the smoke test.
 
 ## Rollout checklist
 
-Do these in order on claunker. Each step says how to check it before moving on.
+Do these in order on claunker. Each step says how to check it.
 
-1. **Install Docker Desktop** (admin) with the WSL2 backend. Run the installer as admin and keep
-   "Use WSL 2 instead of Hyper-V" checked. Sign out and back in if it adds you to
-   `docker-users`. In Settings: General, "Start Docker Desktop when you sign in" on; Resources,
-   File sharing, make sure `D:` is shared; **leave "Expose daemon on tcp://localhost:2375 without
-   TLS" off**. Set the VM size in `%USERPROFILE%\.wslconfig` (for example `memory=24GB`,
-   `processors=8`), then `wsl --shutdown` and restart Docker Desktop.
+1. **Install Docker Desktop** (admin) with the WSL2 backend. In Settings: "Start Docker Desktop when
+   you sign in" on; **leave "Expose daemon on tcp://localhost:2375 without TLS" off**. Size the VM in
+   `%USERPROFILE%\.wslconfig`, then `wsl --shutdown` and restart Docker Desktop.
    Check: `docker version` shows a Server section; `docker run --rm hello-world` works.
-
-2. **Create the bot account.** Sign out of `icey2488` (or use a private window) and sign up for a
-   new free account, for example `claunker-bot`. It needs its own email address. A plus-address
-   like `erick+claunker-bot@...` works if the mail provider supports it. This is the one free
-   machine account GitHub's ToS allows next to Erick's personal account (ToS section B.3, linked
-   above). Turn on 2FA. In the bot's Settings, Emails, turn on "Keep my email address private" and
-   note the `<id>+claunker-bot@users.noreply.github.com` address.
-
-3. **Invite it as a collaborator**, only on the repos jobs should push to. Start with one scratch
-   repo (for example `icey2488/container-job-scratch`, created empty and private). Add others,
-   such as `icey2488/claude-async`, only once the scratch run is clean. As `icey2488`: repo
-   Settings, Collaborators, Add people, the bot's login. Accept the invite as the bot. Check
-   branch protection on each repo's main is still no deletion and no force-push (unchanged).
-   Don't invite the bot to repos where jobs shouldn't push. The classic token can reach every repo
-   the bot can.
-
-4. **Create the classic PAT**, as the bot: Settings, Developer settings, Personal access tokens,
-   Tokens (classic), Generate new token (classic). Note: `claude-async container jobs`.
-   Expiration: 90 days. Scopes: **`repo`** only (or `public_repo` if every target repo is
-   public). Leave `workflow` unchecked unless jobs must edit `.github/workflows/`. Leave everything
-   else unchecked. Copy the token once. Step 6 is where it goes.
-
-5. **Generate the Claude Code token**, as Erick, on claunker: `claude setup-token`, approve in the
-   browser on Erick's subscription account, then copy the printed token. It's valid for one year.
-   Add a reminder about 11 months out to regenerate it.
-
-6. **Write the host secrets file** outside every repo, readable only by Erick's user. In
-   PowerShell (the values are read as secure strings and never echoed, never put in history, and
-   never passed on a command line):
+2. **Create the bot account** (one free machine account next to `icey2488`; ToS B.3 above), with its
+   own email and 2FA, "Keep my email address private" on, and note its noreply address.
+3. **Rulesets first, then invite.** On each repo the bot will push to, add a ruleset for the default
+   branch: require a pull request with **1 approval** (with "dismiss stale approvals" and "require
+   approval of the most recent reviewable push"), Erick (`icey2488`) as a bypass actor, plus no
+   deletion and no force-push; optionally "Restrict updates" so only Erick can merge (see
+   "Server-side backstops"). Then invite the bot as a collaborator, starting with one scratch
+   repo (`icey2488/container-job-scratch`, private). Don't invite it to any repo whose CI holds
+   secrets or runs on a self-hosted runner until that CI is reviewed.
+   Check: as the bot, `git push origin HEAD:main` to the scratch repo is rejected, and the bot
+   cannot merge a PR it opened.
+4. **Create the classic PAT** as the bot: scopes **`repo`** only (or `public_repo`), no `workflow`,
+   90-day expiry.
+5. **Generate the Claude Code token** as Erick: `claude setup-token`; one year; set a reminder.
+6. **Write the host secrets file** outside every repo, readable only by Erick's user (values read
+   as secure strings, never echoed, never on a command line):
 
    ```powershell
    $dir  = Join-Path $env:USERPROFILE ".claude-async-secrets"
    $file = Join-Path $dir "container.env"
    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-   # User-only ACL on the folder: drop inheritance, grant only the current user and SYSTEM.
    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
    icacls $dir /inheritance:r /grant:r "${me}:(OI)(CI)F" "SYSTEM:(OI)(CI)F" | Out-Null
-
    function Read-Plain([string]$prompt) {
      $s = Read-Host -AsSecureString $prompt
      $p = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($s)
@@ -668,103 +694,122 @@ Do these in order on claunker. Each step says how to check it before moving on.
    }
    $gh = Read-Plain "Bot classic PAT (GH_TOKEN)"
    $cc = Read-Plain "Claude Code token from 'claude setup-token' (CLAUDE_CODE_OAUTH_TOKEN)"
-   # LF line endings and no BOM: docker keeps a trailing CR in the value and a BOM in the key name.
+   # LF endings, no BOM, no quotes or spaces: docker keeps all of those in the values.
    $body = "GH_TOKEN=$($gh.Trim())`nCLAUDE_CODE_OAUTH_TOKEN=$($cc.Trim())`n"
    [IO.File]::WriteAllText($file, $body, (New-Object Text.UTF8Encoding($false)))
    Remove-Variable gh, cc, body
    icacls $file /inheritance:r /grant:r "${me}:F" "SYSTEM:F" | Out-Null
-   icacls $file    # shows the ACL only; check that nothing but you and SYSTEM is listed
    ```
 
-   Check: `(Get-Content $file | ForEach-Object { ($_ -split '=')[0] })` prints the two key names
-   (and only the names).
-
-7. **Build the image and run the smoke test**, from `D:\code\claude-async`:
+   Check: `(Get-Content $file | ForEach-Object { ($_ -split '=')[0] })` prints the two key names.
+7. **Lock the HTTP bridge**: `node claude-async-http.mjs --new-token`, then restart it
+   (`pm2 restart claude-async-http`, or stop it if nothing uses it). Give the token to anything that
+   still needs the bridge (`Authorization: Bearer <token>`). Check:
+   `curl -s -o NUL -w "%{http_code}" -X POST http://127.0.0.1:7842/mcp` prints `401`.
+8. **Build the image and run the smoke test**, from `D:\code\claude-async`:
 
    ```powershell
    powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1
    powershell -NoProfile -ExecutionPolicy Bypass -File container\smoke-test.ps1 -SkipBuild `
-     -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" -RunClaude
+     -EnvFile "$env:USERPROFILE\.claude-async-secrets\container.env" -RunClaude `
+     -LanTargets "<hermes-host>:<port>","<ha-host>:8123"
    ```
 
-   Every line must be PASS: tools, uid 1000 with no capabilities, host Ollama with
-   `qwen2.5-coder:7b`, **ports 7842/2375/2376 not reachable**, no socket or host credential paths,
-   read-only CLAUDE.md and hooks, gh authenticated as the bot (it prints the login, which must be
-   the bot's and not `icey2488`), git over https, and the headless claude call. If 7842 is
-   reachable, stop: see the threat model's "Host loopback services".
-   Then pin the base image. `docker image inspect node:24-bookworm-slim --format "{{index .RepoDigests 0}}"`
-   prints `node@sha256:...`. Put it in the Dockerfile as `ARG NODE_IMAGE=node:24-bookworm-slim@sha256:...`
-   in a small commit.
-
-8. **Configure the bridge** (container mode stays off by default). Add to the bridge's environment
-   (ecosystem.config.cjs `env`, or the Claude Desktop MCP server entry's `env`), then restart the
-   bridge with `tools\restart-bridge.ps1 -RequestedBy manual`:
+   Every line must be PASS or WARN. Read the loopback-forwarding line (it is measured) and every
+   WARN. A FAIL on 7842/2375/2376 means stop. Then pin the base image digest
+   (`docker image inspect node:24-bookworm-slim --format "{{index .RepoDigests 0}}"` into
+   `ARG NODE_IMAGE=...@sha256:...`) in a small commit.
+9. **Configure the bridge** (container mode still off), then restart it with
+   `tools\restart-bridge.ps1 -RequestedBy manual`:
 
    ```
-   CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS=D:\code\jobs
-   CLAUDE_ASYNC_CONTAINER_DENIED_ROOTS=D:\claunker
+   CLAUDE_ASYNC_ALLOWED_SANDBOXES=host,container
+   CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS=icey2488/container-job-scratch
    CLAUDE_ASYNC_CONTAINER_ENV_FILE=C:\Users\Raide\.claude-async-secrets\container.env
    CLAUDE_ASYNC_CONTAINER_GIT_NAME=claunker-bot
    CLAUDE_ASYNC_CONTAINER_GIT_EMAIL=<id>+claunker-bot@users.noreply.github.com
    CLAUDE_ASYNC_DOCKER_BIN=C:\Program Files\Docker\Docker\resources\bin\docker.exe
    ```
 
-   Do **not** set `CLAUDE_ASYNC_JOB_SANDBOX` yet. Clone the scratch repo with an https origin into
-   the jobs root: `git clone https://github.com/icey2488/container-job-scratch D:\code\jobs\container-job-scratch`.
-
-9. **Run one container job end to end**: `claude_start` with `host: "claunker"`,
-   `sandbox: "container"`, `workFolder: "D:\code\jobs\container-job-scratch"`, and a prompt like
-   "Create a branch docs/container-smoke, add a README line saying hello from the container,
-   commit, push the branch, and open a PR to main. Delegate the README wording to qwen2.5-coder:7b
-   through $OLLAMA_HOST. End with the delegation report." Check:
-   - `claude_check` shows `sandbox: "container"`, status `completed`, `exit.container.newGitFindings: []`.
-   - On GitHub, the branch and PR exist, and the commit's author **and** the PR's opener are the bot.
-   - The delegation report shows an Ollama call, which proves the host-Ollama path works.
-   - The dispatch card and the Discord ping both arrived.
-   - `docker ps -a --filter label=claude-async.job` is empty afterwards.
-   - Cancel: start a second long job and run `claude_cancel`. The job reports `failed` with exit
-     code 137, and `docker ps` shows no container left.
-   Review and merge the PR yourself.
-
-10. **Widen slowly.** Invite the bot to one real repo, clone that repo under `D:\code\jobs`, and use
-    `sandbox: "container"` for code jobs there. Only once that's routine, consider
-    `CLAUDE_ASYNC_JOB_SANDBOX=container` as the default (admin jobs then pass `sandbox: "host"`).
-    Schedule phase 2 egress.
+   Remove any `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`/`_DENIED_ROOTS`/`_GIT_AUTOCRLF` from an earlier
+   draft; they are ignored now. No job clones under `D:\code\jobs` are needed any more.
+10. **Run one container job end to end**: `claude_start` with `host: "claunker"`,
+    `sandbox: "container"`, `repo: "icey2488/container-job-scratch"`, and a prompt like "Create a
+    branch docs/container-smoke, add a README line saying hello from the container, commit, push the
+    branch, open a PR to main and print its URL. Delegate the README wording to qwen2.5-coder:7b
+    through $OLLAMA_HOST. End with the delegation report." Check: `claude_check` shows
+    `sandbox: "container"`, status `completed`, `containerCleanup: "confirmed"` and
+    `exit.container.prUrl`; the commit author and PR opener are the bot; the delegation report shows
+    an Ollama call; the card and the Discord ping arrived; `docker ps -a --filter
+    label=claude-async.job` is empty. Then start a long job and `claude_cancel` it: it reports
+    `failed`, `exitReason: "cancelled"`, cleanup confirmed. Review and merge the PR yourself.
+11. **Widen slowly.** Add one real repo to the allowlist (and the ruleset on it) once the scratch runs
+    are routine. Schedule phase 2 before any repo with third-party install scripts.
 
 ### Rollback
 
-Container mode is opt-in, so rollback is cheap and goes from least to most drastic:
-
-- **Stop using it:** stop passing `sandbox: "container"`, and unset `CLAUDE_ASYNC_JOB_SANDBOX` if
-  you set it. Host jobs never went through any container code, so nothing else changes.
-- **Cut off the bot:** revoke the classic PAT (bot account, Developer settings), remove the bot as
-  a collaborator on each repo, and revoke the Claude Code token (claude.ai settings, or regenerate
-  it with `claude setup-token`; the old one stays valid until it expires or is revoked). Then
-  delete `%USERPROFILE%\.claude-async-secrets\container.env`. Container jobs then fail in preflight
-  ("env file ... does not exist").
-- **Remove the code:** revert this PR's merge commit. Host-mode behavior is the same with or
-  without it (the tests assert the host argv is unchanged).
+- **Stop using it:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host` (or unset it) and restart the bridge.
+  Every container start is then refused before anything is written.
+- **Cut off the credentials:**
+  - Bot PAT: as the bot, Settings, Developer settings, Personal access tokens, Tokens (classic),
+    Delete. Remove the bot as a collaborator on each repo.
+  - Claude Code setup-token: **unverified**. I could not confirm a per-token revoke procedure for
+    `claude setup-token` tokens (Anthropic's docs pages could not be fetched this time, and the CLI
+    has no revoke command). Look in the claude.ai account settings for the Claude Code / authorized
+    apps or sessions list and revoke it there; if no per-token control exists, ask Anthropic support,
+    and treat the token as live until it expires (one year).
+  - Then delete `%USERPROFILE%\.claude-async-secrets\container.env`. Container jobs fail in preflight.
+- **Remove the code:** revert this PR's merge commit. Host mode is the same with or without it.
 - **Remove Docker:** `docker image rm claude-async-job:local`, then uninstall Docker Desktop if
   nothing else uses it.
-- **Clean the job clones:** `D:\code\jobs\*` are disposable clones. Delete them or re-clone them.
-  If any `claude_check` ever showed a `newGitFindings` warning for a clone, delete that clone
-  rather than running git in it.
 
-## Not verified
+## Review round 1: questions answered
 
-- **Anthropic's install, devcontainer and network-config pages** (`https://code.claude.com/docs/en/setup`,
-  `.../devcontainer`, `.../network-config`) could not be fetched from the sandbox this was written
-  in: the fetch permission timed out, and direct access was blocked by its egress proxy. So the
-  current recommended install method, the official list of hosts Claude Code needs, and its proxy
-  support come from the npm package's README and from strings in the 2.1.309 binary, not from
-  those pages. The authentication page *was* fetched and is quoted above.
-- **The real `node:24-bookworm-slim` build, Docker Desktop on Windows, host Ollama, the
-  host-loopback ports, and a real headless `claude -p` on the subscription token** were not run
-  here. The smoke test covers each one on claunker.
-- **GitHub's collaborator permission-level page** could not be fetched, so the statement that
-  personal-account repos have a single collaborator role is from prior knowledge.
-- **Whether `host.docker.internal` reaches services bound only to the Windows host's
-  `127.0.0.1`** (Ollama, the 7842 bridge). The smoke test probes both.
-- **Docker's daemon-security page** (<https://docs.docker.com/engine/security/>) could not be
-  fetched. "Access to the Docker daemon is equivalent to root on the host" is standard Docker
-  guidance stated from prior knowledge.
+- **Can concurrent jobs share a clone?** No. Each container clones its own copy into its own
+  writable layer, and nothing is shared or mounted read-write.
+- **Token values in out.log?** A job can print `$GH_TOKEN` (or read the OAuth token from `/proc`), and
+  `out.log` keeps it. The job dirs are readable by Erick's account, SYSTEM and Administrators. What
+  leaves the runner (exit.json tails, the Discord ping, `claude_check`) is redacted; the card never
+  carries output. See "Output redaction".
+- **`workflow` scope?** Omitting it doesn't stop a job editing a script an existing workflow runs.
+  Don't invite the bot to repos whose CI holds secrets until reviewed.
+- **Does `findUnsafeConfig()` / the `.git` audit cover enough?** Moot: there is no host clone and no
+  audit any more.
+- **Mount-path races, NTFS junctions, container-created symlinks?** Moot for the repo: nothing
+  writable is mounted. The two read-only mounts are files in the claude-async checkout.
+- **Duplicate runners, name reuse?** Cleanup acts only on containers carrying this job's
+  `claude-async.job` label, by immutable ID. A duplicate start is refused by the job-dir check.
+- **Repo-local Claude settings, `apiKeyHelper`?** Ignored (`--setting-sources user`), verified.
+- **Wall-clock limit?** Yes now: 4h default, runner-enforced.
+- **Phase 1 risk.** Phase 1 is an accepted credential-theft risk for a limited pilot (one scratch repo
+  first, no third-party install scripts, short collaborator list), with the revoke steps above.
+
+## Verified here vs assumed
+
+Verified in this sandbox (Linux, a real Docker engine, a test-only base image):
+
+- the image builds; the verified-bytes install rejects a substituted tarball and the old method did
+  not; `claude --version` and a full headless turn with a Bash tool call run in the image;
+- `--setting-sources user` ignores a hostile repo's settings, hooks, `apiKeyHelper` and `.mcp.json`
+  (fake API, control run included); `~/.claude` is unwritable; the CLI writes only the listed dirs;
+- the Bash tool's environment lacks `CLAUDE_CODE_OAUTH_TOKEN` but `/proc/<pid>/environ` has it;
+  `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` needs bubblewrap;
+- the entrypoint's clone, base-ref and failure paths (against a local repo via a git URL rewrite),
+  and the gh credential helper answering from `GH_TOKEN`;
+- run-by-ID after a tag retarget, and `--pull=never` with a missing tag (exit 125);
+- cancel at launch, cancel while running, SIGTERM, the wall-clock limit and cleanup confirmation with
+  the real runner and engine; `docker rm -f` semantics;
+- `container/probe.sh` against open, closed and unresolvable targets in a hardened container;
+- the HTTP bridge script with and without a token (401 / 200).
+
+Not verified here:
+
+- Docker Desktop on Windows, the real `node:24-bookworm-slim` base, host Ollama, and whether
+  `host.docker.internal` reaches the Windows host's `127.0.0.1` (the smoke test measures it);
+- `container/smoke-test.ps1` itself: no PowerShell was available, so its PowerShell logic was
+  reviewed but never run;
+- a real `claude -p` on the subscription token, and real GitHub clone/push/PR as the bot;
+- the ICC-off phase-1 network and the phase-2 proxy;
+- whether the app's Connectors UI can send a bearer header to the HTTP bridge;
+- a revoke path for `claude setup-token` tokens; GitHub's collaborator-level page; Anthropic's
+  install and network-config pages (not fetchable from here).

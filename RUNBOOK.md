@@ -437,26 +437,31 @@ this:
 
 ## Container jobs (`feat/container-jobs`, 2026-11-01)
 
-Opt-in per job with `claude_start`'s `sandbox: "container"`; off by default, and host jobs are
-untouched. Design, threat model, configuration and the rollout checklist: `docs/container-jobs.md`.
-Operational notes:
+Opt-in per job with `claude_start`'s `sandbox: "container"` plus `repo: "owner/repo"`, and only on a
+host whose `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes `container`; host jobs are untouched. The
+container clones the repo itself; no host folder is mounted read-write. Design, threat model,
+configuration and the rollout checklist: `docs/container-jobs.md`. Operational notes:
 
-- **Preflight refusals name the cause.** `errorCode: "preflight"` with "docker image ... is not
-  built" (run `container\smoke-test.ps1`), "is Docker Desktop running?", "outside the container
-  allowed roots", "env file ...", or a missing `CLAUDE_ASYNC_CONTAINER_GIT_NAME/_EMAIL`. Nothing is
+- **Preflight refusals name the cause.** `errorCode: "invalid"` for a sandbox the policy doesn't
+  allow; `errorCode: "preflight"` with "not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS", "do not take
+  workFolder", "docker image ... is not built" (run `container\smoke-test.ps1`), "is Docker Desktop
+  running?", "env file ...", "HTTP MCP bridge is not token-locked" (`node claude-async-http.mjs
+  --new-token`, restart the bridge), or a missing `CLAUDE_ASYNC_CONTAINER_GIT_NAME/_EMAIL`. Nothing is
   written for a refused start.
-- **exit 125** is `docker run` itself failing (bad mount, drive not shared, daemon down); exit.json
-  carries a warning saying so. **exit 137** is a killed container (`claude_cancel`, OOM at
-  `--memory`, or the runner's own kill on SIGTERM).
-- **Cancel = `claude_cancel`**, which runs `docker kill claude-async-<jobId>`. Killing the runner
-  or `docker.exe` with `taskkill /F` does NOT stop the container; if that happened, `claude_check`
-  kills it when it classifies the job `died`/`timed_out`, or run `docker kill claude-async-<jobId>`
-  by hand. List them with `docker ps --filter label=claude-async.job`.
-- **`exit.container.newGitFindings` non-empty** means the job left host-executing git config or
-  hooks in the repo's `.git`. Do not run git in that clone until you have looked; deleting and
-  re-cloning the job clone is the safe fix.
-- **Rollback:** stop passing `sandbox: "container"` (and unset `CLAUDE_ASYNC_JOB_SANDBOX`); revoke
-  the bot PAT and the setup-token for a full cut-off. See the doc's "Rollback".
+- **Exit codes:** 125 is `docker run` itself failing (daemon down, image missing; it never pulls);
+  70 is the entrypoint failing to clone `repo` or check out `baseRef`; 137 is a removed container
+  (`claude_cancel`, the wall-clock limit, OOM at `--memory`, or the runner's own stop on SIGTERM).
+- **Cancel = `claude_cancel`.** It writes `cancel_requested` in the job dir, then removes the job's
+  containers by label. Killing the runner or `docker.exe` with `taskkill /F` does NOT stop the
+  container; `claude_check` cleans up when it classifies the job `died`/`timed_out`. By hand:
+  `docker ps -a --filter label=claude-async.job=<jobId>` and `docker rm -f <id>`.
+- **`containerCleanup: "unconfirmed"`** on a finished job means something with the job's label may
+  still exist (usually the daemon was unreachable at the end). Every `claude_check` or
+  `claude_cancel` retries; it turns `confirmed` once docker lists nothing.
+- **Tokens in logs:** `out.log`/`err.log` are raw and may hold the bot PAT or OAuth token if a job
+  printed them; exit.json, `claude_check` and the Discord ping are redacted.
+- **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; revoke the bot PAT and the setup-token for
+  a full cut-off. See the doc's "Rollback".
 
 ## Dispatch defaults (model + effort)
 
