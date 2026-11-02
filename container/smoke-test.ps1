@@ -11,6 +11,8 @@
        - git, gh, node, python3, uv, rg, claude all run (versions printed)
        - the job user is uid 1000, not root, and cannot gain privileges
        - host Ollama answers at http://host.docker.internal:11434/api/tags
+       - the claude-async HTTP bridge (7842) and the Docker Engine TCP API (2375/2376) are NOT
+         reachable from the container (either would be a way out of the sandbox)
        - no Docker socket is visible, and none of the host secret/credential paths are mounted
          (it greps the container's own mount table for them)
        - with -EnvFile: the secrets file reaches the container as env vars (only their NAMES and
@@ -27,7 +29,8 @@ param(
   [string]$EnvFile = "",
   [switch]$RunClaude,
   [switch]$SkipBuild,
-  [string]$Docker = "docker"
+  [string]$Docker = "docker",
+  [int[]]$ForbiddenPorts = @(7842, 2375, 2376)
 )
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -82,6 +85,19 @@ if ($r.code -eq 0 -and $r.out -match '"models"') {
 } else {
   Fail "host Ollama NOT reachable at host.docker.internal:11434 (is Ollama listening on 0.0.0.0 / allowed through the firewall for the WSL/Docker vEthernet?): $($r.out)"
 }
+
+# --- 4b. Host services a job must NOT reach -------------------------------------------------
+# host.docker.internal reaches the Windows host -- that is how host Ollama is reachable -- and may
+# reach services bound only to its 127.0.0.1 too (unverified; this check is how to find out). Two
+# such services would let a job out of the sandbox entirely:
+#   7842  claude-async-http.mjs (unauthenticated MCP: a job could claude_start a sandbox:"host" job)
+#   2375/2376  Docker Engine API ("Expose daemon on tcp://localhost:2375" in Docker Desktop settings)
+# Extra ports to probe can be passed with -ForbiddenPorts.
+$probe = ($ForbiddenPorts | ForEach-Object { "p=$_; if timeout 3 bash -c `"exec 3<>/dev/tcp/host.docker.internal/`$p`" 2>/dev/null; then echo OPEN_`$p; else echo closed_`$p; fi" }) -join "`n"
+$r = Invoke-InContainer @() $probe
+$open = [regex]::Matches($r.out, "OPEN_(\d+)") | ForEach-Object { $_.Groups[1].Value }
+if (-not $open) { Pass "host ports $($ForbiddenPorts -join ', ') are not reachable from a job container" }
+else { Fail "host port(s) $($open -join ', ') reachable from a job container via host.docker.internal; see docs/container-jobs.md 'Host loopback services'. Do not enable container mode until this is closed." }
 
 # --- 5. No socket, no host secrets ----------------------------------------------------------
 # The container sees only what is mounted. The job's real mounts are the repo, CLAUDE.md and hooks;

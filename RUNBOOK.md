@@ -435,6 +435,29 @@ this:
   permanent misconfiguration still fails fast) — all via injected interfaces/listen/sleep/now, no
   real Tailscale or sockets.
 
+## Container jobs (`feat/container-jobs`, 2026-11-01)
+
+Opt-in per job with `claude_start`'s `sandbox: "container"`; off by default, and host jobs are
+untouched. Design, threat model, configuration and the rollout checklist: `docs/container-jobs.md`.
+Operational notes:
+
+- **Preflight refusals name the cause.** `errorCode: "preflight"` with "docker image ... is not
+  built" (run `container\smoke-test.ps1`), "is Docker Desktop running?", "outside the container
+  allowed roots", "env file ...", or a missing `CLAUDE_ASYNC_CONTAINER_GIT_NAME/_EMAIL`. Nothing is
+  written for a refused start.
+- **exit 125** is `docker run` itself failing (bad mount, drive not shared, daemon down); exit.json
+  carries a warning saying so. **exit 137** is a killed container (`claude_cancel`, OOM at
+  `--memory`, or the runner's own kill on SIGTERM).
+- **Cancel = `claude_cancel`**, which runs `docker kill claude-async-<jobId>`. Killing the runner
+  or `docker.exe` with `taskkill /F` does NOT stop the container; if that happened, `claude_check`
+  kills it when it classifies the job `died`/`timed_out`, or run `docker kill claude-async-<jobId>`
+  by hand. List them with `docker ps --filter label=claude-async.job`.
+- **`exit.container.newGitFindings` non-empty** means the job left host-executing git config or
+  hooks in the repo's `.git`. Do not run git in that clone until you have looked; deleting and
+  re-cloning the job clone is the safe fix.
+- **Rollback:** stop passing `sandbox: "container"` (and unset `CLAUDE_ASYNC_JOB_SANDBOX`); revoke
+  the bot PAT and the setup-token for a full cut-off. See the doc's "Rollback".
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /
