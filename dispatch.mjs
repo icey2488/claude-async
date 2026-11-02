@@ -104,15 +104,22 @@ export async function dispatchCheck(jobId, tailBytes = 8000, ctx = defaultCtx())
   return { jobId, host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
 
-// Cancel is local-only for now: a container job is cancelled on the host that runs it. A prefixed
-// id for another host is refused with a pointer, not forwarded (host-api.mjs has no cancel route).
+// Routed like claude_check: a job id prefixed with another registry host is forwarded to that
+// host's POST /v1/cancel (a container job runs, and is cancelled, on the host that started it);
+// an un-prefixed or local id is cancelled here.
 export async function dispatchCancel(jobId, ctx = defaultCtx()) {
   const { host } = parseHostPrefix(jobId);
-  if (host && host !== ctx.cfg.localHost) {
+  if (!host) return { host: ctx.cfg.localHost ?? null, ...cancelJob(jobId) };
+  if (!ctx.cfg.error && !knownHosts(ctx.cfg).includes(host)) {
     return { jobId, host, hostname: os.hostname(),
-             error: `job ${jobId} runs on host ${host}; claude_cancel only cancels jobs on this host (${ctx.cfg.localHost})` };
+             error: `job id ${JSON.stringify(jobId)} has host prefix "${host}", which is not in ${ctx.cfg.file} ` +
+                    `(known hosts: ${knownHosts(ctx.cfg).join(", ")})` };
   }
-  return { host: ctx.cfg.localHost ?? null, ...cancelJob(jobId) };
+  const route = resolveRoute(host, ctx.cfg);
+  if (route.error) return { jobId, host, hostname: os.hostname(), error: route.error };
+  if (route.kind === "local") return { host, ...cancelJob(jobId) };
+  const out = await forward(ctx, route, "POST", "/v1/cancel", { jobId }, FORWARD_TIMEOUT_MS);
+  return { jobId, host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
 
 export async function dispatchJobs(ctx = defaultCtx()) {
@@ -245,9 +252,11 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
   }, async ({ jobId, tailBytes }) => ok(await dispatchCheck(jobId, tailBytes || 8000, getCtx())));
 
   server.registerTool("claude_cancel", {
-    description: "Cancel a running CONTAINER job (sandbox: \"container\") on this host by killing its container " +
-                 "(docker kill claude-async-<jobId>). The job then finishes through its normal path (exit.json, " +
-                 "card, Discord ping) with a non-zero exit. Host jobs cannot be cancelled with this tool.",
+    description: "Cancel a CONTAINER job (sandbox: \"container\"), routed by the jobId's host prefix like claude_check. " +
+                 "Records the cancel (so a container that does not exist yet is never started, or is stopped the moment " +
+                 "it is) and removes the job's containers by label (docker rm -f). The job then finishes through its normal " +
+                 "path (exit.json, card, Discord ping) with a non-zero exit. On a finished job it retries an unconfirmed " +
+                 "container cleanup. Host jobs cannot be cancelled with this tool.",
     inputSchema: { jobId: z.string() },
   }, async ({ jobId }) => ok(await dispatchCancel(jobId, getCtx())));
 

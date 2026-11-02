@@ -5,6 +5,7 @@
  *
  *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
+ *   POST /v1/cancel  body { jobId }   (container jobs only; see job-core.mjs cancelJob)
  *   GET  /v1/jobs
  *
  * Backed by the EXISTING local path: a start goes through dispatch.mjs's startLocal() ->
@@ -37,7 +38,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkJob, listJobs } from "./job-core.mjs";
+import { checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
 import { loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
 import { DEPTH_HEADER } from "./guard.mjs";
@@ -196,6 +197,23 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
                                   error: `job ${jobId} belongs to host ${host}, not ${localHost}` });
         }
         return send(res, 200, { host: localHost, ...checkJob(jobId, tailBytes) });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/cancel") {
+        let body;
+        try { body = JSON.parse(await readBody(req)); }
+        catch (e) { return send(res, e.status || 400, { error: e.status ? e.message : "invalid JSON body", hostname }); }
+        if (!body || typeof body !== "object" || typeof body.jobId !== "string" || !body.jobId) {
+          return send(res, 400, { error: "jobId (a string) is required", hostname });
+        }
+        const { host } = parseHostPrefix(body.jobId);
+        if (host && host !== localHost) {
+          return send(res, 404, { jobId: body.jobId, host, hostname, error: `job ${body.jobId} belongs to host ${host}, not ${localHost}` });
+        }
+        const out = cancelJob(body.jobId);
+        // 404 unknown job; 503 a finished job whose container cleanup could not be confirmed (retry);
+        // 400 anything else refused (invalid id, a host job).
+        const status = out.error === "no such job" ? 404 : out.cleanup === "unconfirmed" ? 503 : out.error ? 400 : 200;
+        return send(res, status, { host: localHost, ...out, hostname: out.hostname || hostname });
       }
       if (req.method === "GET" && url.pathname === "/v1/jobs") {
         const jobs = listJobs().map((r) => ({ ...r, host: localHost, hostname }));

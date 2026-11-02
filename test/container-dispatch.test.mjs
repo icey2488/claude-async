@@ -73,3 +73,40 @@ test("POST /v1/start: sandbox:\"container\" is refused under the default policy 
   assert.equal(tickets().length, 0);
   assert.equal(jobDirs().length, 0);
 });
+
+// Argon #11: a container job started on claunker from another host can be cancelled from there.
+test("dispatchCancel: a remote job id is forwarded to its host's POST /v1/cancel; an unknown host is refused", async () => {
+  const seen = [];
+  const out = await dispatch.dispatchCancel("claunker.j-20261101-abcdefgh",
+    laptopCtx(peer(seen, { jobId: "claunker.j-20261101-abcdefgh", ok: true, cancelRequested: true })));
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].url, "http://100.100.1.1:7850/v1/cancel");
+  assert.equal(seen[0].init.method, "POST");
+  assert.equal(seen[0].init.headers.authorization, "Bearer tok");
+  assert.deepEqual(JSON.parse(seen[0].init.body), { jobId: "claunker.j-20261101-abcdefgh" });
+  assert.equal(out.ok, true);
+  assert.equal(out.host, "claunker");
+  assert.ok(out.forwardedBy);
+  const unknown = await dispatch.dispatchCancel("desktop.j-20261101-abcdefgh", laptopCtx(peer([])));
+  assert.match(unknown.error, /not in hosts\.json/);
+});
+
+test("POST /v1/cancel: cancels only this host's container jobs; validates the body", async () => {
+  const url = await apiServer();
+  const other = await post(url, "/v1/cancel", { jobId: "ha.j-20261101-abcdefgh" });
+  assert.equal(other.status, 404);
+  assert.match(other.body.error, /belongs to host ha/);
+  const missing = await post(url, "/v1/cancel", { jobId: "claunker.nope-20261101-abcdefgh" });
+  assert.equal(missing.status, 404);
+  assert.match(missing.body.error, /no such job/);
+  const bad = await post(url, "/v1/cancel", { jobId: 5 });
+  assert.equal(bad.status, 400);
+  // a host job: refused, nothing written
+  const started = await post(url, "/v1/start", { host: "claunker", prompt: "p" });
+  assert.equal(started.status, 200, JSON.stringify(started.body));
+  const hostJob = await post(url, "/v1/cancel", { jobId: started.body.jobId });
+  assert.equal(hostJob.status, 400);
+  assert.match(hostJob.body.error, /only supported for container jobs/);
+  const unauth = await fetch(url + "/v1/cancel", { method: "POST", body: "{}", headers: { "content-type": "application/json" } });
+  assert.equal(unauth.status, 401);
+});
