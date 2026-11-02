@@ -354,12 +354,16 @@ export function buildContainerEnv({ extraEnv = {}, cfg, jobId }) {
 // element; nothing is ever joined into a shell string.
 export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
   const { cfg, mounts, name, jobId } = plan;
+  // docker refuses --cpus above the CPUs the daemon's VM has (Docker Desktop's WSL2 VM may have
+  // fewer than the host), so the configured value is a ceiling, clamped to what the host reports.
+  const hostCpus = plan.hostCpus || os.availableParallelism?.() || os.cpus().length || 1;
+  const cpus = String(Math.min(Number(cfg.cpus), hostCpus));
   const argv = [
     "run", "--rm", "--name", name, "--label", `claude-async.job=${jobId}`,
     "--init",                                   // PID 1 reaps the CLI's children and forwards signals
     "--user", CONTAINER_USER,
     "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
-    "--cpus", cfg.cpus, "--memory", cfg.memory, "--memory-swap", cfg.memory, "--pids-limit", cfg.pidsLimit,
+    "--cpus", cpus, "--memory", cfg.memory, "--memory-swap", cfg.memory, "--pids-limit", cfg.pidsLimit,
     "--network", cfg.network,
     "--add-host", "host.docker.internal:host-gateway",
     "--env-file", plan.envFile,

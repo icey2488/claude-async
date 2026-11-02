@@ -53,7 +53,7 @@ function planFor(fx, overrides = {}) {
   const r = c.planContainerJob({ jobId: "claunker.t-20261101-abcd1234", workFolder: fx.repo,
                                  cfg: { ...fx.cfg, ...overrides }, resolveBin: (b) => b });
   assert.ok(!r.error, r.error);
-  return r.plan;
+  return { ...r.plan, hostCpus: 16 }; // pin the CPU clamp so argv doesn't depend on the test machine
 }
 
 function sampleArgv(fx, { extraEnv = {}, prompt = "do the thing", cfg = {} } = {}) {
@@ -83,6 +83,13 @@ test("resolveSandbox: an explicit request wins in both directions; anything else
 });
 
 // ------------------------------------------------------------------------------- argv ---
+
+test("docker run argv: --cpus is clamped to the host's CPU count", () => {
+  const fx = fixture();
+  const plan = { ...planFor(fx), hostCpus: 2 };
+  const argv = c.buildDockerRunArgv({ plan, cliArgv: ["-p"] });
+  assert.equal(valueAfter(argv, "--cpus"), "2");
+});
 
 test("docker run argv: exact isolation and lifecycle flags are present", () => {
   const fx = fixture();
