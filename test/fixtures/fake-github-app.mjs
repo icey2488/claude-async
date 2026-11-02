@@ -7,7 +7,8 @@
 // It writes <state-dir>/port when listening, appends one JSON line per request to
 // <state-dir>/calls.jsonl, appends every issued token to <state-dir>/tokens, and reads control
 // files on every request: <state-dir>/fail-mint (exists -> POST access_tokens answers 500),
-// <state-dir>/expires-ms (content -> how far ahead expires_at lies; default an hour).
+// <state-dir>/expires-ms (content -> how far ahead expires_at lies; default an hour),
+// <state-dir>/mint-delay-ms (content -> POST access_tokens answers after that many ms).
 //   GET  /repos/<repo>/installation            -> { id: 777 }
 //   GET  /app                                  -> { slug: "claunker-jobs" }
 //   GET  /users/claunker-jobs[bot]             -> { id: 98765 }
@@ -55,6 +56,13 @@ function serve(dir) {
       if (req.method === "GET" && url === `/users/${FAKE_SLUG}[bot]`) return send(200, { id: FAKE_BOT_ID, login: `${FAKE_SLUG}[bot]` });
       if (req.method === "POST" && url === `/app/installations/${FAKE_INSTALLATION}/access_tokens`) {
         if (fs.existsSync(path.join(dir, "fail-mint"))) return send(500, { message: "fake outage" });
+        let delayMs = 0;
+        try { delayMs = Number(fs.readFileSync(path.join(dir, "mint-delay-ms"), "utf8")) || 0; } catch {}
+        if (delayMs) { setTimeout(() => mintAndSend(), delayMs); return; }
+        return mintAndSend();
+      }
+      send(404, { message: "Not Found" });
+      function mintAndSend() {
         const b = JSON.parse(body);
         if (!Array.isArray(b.repositories) || b.repositories.length !== 1 || !b.permissions) return send(422, { message: "bad body" });
         let expiresMs = 60 * 60 * 1000;
@@ -63,7 +71,6 @@ function serve(dir) {
         fs.appendFileSync(path.join(dir, "tokens"), token + "\n");
         return send(201, { token, expires_at: new Date(Date.now() + expiresMs).toISOString(), permissions: b.permissions });
       }
-      send(404, { message: "Not Found" });
     });
   });
   server.listen(0, "127.0.0.1", () => {
@@ -74,7 +81,7 @@ function serve(dir) {
 
 export async function startFakeGitHub(dir, { publicKey }) {
   fs.mkdirSync(dir, { recursive: true });
-  for (const f of ["port", "calls.jsonl", "tokens", "fail-mint", "expires-ms"]) fs.rmSync(path.join(dir, f), { force: true }); // a stale state dir from an earlier run
+  for (const f of ["port", "calls.jsonl", "tokens", "fail-mint", "expires-ms", "mint-delay-ms"]) fs.rmSync(path.join(dir, f), { force: true }); // a stale state dir from an earlier run
   fs.writeFileSync(path.join(dir, "public.pem"), publicKey.export({ type: "spki", format: "pem" }));
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), dir], { stdio: "ignore" });
   const portFile = path.join(dir, "port");
@@ -90,6 +97,7 @@ export async function startFakeGitHub(dir, { publicKey }) {
     tokens: () => lines("tokens"),
     calls: () => lines("calls.jsonl").map((l) => JSON.parse(l)),
     setFailMint: (on) => { const f = path.join(dir, "fail-mint"); if (on) fs.writeFileSync(f, ""); else fs.rmSync(f, { force: true }); },
+    setMintDelayMs: (ms) => { const f = path.join(dir, "mint-delay-ms"); if (ms) fs.writeFileSync(f, String(ms)); else fs.rmSync(f, { force: true }); },
     setExpiresMs: (ms) => { const f = path.join(dir, "expires-ms"); if (ms) fs.writeFileSync(f, String(ms)); else fs.rmSync(f, { force: true }); },
     close: () => new Promise((r) => { child.on("exit", () => r()); child.kill("SIGTERM"); }),
   };

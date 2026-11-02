@@ -669,3 +669,42 @@ test("Argon #4: a 0-byte runner.lock created just before the runner starts: exit
   assert.equal(r.status, 3, r.stderr);
   assert.ok(!j.calls().some((a) => a[0] === "run"), "docker run never invoked");
 });
+
+// ------------------------------------------------------------ review round 3, C1 (Argon #3) ---
+// Token lifecycle: a signal during the initial mint still finishes properly (no container, creds dir
+// gone, exit.json and exit_code written); a dead runner's creds dir is removed by checkJob, after the
+// token value was read so the tails stay redacted.
+test("C1: SIGTERM during a delayed initial mint: no container, creds removed, exit.json and exit_code written", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "5000" });
+  gh.setMintDelayMs(3000);
+  try {
+    const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+    assert.ok(await waitFor(() => fs.existsSync(path.join(j.dir, "creds"))), "the runner is inside prepareGitHubToken (creds dir created)");
+    await new Promise((r) => setTimeout(r, 300));
+    child.kill("SIGTERM");
+    assert.equal(await exited(child), 0, "the runner finished through finish(), not by the default signal action");
+    await new Promise((r) => setTimeout(r, 3500));                 // the delayed mint answers after finish
+  } finally { gh.setMintDelayMs(null); }
+  assert.ok(!j.calls().some((a) => a[0] === "run"), "docker run never invoked");
+  assert.ok(fs.existsSync(path.join(j.dir, "exit_code")), "exit_code written");
+  const rec = j.exitRecord();
+  assert.equal(rec.exitReason, "signal");
+  assert.equal(rec.exitSignal, "SIGTERM");
+  assert.ok(!fs.existsSync(path.join(j.dir, "creds")), "creds dir removed, and not recreated by the late mint");
+  assert.ok(!/token refresh failed/.test(fs.readFileSync(path.join(j.dir, "err.log"), "utf8")), "no false refresh warning after finish");
+});
+
+test("C1: checkJob on a died container job with creds/token on disk removes creds and still redacts the token", { skip: SKIP }, () => {
+  const j = setup({});
+  const tok = "TOKENVALUE-not-a-known-shape-0123456789abcdef";
+  fs.mkdirSync(path.join(j.dir, "creds"));
+  fs.writeFileSync(path.join(j.dir, "creds", "token"), `${tok}\n`);
+  fs.writeFileSync(path.join(j.dir, "out.log"), `the job printed ${tok}\n`);
+  j.patchMeta({ pid: 999999, credsDir: undefined });
+  ageHeartbeat(j);
+  const s = core.checkJob(j.jobId, 4000, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }), findDockerClients: () => [] });
+  assert.equal(s.status, "died");
+  assert.ok(!fs.existsSync(path.join(j.dir, "creds")), "the dead runner's creds dir is gone");
+  assert.ok(!JSON.stringify(s).includes(tok), "the token is redacted");
+  assert.match(s.stdout, /\[REDACTED\]/);
+});

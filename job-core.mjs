@@ -1288,6 +1288,10 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
   // Container jobs: once the job is terminal (exit_code written, or the runner died/timed out), make
   // sure nothing it owns is still running, and keep retrying on every check until that is
   // CONFIRMED (see reconcileContainerCleanup). A running job is left to its runner.
+  // The job's current installation token is read BEFORE cleanup can delete creds/ (review round 3,
+  // C1), so the tails below are still redacted with it.
+  const tokenValues = meta.sandbox === "container"
+    ? readTokenFileSecretValues((meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME)) : [];
   if (meta.sandbox === "container" && meta.container && opts.containerCleanup !== false) {
     const terminal = exitCode !== null || state === "died" || state === "timed_out";
     if (terminal) {
@@ -1331,8 +1335,7 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
   if (meta.sandbox === "container") {
     // The OAuth token from the env file plus the job's current installation token (the runner's
     // creds/token, while the job runs); older token generations are covered by the ghs_ patterns.
-    const credsDir = (meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME);
-    const values = [...readEnvFileSecretValues(meta.container && meta.container.envFile), ...readTokenFileSecretValues(credsDir)];
+    const values = [...readEnvFileSecretValues(meta.container && meta.container.envFile), ...tokenValues];
     stdout = readRedactedTail(p.out, tailBytes, values);
     stderr = readRedactedTail(p.err, tailBytes, values);
     if (exitRecord && typeof exitRecord === "object") {
@@ -1492,6 +1495,13 @@ function containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClien
   return { pending: false };
 }
 
+function removeJobCredsDir(p, meta) {
+  const dir = (meta && meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME);
+  if (!fs.existsSync(dir)) return;
+  try { fs.rmSync(dir, { recursive: true, force: true }); }
+  catch (e) { try { fs.appendFileSync(p.err, `\n[job-core] WARN: could not delete ${dir}: ${e.message}\n`); } catch {} }
+}
+
 // A write-once flag (its existence is the signal): created with O_EXCL, an existing one is kept.
 function writeCancelIntent(p, why) {
   try { fs.writeFileSync(p.cancel, `${new Date().toISOString()} ${why}\n`, { flag: "wx" }); } catch {}
@@ -1502,6 +1512,10 @@ function writeCancelIntent(p, why) {
 // creates its container and exits between the two observations is then seen by the listing; the
 // other order (list, then liveness) could confirm an empty listing taken before the create landed.
 function reconcileContainerCleanup(p, meta, exitRecord, { by, runnerFinished, cleanup, findClients }) {
+  // A terminal job keeps no credential on disk (review round 3, C1): a runner that died (or hung past
+  // its timeout) never ran finish(), which is what normally deletes creds/. The caller has already read
+  // the token for redaction. Done before anything else, confirmed or not.
+  removeJobCredsDir(p, meta);
   if (containerCleanupConfirmed(meta, exitRecord)) return { confirmed: true, removed: 0 };
   // A runner that died before `docker run` must never start it later.
   if (!runnerFinished) writeCancelIntent(p, `${by}: runner not alive`);

@@ -664,6 +664,13 @@ logIfPathextSanitized(err, process.env, spawnEnv, `spawning ${command}`);
 
 let child;
 let containerWatch = null;
+const STOP_SIGNALS = ["SIGTERM", "SIGINT", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])];
+function onSignalBeforeLaunch(sig) {
+  if (done || child) return;
+  try { fs.writeSync(errFd, `\n[job-runner] ${sig} received before docker run; not starting container ${containerSpec.name}\n`); } catch {}
+  exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
+  finish(1);
+}
 // Cancelled before `docker run`: never start the container at all.
 function finishCancelledBeforeLaunch() {
   containerState.cancelled = true;
@@ -676,7 +683,11 @@ if (containerSpec && fs.existsSync(cancelPath)) {
 } else if (containerSpec) {
   // Container jobs: the GitHub App installation token must be on disk (for the creds mount) before
   // the container starts; minting is a network call, so the spawn happens in its continuation. A
-  // cancel that lands during the mint is honoured before anything is spawned.
+  // cancel that lands during the mint is honoured before anything is spawned. A signal that lands
+  // during the mint (review round 3, C1) finishes the job through finish() -- no container, creds
+  // dir removed, exit.json and exit_code written -- instead of Node's default action; watchContainer
+  // replaces these handlers with the bounded stop once the client runs.
+  for (const sig of STOP_SIGNALS) process.on(sig, onSignalBeforeLaunch);
   prepareGitHubToken().then((ready) => {
     if (done) return;
     if (fs.existsSync(cancelPath)) { finishCancelledBeforeLaunch(); return; }
@@ -795,7 +806,8 @@ function watchContainer() {
     if (stop.started && Date.now() - stop.lastAttemptEnd >= rmRetryMs) tryRemove("retry");
   }, pollMs);
   containerWatch.unref();
-  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])]) {
+  for (const sig of STOP_SIGNALS) {
+    process.removeListener(sig, onSignalBeforeLaunch);
     process.on(sig, () => beginStop(`${sig} received`, { sig }));
   }
 }
