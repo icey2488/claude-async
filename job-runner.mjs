@@ -37,13 +37,25 @@
  * runs inside the container while this runner keeps owning the child's stdout/stderr, heartbeat,
  * exit.json, card close and Discord ping exactly as for a host job. The container clones its repo
  * itself; no host folder is mounted, so there is no host clone to audit and the card hook never runs
- * host git for a container job. Additions, all inert for host jobs: (1) on
- * SIGTERM/SIGINT/SIGBREAK/SIGHUP the runner `docker kill`s the container BY NAME (stopping the
- * docker client alone leaves the container running) and then records the exit as usual; (2)
- * finish() always runs a best-effort `docker kill <name>` too, for a docker client that died while
- * its container kept going; (3) exit.json gets a `container` record: the repo, the PR URL the job
- * reported on stdout for that repo (prUrl), and a warning when the image's entrypoint could not
- * clone the repo (exit 70).
+ * host git for a container job. Additions, all inert for host jobs:
+ *   (1) Cancel intent: if job-core wrote cancel_requested before this runner got to `docker run`, the
+ *       container is never started; while the client runs, the file is polled and the container is
+ *       removed the moment it is seen (also right after a container that was still being created
+ *       appears). The docker client's pid goes to docker_client.pid so job-core can tell whether a
+ *       launch may still be pending.
+ *   (2) Every stop removes the job's containers BY LABEL (claude-async.job=<jobId>) with
+ *       `docker rm -f <id>` (container.mjs cleanupJobContainers), which catches a container in the
+ *       Created state too. Stopping the docker client alone leaves the container running.
+ *   (3) SIGTERM/SIGINT/SIGBREAK/SIGHUP: remove the containers, then wait for the client; if it never
+ *       exits (wedged daemon), kill the client after CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS and record
+ *       the cleanup as NOT confirmed.
+ *   (4) A wall-clock limit (spec.container.maxRuntimeMs): past it the containers are removed and the
+ *       exit is recorded as exitReason "container_max_runtime" (claude_check: timed_out).
+ *   (5) finish() kills a still-running client, removes the job's containers and records the result
+ *       in exit.json as container.cleanup.confirmed, separately from the CLI's own exit: job-core's
+ *       checkJob()/cancelJob() keep retrying an unconfirmed cleanup.
+ *   (6) exit.json's container record also carries the repo, the PR URL the job reported on stdout
+ *       for that repo (prUrl), and a warning when the entrypoint could not clone it (exit 70).
  *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
@@ -66,7 +78,7 @@ import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
-import { killContainer, extractPrUrl, ENTRY_EXIT_CLONE } from "./container.mjs";
+import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, DEFAULT_MAX_RUNTIME_MS } from "./container.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -91,10 +103,14 @@ try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
 catch { process.exit(2); }
 
 const { command, argv, cwd, out, err, exit } = spec;
-// Container jobs only (see the header): { name, dockerBin, repo }. null for host jobs.
+// Container jobs only (see the header): { name, jobId, dockerBin, repo, maxRuntimeMs }. null for host jobs.
 const containerSpec = spec.container && typeof spec.container === "object" ? spec.container : null;
 
 const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
+// Container jobs: cancel intent (written by job-core) and the docker client's pid (written here).
+const cancelPath = path.join(path.dirname(specPath), "cancel_requested");
+const dockerPidPath = path.join(path.dirname(specPath), "docker_client.pid");
+const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null };
 
 // 2026-09-09 runner-termination investigation: self-reported Job Object membership, refreshed on
 // every heartbeat, so a job's death can be correlated against "was this runner actually free of
@@ -226,8 +242,23 @@ const BG_TASKS_TERMINATED_RE = /Background tasks still running after \d+s; termi
 // guarantee it does, which is why this is a best-effort warning, not a status change.
 const BASH_AUTO_BACKGROUND_KILLED_RE = /stopped after reaching its background time limit/;
 
-// Best-effort: a runner that cannot record must still finish normally.
-function recordExit() {
+// Container jobs: remove every container carrying this job's label. Returns cleanupJobContainers()'s
+// result; logs a failure once per distinct error so a poll loop doesn't flood err.log.
+function removeJobContainers(why) {
+  let r;
+  try { r = cleanupJobContainers({ dockerBin: containerSpec.dockerBin || command, jobId: containerSpec.jobId || path.basename(path.dirname(specPath)) }); }
+  catch (e) { r = { ok: false, error: e.message }; }
+  const errText = !r.ok ? r.error : (!r.absent ? "a container is still listed after docker rm -f" : null);
+  if (errText && errText !== containerState.lastCleanupError) {
+    containerState.lastCleanupError = errText;
+    try { fs.writeSync(errFd, `\n[job-runner] WARN: removing container ${containerSpec.name} (${why}) failed: ${errText}\n`); } catch {}
+  }
+  return r;
+}
+
+// Best-effort: a runner that cannot record must still finish normally. cleanup: container jobs'
+// cleanup record from finish() ({ confirmed, removed, error? }).
+function recordExit(cleanup = null) {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
   const stdoutTail = readTail(out);
   const stderrTail = readTail(err);
@@ -236,9 +267,12 @@ function recordExit() {
   // Only overrides a plain "exit" (the CLI ran and exited on its own, which is what printing its
   // own ceiling-reached line implies) -- never a signal or spawn-error, which mean something else
   // entirely happened.
-  const exitReason = exitInfo.exitReason === "exit" && BG_TASKS_TERMINATED_RE.test(stderrTail.join("\n"))
+  let exitReason = exitInfo.exitReason === "exit" && BG_TASKS_TERMINATED_RE.test(stderrTail.join("\n"))
     ? "bg_tasks_terminated"
     : exitInfo.exitReason;
+  // Container jobs: the client exited because WE removed its container (cancel, wall-clock limit).
+  if (containerSpec && containerState.cancelled && (exitReason === "exit" || exitReason === "cancelled")) exitReason = "cancelled";
+  else if (containerSpec && containerState.runtimeExceeded && exitReason === "exit") exitReason = "container_max_runtime";
   const combinedTail = `${stdoutTail.join("\n")}\n${stderrTail.join("\n")}`;
   const warnings = [];
   if (BASH_AUTO_BACKGROUND_KILLED_RE.test(combinedTail)) {
@@ -252,7 +286,13 @@ function recordExit() {
     // reads, not just the last 20 lines, since the report usually ends with the delegation lines).
     let prUrl = null;
     try { prUrl = extractPrUrl(readTail(out, PR_SCAN_LINES), containerSpec.repo); } catch {}
-    containerRecord = { name: containerSpec.name, repo: containerSpec.repo || null, prUrl };
+    containerRecord = { name: containerSpec.name, repo: containerSpec.repo || null, prUrl,
+                        cleanup: cleanup || { confirmed: false, error: "not attempted" },
+                        cancelled: containerState.cancelled, maxRuntimeExceeded: containerState.runtimeExceeded };
+    if (containerState.runtimeExceeded) {
+      warnings.push(`the container ran past its wall-clock limit (${containerSpec.maxRuntimeMs} ms, ` +
+        "CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS) and was removed");
+    }
     // 125 is docker run's own failure (daemon down, bad flag, image refused), not the CLI's.
     if (exitInfo.exitCode === 125) warnings.push("docker run itself failed (exit 125) before or while starting the container; see stderrTail");
     if (exitInfo.exitCode === ENTRY_EXIT_CLONE) {
@@ -291,19 +331,36 @@ async function finish(code) {
   // Wrapped so a throw here (e.g. the membership-query child process misbehaving on close)
   // cannot skip the exit_code / exit.json / card-close writes below.
   try { membershipQuerier.close(); } catch {}
-  // Container jobs: make sure nothing is left running (a no-op after a normal --rm exit).
+  // Container jobs: the client must be gone first (so it can't create or start anything after the
+  // cleanup below), then nothing with the job's label may be left. Normally the client has exited
+  // and --rm already removed the container, so this lists nothing.
+  let cleanupRecord = null;
   if (containerSpec) {
+    if (containerWatch) clearInterval(containerWatch);
+    if (child && child.exitCode === null && child.signalCode === null) { try { child.kill("SIGKILL"); } catch {} }
     try {
-      const k = killContainer({ dockerBin: containerSpec.dockerBin || command, name: containerSpec.name });
-      if (k.ok && k.killed) fs.writeSync(errFd, `\n[job-runner] container ${containerSpec.name} was still running after docker exited; killed it\n`);
-      else if (!k.ok) fs.writeSync(errFd, `\n[job-runner] WARN: docker kill ${containerSpec.name} failed: ${k.error}\n`);
+      const r = removeJobContainers("finish");
+      const absent = !!(r.ok && r.absent);
+      // A client that had to be killed after the stop wait may have had a create request in flight
+      // daemon-side, so its cleanup is never confirmed here; checkJob() confirms it later.
+      const confirmed = absent && !containerState.fallbackFired;
+      cleanupRecord = { confirmed, removed: r.removed || 0,
+                        ...(!r.ok ? { error: r.error } : !absent ? { error: "a container is still listed after docker rm -f" } : {}),
+                        ...(containerState.fallbackFired ? { reason: "the docker client did not exit within the stop wait and was killed" } : {}) };
+      if (absent && r.removed > 0 && !containerState.cancelled && !containerState.runtimeExceeded) {
+        fs.writeSync(errFd, `\n[job-runner] container ${containerSpec.name} was still present after docker exited; removed it\n`);
+      }
+      if (!confirmed) {
+        fs.writeSync(errFd, `\n[job-runner] WARN: container cleanup for ${containerSpec.name} not confirmed ` +
+          `(${cleanupRecord.error || cleanupRecord.reason}); claude_check / claude_cancel retry it\n`);
+      }
     } catch {}
   }
   // Write exit.json BEFORE exit_code (and therefore before closeCard() too): exit_code is the
   // signal most external readers poll for "the job is done", so any reader that observes
   // exit_code must be able to rely on exit.json already existing on disk.
   let exitRecord = null;
-  try { exitRecord = recordExit(); } catch {}
+  try { exitRecord = recordExit(cleanupRecord); } catch {}
   try { fs.writeFileSync(exit, String(code)); } catch {}
   // Card hook: read meta.json (written by job-core before launching us) for cardId/startHead.
   // Reading here (after child exits) avoids any startup race with job-core's meta write.
@@ -365,31 +422,67 @@ const spawnEnv = sanitizeEnvForWin32(process.env);
 logIfPathextSanitized(err, process.env, spawnEnv, `spawning ${command}`);
 
 let child;
-try {
-  child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true, env: spawnEnv });
-} catch (e) {
-  try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
-  exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
-  finish(127);
+let containerWatch = null;
+if (containerSpec && fs.existsSync(cancelPath)) {
+  // Cancelled before `docker run`: never start the container at all.
+  containerState.cancelled = true;
+  try { fs.writeSync(errFd, `\n[job-runner] cancel requested before docker run; not starting container ${containerSpec.name}\n`); } catch {}
+  exitInfo = { exitCode: null, exitSignal: null, exitReason: "cancelled" };
+  finish(130);
+} else {
+  try {
+    child = spawn(command, argv, { cwd, stdio: ["ignore", outFd, errFd], windowsHide: true, env: spawnEnv });
+  } catch (e) {
+    try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
+    exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
+    finish(127);
+  }
 }
 
-// Container jobs: a cancel (or any catchable termination of this runner) kills the container by
-// name; the docker client then exits on its own and the normal exit path records it. The fallback
-// timer finishes the job anyway if the client never exits. Windows TerminateProcess can't be
-// caught at all, which is why job-core.mjs's cancelJob() kills the container itself first and
-// checkJob() reaps the container of a runner that died.
+// Container jobs: the docker client's pid (job-core's "may a launch still be pending?"), then a poll
+// for the cancel intent and the wall-clock limit. Either one removes the job's containers on every
+// tick until the client exits, which also catches a container that was still being created when
+// the cancel arrived.
+if (child && containerSpec) {
+  try { if (child.pid) fs.writeFileSync(dockerPidPath, String(child.pid)); } catch {}
+  const startedMs = Date.now();
+  const maxRuntimeMs = Number(containerSpec.maxRuntimeMs) > 0 ? Number(containerSpec.maxRuntimeMs) : DEFAULT_MAX_RUNTIME_MS;
+  const pollMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_POLL_MS) || 1000;
+  containerWatch = setInterval(() => {
+    if (done) return;
+    if (!containerState.cancelled && fs.existsSync(cancelPath)) {
+      containerState.cancelled = true;
+      try { fs.writeSync(errFd, `\n[job-runner] cancel request seen; removing container ${containerSpec.name}\n`); } catch {}
+    }
+    if (!containerState.runtimeExceeded && Date.now() - startedMs > maxRuntimeMs) {
+      containerState.runtimeExceeded = true;
+      try { fs.writeSync(errFd, `\n[job-runner] wall-clock limit (${maxRuntimeMs} ms) reached; removing container ${containerSpec.name}\n`); } catch {}
+    }
+    if (containerState.cancelled || containerState.runtimeExceeded) removeJobContainers("cancel/limit");
+  }, pollMs);
+  containerWatch.unref();
+}
+
+// Container jobs: a cancel (or any catchable termination of this runner) removes the job's
+// containers; the docker client then exits on its own and the normal exit path records it. If the
+// client never exits, the fallback kills it and finishes with the cleanup NOT confirmed. Windows
+// TerminateProcess can't be caught at all, which is why job-core's checkJob() also cleans up after
+// a runner that died, and cancelJob() removes the containers itself.
 if (child && containerSpec) {
   let stopping = false;
+  const stopWaitMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS) || 30_000;
   const stopContainer = (sig) => {
     if (stopping) return;
     stopping = true;
-    try { fs.writeSync(errFd, `\n[job-runner] ${sig} received; killing container ${containerSpec.name}\n`); } catch {}
-    const k = killContainer({ dockerBin: containerSpec.dockerBin || command, name: containerSpec.name });
-    if (!k.ok) { try { fs.writeSync(errFd, `\n[job-runner] WARN: docker kill failed: ${k.error}\n`); } catch {} }
+    try { fs.writeSync(errFd, `\n[job-runner] ${sig} received; removing container ${containerSpec.name}\n`); } catch {}
+    removeJobContainers(sig);
     setTimeout(() => {
-      if (!done) exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
+      if (done) return;
+      containerState.fallbackFired = true;
+      try { child.kill("SIGKILL"); } catch {}
+      exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
       finish(1);
-    }, 30_000).unref();
+    }, stopWaitMs).unref();
   };
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])]) {
     process.on(sig, () => stopContainer(sig));

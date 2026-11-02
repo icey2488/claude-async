@@ -376,20 +376,61 @@ test("validateContainerConfig: refuses host/none networks, bad limits, missing b
 
 // ---------------------------------------------------------------------------- kill / audit ---
 
-test("kill targets the container by name, never a pid", () => {
-  assert.deepEqual(c.buildKillArgv("claude-async-claunker.x-20261101-abcd1234"), ["kill", "claude-async-claunker.x-20261101-abcd1234"]);
-  assert.throws(() => c.buildKillArgv("some-other-container"));
-  assert.throws(() => c.buildKillArgv(1234));
+// A fake spawnSync "daemon" for the label-based cleanup: containers = [{ id, state, label }].
+function fakeDaemon(containers, { psFails = false, rmFails = new Set() } = {}) {
   const calls = [];
-  const fake = (bin, args) => { calls.push([bin, args]); return { status: 0, stdout: "x", stderr: "" }; };
-  assert.deepEqual(c.killContainer({ dockerBin: "docker", name: "claude-async-j", spawnSync: fake }), { ok: true, killed: true });
-  assert.deepEqual(calls, [["docker", ["kill", "claude-async-j"]]]);
-  const gone = () => ({ status: 1, stdout: "", stderr: "Error response from daemon: No such container: claude-async-j" });
-  assert.deepEqual(c.killContainer({ dockerBin: "docker", name: "claude-async-j", spawnSync: gone }), { ok: true, killed: false });
-  const down = () => ({ status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" });
-  assert.equal(c.killContainer({ dockerBin: "docker", name: "claude-async-j", spawnSync: down }).ok, false);
+  const fn = (bin, args) => {
+    calls.push(args);
+    if (args[0] === "ps") {
+      if (psFails) return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
+      const label = args[args.indexOf("--filter") + 1].replace(/^label=claude-async\.job=/, "");
+      return { status: 0, stderr: "", stdout: containers.filter((x) => x.label === label || x.leak)
+        .map((x) => `${x.id}\t${x.state}\t${x.label}\n`).join("") };
+    }
+    if (args[0] === "rm") {
+      if (rmFails.has(args[2])) return { status: 1, stdout: "", stderr: "Error response from daemon: cannot remove" };
+      const i = containers.findIndex((x) => x.id === args[2]);
+      if (i >= 0) containers.splice(i, 1);
+      return { status: 0, stdout: args[2], stderr: "" };
+    }
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  return { fn, calls, containers };
+}
+const CID = (ch) => ch.repeat(64);
+
+test("cleanup lists by the exact job label and removes by immutable ID with rm -f (running AND created)", () => {
+  const d = fakeDaemon([{ id: CID("a"), state: "running", label: "j1" }, { id: CID("b"), state: "created", label: "j1" },
+                        { id: CID("c"), state: "running", label: "j2" }]);
+  assert.deepEqual(c.buildListArgv("j1"), ["ps", "-a", "--no-trunc", "--filter", "label=claude-async.job=j1",
+    "--format", '{{.ID}}\t{{.State}}\t{{.Label "claude-async.job"}}']);
+  const r = c.cleanupJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: d.fn });
+  assert.deepEqual(r, { ok: true, absent: true, removed: 2, remaining: [] });
+  assert.deepEqual(d.calls.filter((a) => a[0] === "rm"), [["rm", "-f", CID("a")], ["rm", "-f", CID("b")]]);
+  assert.deepEqual(d.containers.map((x) => x.label), ["j2"], "another job's container is untouched");
+  assert.ok(!d.calls.some((a) => a[0] === "kill"), "never docker kill <name>");
 });
 
+test("cleanup: a container returned without our label is never removed (name reuse / filter bug belt)", () => {
+  const d = fakeDaemon([{ id: CID("d"), state: "running", label: "someone-else", leak: true }]);
+  const r = c.cleanupJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: d.fn });
+  assert.equal(r.removed, 0);
+  assert.ok(!d.calls.some((a) => a[0] === "rm"));
+});
+
+test("cleanup: daemon down is ok:false; a failed rm leaves the container listed (absent:false)", () => {
+  assert.match(c.cleanupJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: fakeDaemon([], { psFails: true }).fn }).error,
+    /Cannot connect/);
+  const d = fakeDaemon([{ id: CID("e"), state: "running", label: "j1" }], { rmFails: new Set([CID("e")]) });
+  const r = c.cleanupJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: d.fn });
+  assert.equal(r.ok, true);
+  assert.equal(r.absent, false);
+  assert.equal(r.remaining.length, 1);
+  assert.equal(c.cleanupJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: fakeDaemon([]).fn }).absent, true);
+  const bad = () => ({ status: 0, stdout: "not-an-id\trunning\tj1\n", stderr: "" });
+  assert.match(c.listJobContainers({ dockerBin: "docker", jobId: "j1", spawnSync: bad }).error, /unexpected line/);
+  assert.equal(c.killContainer, undefined, "the name-based kill is gone");
+});
 test("checkDockerImage: returns the immutable image ID; refuses a malformed one", () => {
   const id = `sha256:${"0123456789abcdef".repeat(4)}`;
   const run = (res) => () => res;
@@ -514,7 +555,7 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.equal(r.workFolder, null, "no host folder");
   assert.equal(r.startHead, null, "no host git HEAD for a container job");
   assert.equal(r.hermesHome, undefined, "no per-job HERMES_HOME dir for container jobs");
-  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "name", "repo"]);
+  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "jobId", "maxRuntimeMs", "name", "repo"]);
   // the image runs by the ID preflight inspected (ctrOpts' checkImage), recorded in meta too
   const imageId = `sha256:${"ab".repeat(32)}`;
   assert.ok(argv.includes(imageId) && !argv.includes(fx.cfg.image));
@@ -578,37 +619,117 @@ test("startJob: container preflight refusals happen before the job dir exists", 
   }
 });
 
-test("cancelJob: kills a running container job by name; refuses host jobs; no-op once finished", async () => {
-  const fx = fixture();
-  const id = jid("cancel");
-  const r2 = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO }, ctrOpts(fx, { launch: fakeLaunch([]) }));
-  assert.ok(!r2.error, r2.error);
-  const kills = [];
-  const out = core.cancelJob(id, { killContainer: (a) => { kills.push(a); return { ok: true, killed: true }; } });
-  assert.deepEqual(out.ok, true);
-  assert.deepEqual(kills, [{ dockerBin: process.execPath, name: `claude-async-${id}` }]);
-  fs.writeFileSync(path.join(core.JOB_ROOT, id, "exit_code"), "137");
-  assert.equal(core.cancelJob(id, { killContainer: () => { throw new Error("must not kill"); } }).alreadyFinished, true);
 
+// job-core's container cleanup state. Seams: opts.cleanupContainers replaces cleanupJobContainers.
+const cleanupSeam = (results) => {
+  const seen = [];
+  const fn = (a) => { seen.push(a); return results.length > 1 ? results.shift() : results[0]; };
+  return { fn, seen };
+};
+async function startCtr(fx, launch = fakeLaunch([])) {
+  const id = jid("cl");
+  const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO }, ctrOpts(fx, { launch }));
+  assert.ok(!r.error, r.error);
+  return { id, d: path.join(core.JOB_ROOT, id) };
+}
+const deadLaunch = async () => ({ pid: 999999, pidSource: "test", launchPath: "test" });
+
+test("startJob: the runner's container record carries the job id (label) and the wall-clock limit", async () => {
+  const fx = fixture();
+  const cap = [];
+  await startCtr({ ...fx, cfg: { ...fx.cfg, maxRuntimeMs: 3_600_000 } }, fakeLaunch(cap));
+  const ct = cap[0].launchExtra.container;
+  assert.equal(ct.jobId, path.basename(cap[0].p.d));
+  assert.equal(ct.maxRuntimeMs, 3_600_000);
+  assert.equal(c.loadContainerConfig(BOT).maxRuntimeMs, 4 * 3600_000, "default 4h");
+  assert.ok(c.validateContainerConfig({ ...c.loadContainerConfig(BOT), maxRuntimeMs: 1000 }).length, "too small refused");
+  assert.ok(c.validateContainerConfig(c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS: "abc" })).length);
+});
+
+test("cancelJob: persists the intent FIRST, then removes by label; refuses host jobs", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  const order = [];
+  const seam = (a) => { order.push(fs.existsSync(path.join(d, "cancel_requested")) ? "intent-on-disk" : "no-intent");
+                        assert.equal(a.jobId, id); return { ok: true, absent: true, removed: 1, remaining: [] }; };
+  const out = core.cancelJob(id, { cleanupContainers: seam });
+  assert.deepEqual(order, ["intent-on-disk"]);
+  assert.equal(out.ok, true);
+  assert.equal(out.cancelRequested, true);
+  assert.equal(out.removed, 1);
+  assert.notEqual(out.cleanup, "confirmed", "a running job's runner may still be launching; never confirmed here");
   const hostId = jid("hostjob");
   await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: hostId },
     { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
-  assert.match(core.cancelJob(hostId, { killContainer: () => { throw new Error("must not kill"); } }).error, /only supported for container jobs/);
+  assert.match(core.cancelJob(hostId, { cleanupContainers: () => { throw new Error("must not run"); } }).error, /only supported for container jobs/);
+  assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, hostId, "cancel_requested")));
   assert.match(core.cancelJob("../x").error, /invalid jobId/);
 });
 
-test("checkJob: a died container job gets its container killed once (reap)", async () => {
+test("cancelJob: a cancel that finds no container while the job runs reports a pending launch, not success", async () => {
   const fx = fixture();
-  const id = jid("reap");
-  const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO },
-    ctrOpts(fx, { launch: async () => ({ pid: 999999, pidSource: "test", launchPath: "test" }) }));
-  assert.ok(!r.error, r.error);
-  const kills = [];
-  const killContainer = (a) => { kills.push(a.name); return { ok: true, killed: true }; };
-  // No heartbeat file and a dead pid: classified "died".
-  const s = core.checkJob(id, 0, { killContainer });
-  assert.equal(s.status, "died");
-  assert.deepEqual(kills, [`claude-async-${id}`]);
-  core.checkJob(id, 0, { killContainer });
-  assert.equal(kills.length, 1, "reaped only once");
+  const { id } = await startCtr(fx);
+  const out = core.cancelJob(id, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }) });
+  assert.equal(out.ok, true);
+  assert.equal(out.removed, 0);
+  assert.equal(out.cleanup, "pending");
+  assert.match(out.note, /will not start one|stop it as soon as it exists/);
+  const down = core.cancelJob(id, { cleanupContainers: () => ({ ok: false, error: "daemon down" }) });
+  assert.equal(down.ok, true, "the intent is on disk; the runner acts on it");
+  assert.match(down.warning, /daemon down/);
+});
+
+test("cancelJob on a finished job: alreadyFinished only once cleanup is confirmed", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  fs.writeFileSync(path.join(d, "exit.json"), JSON.stringify({ exitCode: 0, container: { cleanup: { confirmed: false, error: "x" } } }));
+  fs.writeFileSync(path.join(d, "exit_code"), "0");
+  const fail = core.cancelJob(id, { cleanupContainers: () => ({ ok: false, error: "daemon down" }) });
+  assert.equal(fail.ok, false);
+  assert.equal(fail.alreadyFinished, undefined);
+  assert.equal(fail.cleanup, "unconfirmed");
+  const still = core.cancelJob(id, { cleanupContainers: () => ({ ok: true, absent: false, removed: 0, remaining: [{ id: CID("f") }] }) });
+  assert.equal(still.ok, false);
+  const ok = core.cancelJob(id, { cleanupContainers: () => ({ ok: true, absent: true, removed: 1, remaining: [] }) });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.alreadyFinished, true);
+  assert.equal(ok.cleanup, "confirmed");
+  assert.equal(core.cancelJob(id, { cleanupContainers: () => { throw new Error("must not run again"); } }).alreadyFinished, true);
+});
+
+test("checkJob: a died container job is reaped by label; confirmed only when nothing is left AND no launch is pending", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx, deadLaunch);
+  // the docker client the runner started is still alive (pid file names a live process): pending
+  fs.writeFileSync(path.join(d, "docker_client.pid"), String(process.pid));
+  const s1 = cleanupSeam([{ ok: true, absent: true, removed: 0, remaining: [] }]);
+  const r1 = core.checkJob(id, 0, { cleanupContainers: s1.fn });
+  assert.equal(r1.status, "died");
+  assert.equal(r1.containerCleanup, "unconfirmed", "\"no such container\" while a launch may be pending is not cleanup");
+  assert.ok(fs.existsSync(path.join(d, "cancel_requested")), "the reap persists cancel intent for a slow runner");
+  // client gone, but the daemon still lists a container that rm could not remove
+  fs.writeFileSync(path.join(d, "docker_client.pid"), "999999");
+  const r2 = core.checkJob(id, 0, { cleanupContainers: cleanupSeam([{ ok: true, absent: false, removed: 0, remaining: [{ id: CID("g") }] }]).fn });
+  assert.equal(r2.containerCleanup, "unconfirmed");
+  // client gone, nothing left: confirmed, persisted, and never retried
+  const s3 = cleanupSeam([{ ok: true, absent: true, removed: 1, remaining: [] }]);
+  assert.equal(core.checkJob(id, 0, { cleanupContainers: s3.fn }).containerCleanup, "confirmed");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(d, "meta.json"), "utf8")).containerCleanup.confirmed, true);
+  assert.equal(core.checkJob(id, 0, { cleanupContainers: () => { throw new Error("must not run"); } }).containerCleanup, "confirmed");
+});
+
+test("checkJob: a running container job is never cleaned up, and countActiveJobs never touches docker", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  fs.writeFileSync(path.join(d, "runner_heartbeat"), new Date().toISOString());
+  const r = core.checkJob(id, 0, { cleanupContainers: () => { throw new Error("must not run for a running job"); } });
+  assert.equal(r.status, "running");
+  assert.equal(r.containerCleanup, undefined);
+  // a died one: countActiveJobs' status check must not spend docker timeouts on cleanup
+  const dead = await startCtr(fx, deadLaunch);
+  const opts = [];
+  core.countActiveJobs(Date.now(), { check: (jid2, tail, o) => { opts.push(o); return core.checkJob(jid2, tail, o); } });
+  assert.ok(opts.length >= 1);
+  assert.ok(opts.every((o) => o && o.containerCleanup === false), "the cap count asks for no container cleanup");
+  assert.ok(!fs.existsSync(path.join(dead.d, "cancel_requested")), "no reap from the cap count");
 });

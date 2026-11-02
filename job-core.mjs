@@ -26,7 +26,7 @@ import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
-         buildContainerCliArgv, buildDockerRunArgv, killContainer } from "./container.mjs";
+         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -413,7 +413,10 @@ const jobPaths = (id) => {
   return { d, out: path.join(d, "out.log"), err: path.join(d, "err.log"),
            exit: path.join(d, "exit_code"), meta: path.join(d, "meta.json"),
            spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat"),
-           exitJson: path.join(d, "exit.json") };
+           exitJson: path.join(d, "exit.json"),
+           // container jobs only: the persisted cancel intent (job-core writes, the runner reads) and
+           // the docker client's pid (the runner writes, job-core reads; see containerLaunchPending)
+           cancel: path.join(d, "cancel_requested"), dockerPid: path.join(d, "docker_client.pid") };
 };
 
 export function pidAlive(pid) {
@@ -895,7 +898,9 @@ export function countActiveJobs(nowMs, { check = checkJob } = {}) {
     catch (e) { problem = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`; }
     if (!problem && !isPlainObject(meta)) problem = "has an unreadable meta.json (not a JSON object)";
     if (!problem) {
-      try { running = check(id, 0).status === "running"; }
+      // containerCleanup:false: the cap count only needs a status, never docker housekeeping (which
+      // could spend docker timeouts inside the start lock when the daemon is down).
+      try { running = check(id, 0, { containerCleanup: false }).status === "running"; }
       catch (e) { problem = `has a readable meta.json but its status check failed (${e.message})`; }
     }
     if (!problem) { if (running) count++; continue; }
@@ -1110,7 +1115,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                                             settings: buildContainerSettings({ ultracode: eff === "ultracode" }) });
     launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
     launchCommand = containerPlan.dockerBin;
-    launchExtra.container = { name: containerPlan.name, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo };
+    // jobId: the claude-async.job label every cleanup lists by; maxRuntimeMs: the runner's wall-clock limit.
+    launchExtra.container = { name: containerPlan.name, jobId: id, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo,
+                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs };
   }
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, launchCommand, launchArgv, launchCwd, extraEnv, launchExtra);
@@ -1134,7 +1141,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
                        image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
-                       repo: containerPlan.repo, baseRef: containerPlan.baseRef || null } } : {}) };
+                       jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -1145,7 +1152,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
            ...(warnings.length ? { warnings } : {}) };
 }
 
-// opts.killContainer: test seam for the container reap below.
+// opts.containerCleanup === false: skip container housekeeping (countActiveJobs). opts.cleanupContainers:
+// test seam replacing container.mjs's cleanupJobContainers.
 export function checkJob(id, tailBytes = 8000, opts = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
@@ -1223,16 +1231,16 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
     }
   }
 
-  // Container jobs: a runner that died or timed out may have left its container running (the docker
-  // client can die without stopping it). Kill it by name, once.
-  if ((state === "died" || state === "timed_out") && meta.sandbox === "container" && meta.container &&
-      !meta.containerReaped) {
-    const k = (opts.killContainer || killContainer)({ dockerBin: meta.container.dockerBin, name: meta.container.name });
-    if (k.ok) {
-      meta.containerReaped = true;
-      try { writeJsonAtomic(p.meta, meta); } catch {}
-    } else {
-      extra.containerReapError = k.error || "docker kill failed";
+  // Container jobs: once the job is terminal (exit_code written, or the runner died/timed out), make
+  // sure nothing it owns is still running, and keep retrying on every check until that is
+  // CONFIRMED (see reconcileContainerCleanup). A running job is left to its runner.
+  if (meta.sandbox === "container" && meta.container && opts.containerCleanup !== false) {
+    const terminal = exitCode !== null || state === "died" || state === "timed_out";
+    if (terminal) {
+      const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "checkJob", runnerFinished: exitCode !== null,
+                                                                   cleanup: opts.cleanupContainers });
+      extra.containerCleanup = cl.confirmed ? "confirmed" : "unconfirmed";
+      if (!cl.confirmed && cl.reason) extra.containerCleanupError = cl.reason;
     }
   }
 
@@ -1254,6 +1262,11 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
       "and ending its turn";
   }
 
+  // A container job the runner stopped at its wall-clock limit reads as timed_out, like a host job
+  // whose heartbeat went stale past JOB_TIMEOUT_MS. Applied after the reaps above: the runner has
+  // already closed the card and cleaned up through its normal path.
+  if (exitCode !== null && exitRecord && exitRecord.exitReason === "container_max_runtime") state = "timed_out";
+
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
            ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
@@ -1261,12 +1274,65 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
 }
 
-// Cancels a running container job by killing its container BY NAME (`docker kill
-// claude-async-<jobId>`). Killing the docker client process instead would leave the container
-// running. The runner is deliberately left alone: once the container dies, the docker client exits
-// with the container's status (137 after a SIGKILL) and the runner records exit.json, exit_code,
-// the card close and the Discord ping through its normal path. Host jobs are not cancellable here
-// (unchanged from before container mode). opts.killContainer: test seam.
+// ------------------------------------------------------------------ container cleanup state ---
+//
+// A container job's cleanup is tracked separately from the CLI's completion: exit_code says the
+// docker client exited, not that nothing the job owns is still running (the client can exit, or be
+// killed, while its container keeps going, and the final removal can fail while the daemon is
+// unreachable). Cleanup is CONFIRMED only when (a) docker lists no container with the job's
+// claude-async.job label after removing what it found, and (b) no launch can still be pending:
+// either the runner finished (its finish() kills the client first), or the docker client pid the
+// runner recorded is gone. Confirmation is stored once -- by the runner in exit.json
+// (container.cleanup.confirmed) or by job-core in meta.json (containerCleanup) -- and every later
+// check/cancel retries until then.
+
+export function containerCleanupConfirmed(meta, exitRecord) {
+  return !!((exitRecord && exitRecord.container && exitRecord.container.cleanup && exitRecord.container.cleanup.confirmed === true) ||
+            (meta && meta.containerCleanup && meta.containerCleanup.confirmed === true));
+}
+
+// True while a `docker run` the runner started could still create (or start) a container: the
+// runner has not finished and the docker client it recorded is still alive.
+function containerLaunchPending(p, runnerFinished) {
+  if (runnerFinished) return false;
+  let pid = null;
+  try { pid = Number(fs.readFileSync(p.dockerPid, "utf8").trim()) || null; } catch {}
+  return pid !== null && pidAlive(pid);
+}
+
+function writeCancelIntent(p, why) {
+  if (fs.existsSync(p.cancel)) return;
+  try { fs.writeFileSync(p.cancel, `${new Date().toISOString()} ${why}\n`); } catch {}
+}
+
+// Removes whatever the job still owns and confirms if it can. Returns { confirmed, removed, reason }.
+function reconcileContainerCleanup(p, meta, exitRecord, { by, runnerFinished, cleanup }) {
+  if (containerCleanupConfirmed(meta, exitRecord)) return { confirmed: true, removed: 0 };
+  // A runner that died before `docker run` must never start it later.
+  if (!runnerFinished) writeCancelIntent(p, `${by}: runner not alive`);
+  const jobId = (meta.container && meta.container.jobId) || meta.jobId || path.basename(p.d);
+  let r;
+  try { r = (cleanup || cleanupJobContainers)({ dockerBin: meta.container.dockerBin, jobId }); }
+  catch (e) { r = { ok: false, error: e.message }; }
+  if (!r.ok) return { confirmed: false, removed: r.removed || 0, reason: r.error || "docker cleanup failed" };
+  if (!r.absent) return { confirmed: false, removed: r.removed, reason: `container(s) still present after docker rm -f: ${(r.remaining || []).map((x) => x.id.slice(0, 12)).join(", ")}` };
+  if (containerLaunchPending(p, runnerFinished)) {
+    return { confirmed: false, removed: r.removed, reason: "no container found, but the docker client is still alive and may still create one" };
+  }
+  meta.containerCleanup = { confirmed: true, at: new Date().toISOString(), by };
+  try { writeJsonAtomic(p.meta, meta); } catch {}
+  return { confirmed: true, removed: r.removed };
+}
+
+// Cancels a container job. The cancel intent is persisted FIRST (cancel_requested in the job dir):
+// the runner checks it before `docker run` and on every poll while the client runs, so a cancel
+// that lands before the container exists still stops it the moment it does. Then every container
+// with the job's label is removed (`docker rm -f` by ID: running or still Created). The runner is
+// left alone; once the container is gone the docker client exits (137) and the runner records the
+// exit, card close and Discord ping through its normal path. For a job whose runner already
+// finished, this is the cleanup retry: alreadyFinished is returned only once cleanup is confirmed.
+// Host jobs are not cancellable here (unchanged from before container mode).
+// opts.cleanupContainers: test seam replacing container.mjs's cleanupJobContainers.
 export function cancelJob(id, opts = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, error: "invalid jobId" };
@@ -1276,11 +1342,27 @@ export function cancelJob(id, opts = {}) {
   if (meta.sandbox !== "container" || !meta.container) {
     return { jobId: id, hostname, error: "cancel is only supported for container jobs (sandbox: \"container\")" };
   }
-  if (fs.existsSync(p.exit)) return { jobId: id, hostname, ok: true, alreadyFinished: true };
-  try { fs.appendFileSync(p.err, `\n[job-core] cancel requested at ${new Date().toISOString()}; killing container ${meta.container.name}\n`); } catch {}
-  const k = (opts.killContainer || killContainer)({ dockerBin: meta.container.dockerBin, name: meta.container.name });
-  if (!k.ok) return { jobId: id, hostname, error: `docker kill ${meta.container.name} failed: ${k.error}` };
-  return { jobId: id, hostname, ok: true, container: meta.container.name, killed: k.killed };
+  const name = meta.container.name;
+  const runnerFinished = fs.existsSync(p.exit);
+  if (runnerFinished) {
+    const exitRecord = readExitJson(p);
+    const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "cancelJob", runnerFinished: true, cleanup: opts.cleanupContainers });
+    if (cl.confirmed) return { jobId: id, hostname, ok: true, alreadyFinished: true, cleanup: "confirmed", container: name, removed: cl.removed };
+    return { jobId: id, hostname, ok: false, cleanup: "unconfirmed", container: name,
+             error: `the job has finished but its container cleanup is not confirmed: ${cl.reason}` };
+  }
+  writeCancelIntent(p, "cancelJob");
+  try { fs.appendFileSync(p.err, `\n[job-core] cancel requested at ${new Date().toISOString()}; removing container ${name}\n`); } catch {}
+  let r;
+  try { r = (opts.cleanupContainers || cleanupJobContainers)({ dockerBin: meta.container.dockerBin, jobId: meta.container.jobId || id }); }
+  catch (e) { r = { ok: false, error: e.message }; }
+  const base = { jobId: id, hostname, ok: true, cancelRequested: true, container: name, cleanup: "pending" };
+  if (!r.ok) {
+    return { ...base, removed: 0, warning: `docker cleanup failed (${r.error}); the runner will remove the container when it sees the cancel request` };
+  }
+  return { ...base, removed: r.removed,
+           ...(r.removed === 0 ? { note: "no container exists yet; the runner will not start one, or will stop it as soon as it exists" } : {}),
+           ...(!r.absent ? { warning: "a container was still listed after docker rm -f; the runner and later checks keep retrying" } : {}) };
 }
 
 export function listJobs() {

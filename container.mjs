@@ -22,7 +22,7 @@
  * today's argv, env and spec byte-for-byte.
  *
  * This module builds and validates argv and config, and runs the small docker housekeeping
- * commands (image inspect, kill). It never runs `docker run` itself (job-runner.mjs does) and
+ * commands (image inspect, list/remove this job's containers). It never runs `docker run` itself (job-runner.mjs does) and
  * never reads secret VALUES: the env file is passed to docker by path (--env-file), and
  * checkEnvFile() reads it only to verify key names and format, returning names, never values.
  */
@@ -73,6 +73,7 @@ export const FORWARDED_ENV_KEYS = Object.freeze([
 // someone adds it to the list by mistake. Secrets travel only through --env-file.
 const SECRET_NAME_RE = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|PRIVATE|CREDENTIAL)/i;
 
+export const DEFAULT_MAX_RUNTIME_MS = 4 * 60 * 60 * 1000; // 4h
 const DEFAULTS = Object.freeze({
   dockerBin: "docker",
   image: "claude-async-job:local",
@@ -85,6 +86,7 @@ const DEFAULTS = Object.freeze({
 
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$/;
 export const IMAGE_ID_RE = /^sha256:[0-9a-f]{64}$/;
+const CONTAINER_ID_RE = /^[0-9a-f]{64}$/;
 const NETWORK_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/;
 const CPUS_RE = /^(?:\d{1,3})(?:\.\d{1,2})?$/;
 const MEMORY_RE = /^\d{1,6}[kmg]?$/i;
@@ -150,6 +152,10 @@ export function loadContainerConfig(env = process.env) {
     gitName: env.CLAUDE_ASYNC_CONTAINER_GIT_NAME || null,
     gitEmail: env.CLAUDE_ASYNC_CONTAINER_GIT_EMAIL || null,
     ollamaUrl: env.CLAUDE_ASYNC_CONTAINER_OLLAMA_URL || DEFAULTS.ollamaUrl,
+    // Wall-clock ceiling the runner enforces (the heartbeat never goes stale while the runner is
+    // alive, so CLAUDE_ASYNC_JOB_TIMEOUT_MS alone would never stop a hung container).
+    maxRuntimeMs: env.CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS !== undefined && env.CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS !== ""
+      ? Number(env.CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS) : DEFAULT_MAX_RUNTIME_MS,
     // Phase 2 egress allowlist (docs/container-jobs.md): an HTTP proxy reachable on the job network.
     egressProxy: env.CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY || null,
   };
@@ -177,6 +183,9 @@ export function validateContainerConfig(cfg) {
   if (!HTTP_URL_RE.test(cfg.ollamaUrl || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_OLLAMA_URL ${JSON.stringify(cfg.ollamaUrl)} must be a plain http://host:port URL`);
   if (cfg.egressProxy !== null && cfg.egressProxy !== undefined && !HTTP_URL_RE.test(cfg.egressProxy)) {
     errs.push(`CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY ${JSON.stringify(cfg.egressProxy)} must be a plain http://host:port URL`);
+  }
+  if (!Number.isInteger(cfg.maxRuntimeMs) || cfg.maxRuntimeMs < 60_000 || cfg.maxRuntimeMs > 7 * 24 * 3600_000) {
+    errs.push(`CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS ${JSON.stringify(cfg.maxRuntimeMs)} must be an integer between 60000 and 604800000`);
   }
   if ((cfg.allowedReposInvalid || []).length) {
     errs.push(`CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS has invalid entries: ${cfg.allowedReposInvalid.map((e) => JSON.stringify(e)).join(", ")} (use owner/repo)`);
@@ -448,25 +457,57 @@ export function checkDockerImage({ dockerBin, image, spawnSync = nodeSpawnSync, 
   return { ok: true, imageId };
 }
 
-// ----------------------------------------------------------------------------- kill ---
+// ------------------------------------------------------------- container cleanup (by label) ---
 
-export function buildKillArgv(name) {
-  if (typeof name !== "string" || !name.startsWith(CONTAINER_NAME_PREFIX)) throw new Error(`not a claude-async container name: ${name}`);
-  return ["kill", name];
+// Every container a job owns carries the label claude-async.job=<jobId> (job ids are unique per
+// job dir, so the label is too). Cleanup lists by that exact label and removes by immutable
+// container ID with `docker rm -f`, which kills a running container AND removes one still in the
+// Created state (a launch that `docker kill` would miss). A container merely NAMED like ours but
+// without the label is never touched.
+export function buildListArgv(jobId) {
+  return ["ps", "-a", "--no-trunc", "--filter", `label=${CONTAINER_JOB_LABEL}=${jobId}`,
+          "--format", `{{.ID}}\t{{.State}}\t{{.Label "${CONTAINER_JOB_LABEL}"}}`];
 }
 
-// Best-effort `docker kill <name>`. Stopping the docker CLI client alone does NOT stop the container
-// (on Windows a TerminateProcess'd client sends nothing to the daemon), so every cancel/cleanup path
-// kills by name. "No such container" (already exited and --rm'd) counts as success.
-export function killContainer({ dockerBin, name, spawnSync = nodeSpawnSync, timeoutMs = 15_000 }) {
+export function listJobContainers({ dockerBin, jobId, spawnSync = nodeSpawnSync, timeoutMs = 15_000 }) {
   let r;
-  try { r = spawnSync(dockerBin, buildKillArgv(name), { encoding: "utf8", timeout: timeoutMs, windowsHide: true }); }
-  catch (e) { return { ok: false, error: e.message }; }
-  if (r.error) return { ok: false, error: r.error.message };
-  if (r.status === 0) return { ok: true, killed: true };
-  const err = String(r.stderr || "").trim();
-  if (/no such container|is not running/i.test(err)) return { ok: true, killed: false };
-  return { ok: false, error: err.slice(0, 300) || `docker kill exited ${r.status}` };
+  try { r = spawnSync(dockerBin, buildListArgv(jobId), { encoding: "utf8", timeout: timeoutMs, windowsHide: true }); }
+  catch (e) { return { error: e.message }; }
+  if (r.error) return { error: r.error.message };
+  if (r.status !== 0) return { error: String(r.stderr || "").trim().slice(0, 300) || `docker ps exited ${r.status}` };
+  const containers = [];
+  for (const line of String(r.stdout || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const [id, state, label] = line.split("\t");
+    if (!CONTAINER_ID_RE.test(id || "")) return { error: `docker ps returned an unexpected line ${JSON.stringify(line.slice(0, 120))}` };
+    if (label !== jobId) continue; // belt: the filter is exact, but never act on another job's container
+    containers.push({ id, state: state || "unknown" });
+  }
+  return { containers };
+}
+
+// Removes every container this job owns, then lists again. Returns
+//   { ok: true, absent: true|false, removed, remaining }  -- absent: nothing with our label exists
+//   { ok: false, error }                                  -- docker could not be asked
+// "absent" alone does not mean cleanup is confirmed: a launch may still be pending (see
+// job-core.mjs's container cleanup state).
+export function cleanupJobContainers({ dockerBin, jobId, spawnSync = nodeSpawnSync, timeoutMs = 15_000 }) {
+  const before = listJobContainers({ dockerBin, jobId, spawnSync, timeoutMs });
+  if (before.error) return { ok: false, error: before.error };
+  let removed = 0;
+  const errors = [];
+  for (const c of before.containers) {
+    let r;
+    try { r = spawnSync(dockerBin, ["rm", "-f", c.id], { encoding: "utf8", timeout: timeoutMs, windowsHide: true }); }
+    catch (e) { errors.push(e.message); continue; }
+    if (r.error) { errors.push(r.error.message); continue; }
+    if (r.status === 0 || /no such container/i.test(String(r.stderr || ""))) removed++;
+    else errors.push(String(r.stderr || "").trim().slice(0, 200) || `docker rm exited ${r.status}`);
+  }
+  const after = before.containers.length ? listJobContainers({ dockerBin, jobId, spawnSync, timeoutMs }) : { containers: [] };
+  if (after.error) return { ok: false, error: after.error, removed };
+  return { ok: true, absent: after.containers.length === 0, removed, remaining: after.containers,
+           ...(errors.length ? { errors } : {}) };
 }
 
 // ----------------------------------------------------------------------- stdout: PR URL ---
