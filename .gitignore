@@ -38,3 +38,6 @@ test/dummy-env-dumper.exe
 
 # --- Per-worktree task progress trace (not shared, not part of source) ---
 PROGRESS.md
+
+# --- Python bytecode (test runs import test/fixtures/fake-gate-repo/hermes_cli) ---
+__pycache__/
