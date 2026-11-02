@@ -708,3 +708,32 @@ test("C1: checkJob on a died container job with creds/token on disk removes cred
   assert.ok(!JSON.stringify(s).includes(tok), "the token is redacted");
   assert.match(s.stdout, /\[REDACTED\]/);
 });
+
+// ------------------------------------------------------------ review round 3: GitHub App questions ---
+test("R3: preflight against the fake api.github.com (which rejects an App JWT on GET /users) works; a redirected installation is refused", { skip: SKIP }, async () => {
+  const ga = await import("../github-app.mjs");
+  ga._internal.clearIdentityCache();
+  const pf = await ga.preflightGitHubApp({ appId: "123456", keyFile: APP_KEY_FILE, repo: REPO, apiBase: gh.url });
+  assert.ok(!pf.error, pf.error);
+  assert.equal(pf.botUserId, 98765);
+  const users = gh.calls().filter((c) => c.url.startsWith("/users/"));
+  assert.ok(users.length >= 1 && users.every((c) => c.jwtOk === false), "the users lookup carried no JWT");
+  gh.setControl("install-owner", "someone-else");
+  try {
+    const bad = await ga.preflightGitHubApp({ appId: "123456", keyFile: APP_KEY_FILE, repo: REPO, apiBase: gh.url });
+    assert.match(bad.error, /someone-else.*renamed or transferred/);
+  } finally { gh.setControl("install-owner", null); }
+});
+
+test("R3: a minted token for a different repository is refused: the container is never started (exit 78)", { skip: SKIP }, () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "5000" });
+  gh.setControl("mint-full-name", "other-owner/container-job-scratch");
+  let r;
+  try { r = runSync(j); } finally { gh.setControl("mint-full-name", null); }
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!j.calls().some((a) => a[0] === "run"), "docker run never invoked");
+  const rec = j.exitRecord();
+  assert.equal(rec.exitCode, 78);
+  assert.ok(rec.warnings.some((w) => /other-owner\/container-job-scratch.*not icey2488\/container-job-scratch/.test(w)), JSON.stringify(rec.warnings));
+  assert.ok(!fs.existsSync(path.join(j.dir, "creds")), "no token on disk");
+});

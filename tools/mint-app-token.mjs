@@ -26,7 +26,7 @@ const id = botGitIdentity(pf);
 console.log(`app slug: ${pf.slug}  bot user id: ${pf.botUserId}  installation: ${pf.installationId}`);
 console.log(`commit identity: ${id.name} <${id.email}>`);
 try {
-  const minter = createMinter({ appId: cfg.appId, keyFile: pf.keyFile, installationId: pf.installationId, repoName: repoNameOf(repo), apiBase: cfg.apiBase });
+  const minter = createMinter({ appId: cfg.appId, keyFile: pf.keyFile, installationId: pf.installationId, repoName: repoNameOf(repo), repo, apiBase: cfg.apiBase });
   const { token, expiresAt } = await minter.mint();
   const fd = fs.openSync(path.resolve(outFile), fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, 0o600);
   try { fs.writeSync(fd, `${token}\n`); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }

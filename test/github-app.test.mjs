@@ -43,10 +43,12 @@ function fakeGitHub(routes) {
 }
 const APP = { appId: "123456", repo: "icey2488/container-job-scratch" };
 const happyRoutes = {
-  "GET /repos/icey2488/container-job-scratch/installation": [200, { id: 777, account: { login: "icey2488" } }],
+  "GET /repos/icey2488/container-job-scratch/installation": [200, { id: 777, account: { login: "icey2488" }, suspended_at: null,
+                                                                      permissions: { contents: "write", pull_requests: "write", metadata: "read" } }],
   "GET /app": [200, { id: 123456, slug: "claunker-jobs" }],
   "GET /users/claunker-jobs[bot]": [200, { id: 98765, login: "claunker-jobs[bot]" }],
-  "POST /app/installations/777/access_tokens": [201, { token: "ghs_" + "A".repeat(36), expires_at: "2026-11-02T01:00:00Z" }],
+  "POST /app/installations/777/access_tokens": [201, { token: "ghs_" + "A".repeat(36), expires_at: "2026-11-02T01:00:00Z",
+                                                       repositories: [{ id: 1, name: "container-job-scratch", full_name: "icey2488/container-job-scratch" }] }],
 };
 
 // ------------------------------------------------------------------------------------ JWT ---
@@ -135,7 +137,7 @@ test("findInstallation / fetchAppIdentity: 401 means the key and the app id do n
 
 test("mintInstallationToken: POST with the repo name and the three permissions only; returns token + expiry", async () => {
   const gh = fakeGitHub(happyRoutes);
-  const r = await ga.mintInstallationToken({ installationId: 777, repoName: "container-job-scratch", jwt: "J", fetch: gh.fetch });
+  const r = await ga.mintInstallationToken({ installationId: 777, repoName: "container-job-scratch", repo: APP.repo, jwt: "J", fetch: gh.fetch });
   assert.equal(r.token, "ghs_" + "A".repeat(36));
   assert.equal(r.expiresAt, Date.parse("2026-11-02T01:00:00Z"));
   const call = gh.calls[0];
@@ -145,12 +147,12 @@ test("mintInstallationToken: POST with the repo name and the three permissions o
   assert.equal(call.headers.authorization, "Bearer J");
   assert.equal(call.headers["content-type"], "application/json");
   // a 422 (the app lacks a permission, or the repo is not in the installation) is a clear error
-  const e = await ga.mintInstallationToken({ installationId: 777, repoName: "x", jwt: "J",
+  const e = await ga.mintInstallationToken({ installationId: 777, repoName: "x", repo: "icey2488/x", jwt: "J",
     fetch: fakeGitHub({ "POST /app/installations/777/access_tokens": [422, { message: "The permissions requested are not granted to this installation." }] }).fetch }).catch((x) => x);
   assert.match(e.message, /422.*permissions requested are not granted/);
   assert.match(e.message, /Contents.*Pull requests.*Metadata/i, "says which permissions the app needs");
   // a response without a token is an error, not undefined
-  const e2 = await ga.mintInstallationToken({ installationId: 777, repoName: "x", jwt: "J",
+  const e2 = await ga.mintInstallationToken({ installationId: 777, repoName: "x", repo: "icey2488/x", jwt: "J",
     fetch: fakeGitHub({ "POST /app/installations/777/access_tokens": [201, { nope: 1 }] }).fetch }).catch((x) => x);
   assert.match(e2.message, /no token/);
 });
@@ -194,10 +196,11 @@ test("createMinter: reads the key per mint (rotation), builds a fresh JWT, retur
   const issued = [];
   const gh = fakeGitHub({ ...happyRoutes, "POST /app/installations/777/access_tokens": (call) => {
     issued.push(call.headers.authorization);
-    return [201, { token: `ghs_${String(issued.length).padStart(36, "0")}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }];
+    return [201, { token: `ghs_${String(issued.length).padStart(36, "0")}`, expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+                   repositories: [{ full_name: APP.repo }] }];
   } });
   const kf = keyFile(0o600);
-  const minter = ga.createMinter({ appId: APP.appId, keyFile: kf, installationId: 777, repoName: "container-job-scratch", fetch: gh.fetch });
+  const minter = ga.createMinter({ appId: APP.appId, keyFile: kf, installationId: 777, repoName: "container-job-scratch", repo: APP.repo, fetch: gh.fetch });
   const t1 = await minter.mint();
   const t2 = await minter.mint();
   assert.notEqual(t1.token, t2.token);
@@ -222,7 +225,7 @@ test("createMinter: reads the key per mint (rotation), builds a fresh JWT, retur
 test("secret hygiene: no function ever puts the key or a token into an error message", async () => {
   const kf = keyFile(0o600);
   const gh = fakeGitHub({ ...happyRoutes, "POST /app/installations/777/access_tokens": [500, { message: "boom" }] });
-  const minter = ga.createMinter({ appId: APP.appId, keyFile: kf, installationId: 777, repoName: "r", fetch: gh.fetch });
+  const minter = ga.createMinter({ appId: APP.appId, keyFile: kf, installationId: 777, repoName: "r", repo: "icey2488/r", fetch: gh.fetch });
   const e = await minter.mint().catch((x) => x);
   assert.match(e.message, /500/);
   assert.ok(!e.message.includes("PRIVATE") && !/ghs_/.test(e.message) && !e.message.includes("Bearer"));
@@ -244,4 +247,70 @@ test("loadGitHubAppConfig: env names, refresh default 45 min, api base default; 
   assert.match(r("abc"), /REFRESH_MS/);
   assert.match(ga.validateGitHubAppConfig({ appId: "1", keyFile: "/k", refreshMs: 60_000, apiBase: "ftp://x" }).join(" "), /API_BASE/);
   assert.equal(ga.validateGitHubAppConfig({ appId: "1", keyFile: "/k", refreshMs: 60_000, apiBase: "http://127.0.0.1:8080" }).length, 0, "a loopback http base (tests)");
+});
+
+// ------------------------------------------------------------ review round 3 (questions; Argon #2) ---
+// GET /users/<slug>[bot] is a public endpoint and real GitHub does not accept an App JWT outside the
+// /app endpoints: the lookup goes out WITHOUT an Authorization header and is cached. A repo
+// rename/transfer that redirected the installation lookup, a suspended installation, an installation
+// lacking the write permissions, and a minted token for any other repo are refused.
+const R3_INSTALL = { id: 777, account: { login: "icey2488" }, suspended_at: null,
+                     permissions: { contents: "write", pull_requests: "write", metadata: "read" } };
+const r3Routes = (over = {}) => ({
+  "GET /repos/icey2488/container-job-scratch/installation": [200, R3_INSTALL],
+  "GET /app": [200, { id: 123456, slug: "r3-jobs" }],
+  // real GitHub: an App JWT here is not a valid credential (modelled as 401); unauthenticated works
+  "GET /users/r3-jobs[bot]": (c) => (c.headers.authorization ? [401, { message: "Bad credentials" }] : [200, { id: 4242, login: "r3-jobs[bot]" }]),
+  "POST /app/installations/777/access_tokens": [201, { token: "ghs_" + "B".repeat(36), expires_at: "2026-11-02T01:00:00Z",
+    repositories: [{ id: 1, name: "container-job-scratch", full_name: "icey2488/container-job-scratch" }] }],
+  ...over,
+});
+
+test("R3: call() sends no Authorization header without a jwt; the bot-user lookup is unauthenticated and cached", async () => {
+  ga._internal.clearIdentityCache();
+  const gh = fakeGitHub(r3Routes());
+  const r = await ga.fetchAppIdentity({ jwt: "J.W.T", fetch: gh.fetch });
+  assert.deepEqual(r, { slug: "r3-jobs", botUserId: 4242 });
+  const users = gh.calls.filter((c) => c.key.startsWith("GET /users/"));
+  assert.equal(users.length, 1);
+  assert.equal("authorization" in users[0].headers, false, "no Authorization header on GET /users/<slug>[bot]");
+  assert.equal(gh.calls.find((c) => c.key === "GET /app").headers.authorization, "Bearer J.W.T", "GET /app still uses the JWT");
+  // cached: a second preflight does not look the bot user up again
+  await ga.fetchAppIdentity({ jwt: "J.W.T", fetch: gh.fetch });
+  assert.equal(gh.calls.filter((c) => c.key.startsWith("GET /users/")).length, 1, "the bot user id is cached");
+  ga._internal.clearIdentityCache();
+});
+
+test("R3: findInstallation refuses a redirected lookup (other account), a suspended installation, and missing write permissions", async () => {
+  const ok = await ga.findInstallation({ repo: APP.repo, jwt: "J", fetch: fakeGitHub(r3Routes()).fetch });
+  assert.deepEqual(ok, { installationId: 777 });
+  const cases = [
+    [{ ...R3_INSTALL, account: { login: "someone-else" } }, /someone-else.*renamed or transferred|redirect/i],
+    [{ ...R3_INSTALL, suspended_at: "2026-11-01T00:00:00Z" }, /suspended/i],
+    [{ ...R3_INSTALL, permissions: { contents: "read", pull_requests: "write", metadata: "read" } }, /contents.*write/i],
+    [{ ...R3_INSTALL, permissions: { contents: "write", metadata: "read" } }, /pull_requests.*write/i],
+  ];
+  for (const [body, re] of cases) {
+    const gh = fakeGitHub(r3Routes({ "GET /repos/icey2488/container-job-scratch/installation": [200, body] }));
+    await assert.rejects(ga.findInstallation({ repo: APP.repo, jwt: "J", fetch: gh.fetch }), re, JSON.stringify(body));
+  }
+  // the account login comparison is case-insensitive
+  const gh = fakeGitHub(r3Routes({ "GET /repos/icey2488/container-job-scratch/installation": [200, { ...R3_INSTALL, account: { login: "ICEY2488" } }] }));
+  assert.deepEqual(await ga.findInstallation({ repo: APP.repo, jwt: "J", fetch: gh.fetch }), { installationId: 777 });
+});
+
+test("R3: mintInstallationToken refuses a token whose repositories are not exactly the requested owner/repo", async () => {
+  const good = await ga.mintInstallationToken({ installationId: 777, repoName: "container-job-scratch", repo: APP.repo, jwt: "J", fetch: fakeGitHub(r3Routes()).fetch });
+  assert.equal(good.token, "ghs_" + "B".repeat(36));
+  const mint = (repositories) => ga.mintInstallationToken({ installationId: 777, repoName: "container-job-scratch", repo: APP.repo, jwt: "J",
+    fetch: fakeGitHub(r3Routes({ "POST /app/installations/777/access_tokens": [201, { token: "ghs_" + "C".repeat(36), expires_at: "2026-11-02T01:00:00Z",
+      ...(repositories === undefined ? {} : { repositories }) }] })).fetch });
+  await assert.rejects(mint([{ full_name: "other-owner/container-job-scratch" }]), /other-owner\/container-job-scratch.*not .*icey2488\/container-job-scratch/i);
+  await assert.rejects(mint([{ full_name: "icey2488/container-job-scratch" }, { full_name: "icey2488/x" }]), /exactly one/i);
+  await assert.rejects(mint(undefined), /repositories/i, "no repositories in the response: refused (fail closed)");
+  // case-insensitive match
+  assert.ok((await mint([{ full_name: "Icey2488/Container-Job-Scratch" }])).token);
+  // the error never carries the token
+  const e = await mint([{ full_name: "x/y" }]).catch((x) => x);
+  assert.ok(!e.message.includes("CCCC"));
 });

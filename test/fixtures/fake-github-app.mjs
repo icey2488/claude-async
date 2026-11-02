@@ -8,7 +8,10 @@
 // <state-dir>/calls.jsonl, appends every issued token to <state-dir>/tokens, and reads control
 // files on every request: <state-dir>/fail-mint (exists -> POST access_tokens answers 500),
 // <state-dir>/expires-ms (content -> how far ahead expires_at lies; default an hour),
-// <state-dir>/mint-delay-ms (content -> POST access_tokens answers after that many ms).
+// <state-dir>/mint-delay-ms (content -> POST access_tokens answers after that many ms),
+// <state-dir>/mint-full-name (content -> the token's repositories[0].full_name; default owner/<requested>),
+// <state-dir>/install-owner (content -> the installation's account.login; default the repo's owner).
+// GET /users/<slug>[bot] is public: it answers 401 to a request carrying ANY Authorization header.
 //   GET  /repos/<repo>/installation            -> { id: 777 }
 //   GET  /app                                  -> { slug: "claunker-jobs" }
 //   GET  /users/claunker-jobs[bot]             -> { id: 98765 }
@@ -50,10 +53,19 @@ function serve(dir) {
       const send = (status, obj) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(obj)); };
       const jwtOk = verify(req);
       fs.appendFileSync(path.join(dir, "calls.jsonl"), JSON.stringify({ method: req.method, url, body: body ? JSON.parse(body) : undefined, jwtOk, ua: req.headers["user-agent"] }) + "\n");
+      const ctl = (f) => { try { return fs.readFileSync(path.join(dir, f), "utf8").trim(); } catch { return null; } };
+      // A public endpoint, like real GitHub: no credential needed, and an App JWT is NOT accepted there
+      // (401), so a caller that sends one fails (review round 3).
+      if (req.method === "GET" && url === `/users/${FAKE_SLUG}[bot]`) {
+        if (req.headers.authorization) return send(401, { message: "Bad credentials" });
+        return send(200, { id: FAKE_BOT_ID, login: `${FAKE_SLUG}[bot]` });
+      }
       if (!jwtOk) return send(401, { message: "A JSON web token could not be decoded" });
-      if (req.method === "GET" && url === `/repos/${FAKE_REPO}/installation`) return send(200, { id: FAKE_INSTALLATION, account: { login: FAKE_REPO.split("/")[0] } });
+      if (req.method === "GET" && url === `/repos/${FAKE_REPO}/installation`) {
+        return send(200, { id: FAKE_INSTALLATION, account: { login: ctl("install-owner") || FAKE_REPO.split("/")[0] }, suspended_at: null,
+                           permissions: { contents: "write", pull_requests: "write", metadata: "read" } });
+      }
       if (req.method === "GET" && url === "/app") return send(200, { id: 1, slug: FAKE_SLUG });
-      if (req.method === "GET" && url === `/users/${FAKE_SLUG}[bot]`) return send(200, { id: FAKE_BOT_ID, login: `${FAKE_SLUG}[bot]` });
       if (req.method === "POST" && url === `/app/installations/${FAKE_INSTALLATION}/access_tokens`) {
         if (fs.existsSync(path.join(dir, "fail-mint"))) return send(500, { message: "fake outage" });
         let delayMs = 0;
@@ -69,7 +81,8 @@ function serve(dir) {
         try { expiresMs = Number(fs.readFileSync(path.join(dir, "expires-ms"), "utf8")) || expiresMs; } catch {}
         const token = `ghs_${String(++issued).padStart(4, "0")}${crypto.randomBytes(16).toString("hex")}`;
         fs.appendFileSync(path.join(dir, "tokens"), token + "\n");
-        return send(201, { token, expires_at: new Date(Date.now() + expiresMs).toISOString(), permissions: b.permissions });
+        return send(201, { token, expires_at: new Date(Date.now() + expiresMs).toISOString(), permissions: b.permissions,
+                           repositories: [{ id: 4711, name: b.repositories[0], full_name: ctl("mint-full-name") || `${FAKE_REPO.split("/")[0]}/${b.repositories[0]}` }] });
       }
     });
   });
@@ -81,7 +94,7 @@ function serve(dir) {
 
 export async function startFakeGitHub(dir, { publicKey }) {
   fs.mkdirSync(dir, { recursive: true });
-  for (const f of ["port", "calls.jsonl", "tokens", "fail-mint", "expires-ms", "mint-delay-ms"]) fs.rmSync(path.join(dir, f), { force: true }); // a stale state dir from an earlier run
+  for (const f of ["port", "calls.jsonl", "tokens", "fail-mint", "expires-ms", "mint-delay-ms", "mint-full-name", "install-owner"]) fs.rmSync(path.join(dir, f), { force: true }); // a stale state dir from an earlier run
   fs.writeFileSync(path.join(dir, "public.pem"), publicKey.export({ type: "spki", format: "pem" }));
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), dir], { stdio: "ignore" });
   const portFile = path.join(dir, "port");
@@ -97,6 +110,7 @@ export async function startFakeGitHub(dir, { publicKey }) {
     tokens: () => lines("tokens"),
     calls: () => lines("calls.jsonl").map((l) => JSON.parse(l)),
     setFailMint: (on) => { const f = path.join(dir, "fail-mint"); if (on) fs.writeFileSync(f, ""); else fs.rmSync(f, { force: true }); },
+    setControl: (name, value) => { const f = path.join(dir, name); if (value) fs.writeFileSync(f, String(value)); else fs.rmSync(f, { force: true }); },
     setMintDelayMs: (ms) => { const f = path.join(dir, "mint-delay-ms"); if (ms) fs.writeFileSync(f, String(ms)); else fs.rmSync(f, { force: true }); },
     setExpiresMs: (ms) => { const f = path.join(dir, "expires-ms"); if (ms) fs.writeFileSync(f, String(ms)); else fs.rmSync(f, { force: true }); },
     close: () => new Promise((r) => { child.on("exit", () => r()); child.kill("SIGTERM"); }),

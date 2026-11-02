@@ -35,6 +35,7 @@ const USER_AGENT = "claude-async-container-jobs";
 const APP_ID_RE = /^\d{1,20}$/;
 const SLUG_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$/;
 const HTTP_URL_RE = /^https?:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?$/;
+const REPO_FULL_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
 
 // ------------------------------------------------------------------------------- config ---
 
@@ -128,9 +129,11 @@ export function buildAppJwt({ appId, privateKeyPem, nowSeconds = Math.floor(Date
 
 // ---------------------------------------------------------------------------- API calls ---
 
+// jwt: the App JWT for the /app endpoints; omitted (no Authorization header at all) for public
+// endpoints such as GET /users/<login>, where GitHub does not accept an App JWT (review round 3).
 async function call({ method = "GET", url, jwt, body, fetch: f = globalThis.fetch, timeoutMs = 20_000 }) {
-  const headers = { authorization: `Bearer ${jwt}`, accept: "application/vnd.github+json",
-                    "x-github-api-version": "2022-11-28", "user-agent": USER_AGENT };
+  const headers = { accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28", "user-agent": USER_AGENT };
+  if (jwt) headers.authorization = `Bearer ${jwt}`;
   if (body !== undefined) headers["content-type"] = "application/json";
   let res;
   try {
@@ -151,7 +154,10 @@ const mismatch = () => "the JWT was rejected (401): CLAUDE_ASYNC_GITHUB_APP_ID a
   "was generated for a different app id, or the key was revoked), or the host clock is off by more than a minute";
 
 // GET /repos/{owner}/{repo}/installation -> { installationId }. 404: the App is not installed
-// there (install it on that repo). 401: key/app-id mismatch.
+// there (install it on that repo). 401: key/app-id mismatch. Review round 3 (Argon #2): refused at
+// preflight, before any job dir exists, when the lookup was answered for ANOTHER account (GitHub
+// follows a rename/transfer redirect, so "owner/old-name" can resolve to an installation elsewhere),
+// when the installation is suspended, or when it lacks contents:write or pull_requests:write.
 export async function findInstallation({ repo, jwt, fetch: f, apiBase = GITHUB_API_BASE }) {
   const r = await call({ url: `${apiBase}/repos/${repo}/installation`, jwt, fetch: f });
   if (r.status === 401) throw new Error(mismatch());
@@ -163,11 +169,33 @@ export async function findInstallation({ repo, jwt, fetch: f, apiBase = GITHUB_A
   if (!r.ok) throw new Error(`GET /repos/${repo}/installation failed with HTTP ${r.status}${r.message ? `: ${r.message}` : ""}`);
   const id = r.json && r.json.id;
   if (!Number.isInteger(id) || id <= 0) throw new Error(`GET /repos/${repo}/installation returned no installation id`);
+  const owner = String(repo).split("/")[0];
+  const login = r.json.account && typeof r.json.account.login === "string" ? r.json.account.login : "";
+  if (!login || login.toLowerCase() !== owner.toLowerCase()) {
+    throw new Error(`GET /repos/${repo}/installation answered with an installation on the account ${JSON.stringify(login || "(none)")}, not ${owner}: ` +
+      "the repository was probably renamed or transferred (GitHub followed a redirect). Use its current owner/name in " +
+      "CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS and the job's repo");
+  }
+  if (r.json.suspended_at) {
+    throw new Error(`the GitHub App's installation on ${owner} is suspended (since ${r.json.suspended_at}); unsuspend it on the installation's settings page`);
+  }
+  const perms = r.json.permissions && typeof r.json.permissions === "object" ? r.json.permissions : {};
+  for (const k of ["contents", "pull_requests"]) {
+    if (perms[k] !== "write") {
+      throw new Error(`the GitHub App's installation on ${owner} does not grant ${k}: write (it has ${JSON.stringify(perms[k] || "none")}). ` +
+        "Give the App Contents: read and write and Pull requests: read and write, then accept the new permissions on the installation page");
+    }
+  }
   return { installationId: id };
 }
 
-// POST /app/installations/{id}/access_tokens with the one repo and the three permissions.
-export async function mintInstallationToken({ installationId, repoName, jwt, fetch: f, apiBase = GITHUB_API_BASE }) {
+// POST /app/installations/{id}/access_tokens with the one repo and the three permissions. repo: the
+// full owner/repo the token must be for; the response's `repositories` must be exactly that one repo
+// (case-insensitive), or the token is refused (review round 3: after a rename/transfer the short name
+// could select a different repository in the same installation). A response without `repositories`
+// is refused too (fail closed).
+export async function mintInstallationToken({ installationId, repoName, repo, jwt, fetch: f, apiBase = GITHUB_API_BASE }) {
+  if (!repo || !REPO_FULL_RE.test(String(repo))) throw new Error("mintInstallationToken: repo (owner/repo) is required to check the token's repository");
   const r = await call({ method: "POST", url: `${apiBase}/app/installations/${installationId}/access_tokens`, jwt, fetch: f,
                          body: { repositories: [repoName], permissions: { ...INSTALLATION_PERMISSIONS } } });
   if (r.status === 401) throw new Error(mismatch());
@@ -179,10 +207,18 @@ export async function mintInstallationToken({ installationId, repoName, jwt, fet
   if (!r.ok) throw new Error(`minting an installation token failed with HTTP ${r.status}${r.message ? `: ${r.message}` : ""}`);
   const token = r.json && typeof r.json.token === "string" ? r.json.token : "";
   if (!token) throw new Error("the access_tokens response carried no token");
+  const repos = r.json.repositories;
+  if (!Array.isArray(repos)) throw new Error(`the access_tokens response did not list the token's repositories; refusing a token that cannot be shown to be for ${repo} only`);
+  if (repos.length !== 1) throw new Error(`the minted token covers ${repos.length} repositories, not exactly one (${repo}); refusing it`);
+  const full = repos[0] && typeof repos[0].full_name === "string" ? repos[0].full_name : "";
+  if (full.toLowerCase() !== String(repo).toLowerCase()) {
+    throw new Error(`the minted token is for ${JSON.stringify(full || "(unnamed)")}, not ${repo} (renamed or transferred repository?); refusing it`);
+  }
   const expiresAt = r.json.expires_at ? Date.parse(r.json.expires_at) : NaN;
   return { token, expiresAt: Number.isFinite(expiresAt) ? expiresAt : Date.now() + 60 * 60 * 1000 };
 }
 
+const identityCache = new Map();
 // GET /app -> slug; GET /users/<slug>[bot] -> the bot user's id. Both are what commit authorship
 // needs (<slug>[bot] <id+slug[bot]@users.noreply.github.com>), fetched once at preflight.
 export async function fetchAppIdentity({ jwt, fetch: f, apiBase = GITHUB_API_BASE }) {
@@ -191,10 +227,16 @@ export async function fetchAppIdentity({ jwt, fetch: f, apiBase = GITHUB_API_BAS
   if (!a.ok) throw new Error(`GET /app failed with HTTP ${a.status}${a.message ? `: ${a.message}` : ""}`);
   const slug = a.json && typeof a.json === "object" ? a.json.slug : null;
   if (typeof slug !== "string" || !SLUG_RE.test(slug)) throw new Error("GET /app returned no usable app slug");
-  const u = await call({ url: `${apiBase}/users/${encodeURIComponent(`${slug}[bot]`)}`, jwt, fetch: f });
-  if (!u.ok) throw new Error(`GET /users/${slug}[bot] failed with HTTP ${u.status}${u.message ? `: ${u.message}` : ""}`);
+  // Public endpoint: no Authorization header (an App JWT is not a credential GitHub accepts here).
+  // Cached per API origin and slug for the life of this process: the id never changes, and
+  // unauthenticated calls share a 60/hour per-IP limit.
+  const key = `${apiBase}|${slug}`;
+  if (identityCache.has(key)) return { slug, botUserId: identityCache.get(key) };
+  const u = await call({ url: `${apiBase}/users/${encodeURIComponent(`${slug}[bot]`)}`, fetch: f });
+  if (!u.ok) throw new Error(`GET /users/${slug}[bot] (unauthenticated) failed with HTTP ${u.status}${u.message ? `: ${u.message}` : ""}`);
   const botUserId = u.json && u.json.id;
   if (!Number.isInteger(botUserId) || botUserId <= 0) throw new Error(`GET /users/${slug}[bot] returned no user id`);
+  identityCache.set(key, botUserId);
   return { slug, botUserId };
 }
 
@@ -231,13 +273,13 @@ export async function preflightGitHubApp({ appId, keyFile, repo, fetch: f, apiBa
 
 // What the runner holds for the job's lifetime: mint() re-reads the key file, builds a fresh JWT
 // and returns a new installation token. Nothing is cached here; the runner owns the token file.
-export function createMinter({ appId, keyFile, installationId, repoName, fetch: f = globalThis.fetch, apiBase = GITHUB_API_BASE, nowSeconds }) {
-  if (!appId || !keyFile || !installationId || !repoName) throw new Error("createMinter: appId, keyFile, installationId and repoName are required");
+export function createMinter({ appId, keyFile, installationId, repoName, repo, fetch: f = globalThis.fetch, apiBase = GITHUB_API_BASE, nowSeconds }) {
+  if (!appId || !keyFile || !installationId || !repoName || !repo) throw new Error("createMinter: appId, keyFile, installationId, repoName and repo are required");
   return {
     async mint() {
       const pem = readPrivateKey(keyFile);
       const jwt = buildAppJwt({ appId, privateKeyPem: pem, ...(nowSeconds ? { nowSeconds: nowSeconds() } : {}) });
-      return mintInstallationToken({ installationId, repoName, jwt, fetch: f, apiBase });
+      return mintInstallationToken({ installationId, repoName, repo, jwt, fetch: f, apiBase });
     },
   };
 }
@@ -247,4 +289,4 @@ export function repoNameOf(repo) {
   return String(repo).split("/")[1] || "";
 }
 
-export const _internal = { call, mismatch, path };
+export const _internal = { call, mismatch, path, clearIdentityCache: () => identityCache.clear() };
