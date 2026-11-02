@@ -344,3 +344,81 @@ test("A1: delayed daemon creation after the signal fallback is reaped, not confi
   assert.ok(!j.containerExists(), "the late container was removed");
   assert.ok(await waitFor(() => withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold).containerCleanup === "confirmed", 10_000));
 });
+
+// ------------------------------------------------------------ review round 2, finding A4 ---
+// Cancel and the wall-clock limit go through the same bounded stop as a signal: remove by label,
+// wait CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS, then kill the client and finish with the terminal
+// status and cleanup NOT confirmed, so job-core keeps retrying. Removal attempts are throttled so
+// the synchronous docker calls do not starve the heartbeat.
+
+async function boundedStopCase({ trigger, env, maxRuntimeMs, recover, expectReason, expectStatus }) {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "60000", CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS: "2500", ...env }, { maxRuntimeMs });
+  const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  j.patchMeta({ pid: child.pid });
+  assert.ok(await waitFor(() => j.containerExists()));
+  const t0 = Date.now();
+  if (trigger) await trigger(j);
+  assert.equal(await exited(child), 0, "the runner exits normally after recording");
+  const took = Date.now() - t0;
+  assert.ok(took < 15_000, `bounded: finished in ${took} ms`);
+  const rec = j.exitRecord();
+  assert.equal(rec.exitReason, expectReason, JSON.stringify(rec));
+  assert.equal(rec.container.cleanup.confirmed, false, "a container the daemon would not remove is never reported as removed");
+  assert.ok(rec.container.cleanup.clientKilled, "the client was killed after the stop wait");
+  const dockerPid = Number(fs.readFileSync(path.join(j.dir, "docker_client.pid"), "utf8"));
+  assert.ok(await waitFor(() => pidGone(dockerPid), 5000), "the docker client is gone");
+  for (const w of rec.warnings || []) assert.ok(!/was removed/.test(w), `must not claim removal: ${w}`);
+  assert.ok(j.containerExists(), "the container is still there (daemon ignored rm / was down)");
+  const psCalls = j.calls().filter((a) => a[0] === "ps").length;
+  assert.ok(psCalls <= 6, `removal attempts are throttled, not one per 100 ms poll tick (${psCalls} docker ps calls)`);
+  const hold = { CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS: "300" };
+  const s1 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), { ...hold, ...env });
+  assert.equal(s1.status, expectStatus);
+  assert.equal(s1.containerCleanup, "unconfirmed");
+  recover(j);
+  await new Promise((r) => setTimeout(r, 400));
+  const s2 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.ok(!j.containerExists(), "after recovery the check removed the container");
+  const s3 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.equal(s2.containerCleanup === "confirmed" || s3.containerCleanup === "confirmed", true, JSON.stringify([s2.containerCleanupError, s3.containerCleanupError]));
+  assert.equal(s3.status, expectStatus);
+  return j;
+}
+
+test("A4: wall-clock limit with a daemon that ignores rm: bounded timed_out, cleanup unconfirmed, confirmed after recovery", { skip: SKIP }, async () => {
+  const ignore = path.join(TMP, `ignore-rm-${seq + 1}`);
+  fs.writeFileSync(ignore, "");
+  await boundedStopCase({ env: { FAKE_DOCKER_IGNORE_RM: ignore }, maxRuntimeMs: 1500,
+    recover: () => fs.rmSync(ignore), expectReason: "container_max_runtime", expectStatus: "timed_out" });
+});
+
+test("A4: wall-clock limit with the daemon down: bounded timed_out, confirmed once the daemon is back", { skip: SKIP }, async () => {
+  const down = path.join(TMP, `daemon-down-limit-${seq + 1}`);
+  const j = setup({});                                    // just to learn the next seq's paths; not run
+  assert.ok(j);
+  await boundedStopCase({ env: { FAKE_DOCKER_DAEMON_DOWN: down }, maxRuntimeMs: 1500,
+    trigger: () => { fs.writeFileSync(down, ""); },        // the daemon goes away while the job runs
+    recover: () => fs.rmSync(down), expectReason: "container_max_runtime", expectStatus: "timed_out" });
+});
+
+test("A4: cancel with a daemon that ignores rm: bounded cancelled exit, cleanup unconfirmed, confirmed after recovery", { skip: SKIP }, async () => {
+  const ignore = path.join(TMP, `ignore-rm-cancel-${seq + 1}`);
+  fs.writeFileSync(ignore, "");
+  await boundedStopCase({ env: { FAKE_DOCKER_IGNORE_RM: ignore }, maxRuntimeMs: 4 * 3600_000,
+    trigger: (j) => { const c = withFakeDaemon(j, () => core.cancelJob(j.jobId), { FAKE_DOCKER_IGNORE_RM: ignore });
+                      assert.equal(c.cancelRequested, true); },
+    recover: () => fs.rmSync(ignore), expectReason: "cancelled", expectStatus: "failed" });
+});
+
+// Argon #1 (4): the fallback kill sets exitReason "signal"; the limit/cancel override must still win,
+// or the job reads failed instead of timed_out. Covered by the two tests above through checkJob's
+// status; this one pins the exit.json field for the wall-clock case with the client killed.
+test("A4: a wall-clock stop that needed the fallback kill still records container_max_runtime, not signal", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "60000", FAKE_DOCKER_IGNORE_RM: "1", CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS: "1000" }, { maxRuntimeMs: 1200 });
+  runSync(j);
+  const rec = j.exitRecord();
+  assert.equal(rec.exitSignal, "SIGKILL");
+  assert.equal(rec.exitReason, "container_max_runtime");
+  assert.equal(rec.container.maxRuntimeExceeded, true);
+  assert.equal(core.checkJob(j.jobId, 0, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }), findDockerClients: () => [] }).status, "timed_out");
+});

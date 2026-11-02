@@ -48,11 +48,13 @@
  *   (2) Every stop removes the job's containers BY LABEL (claude-async.job=<jobId>) with
  *       `docker rm -f <id>` (container.mjs cleanupJobContainers), which catches a container in the
  *       Created state too. Stopping the docker client alone leaves the container running.
- *   (3) SIGTERM/SIGINT/SIGBREAK/SIGHUP: remove the containers, then wait for the client; if it never
- *       exits (wedged daemon), kill the client after CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS and record
- *       the cleanup as NOT confirmed.
- *   (4) A wall-clock limit (spec.container.maxRuntimeMs): past it the containers are removed and the
- *       exit is recorded as exitReason "container_max_runtime" (claude_check: timed_out).
+ *   (3) One bounded stop for cancel, the wall-clock limit (spec.container.maxRuntimeMs) and
+ *       SIGTERM/SIGINT/SIGBREAK/SIGHUP: remove the containers (retried at most every
+ *       CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS), wait for the client up to
+ *       CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS, then kill it and finish with the terminal result
+ *       ("cancelled" / "container_max_runtime" (claude_check: timed_out) / "signal") and the cleanup
+ *       recorded as NOT confirmed. The runner never reports a container as removed unless the
+ *       listing established it.
  *   (5) finish() kills a still-running client, removes the job's containers and records the result
  *       in exit.json as container.cleanup.confirmed, separately from the CLI's own exit: job-core's
  *       checkJob()/cancelJob() keep retrying an unconfirmed cleanup.
@@ -300,8 +302,11 @@ function recordExit(cleanup = null) {
     ? "bg_tasks_terminated"
     : exitInfo.exitReason;
   // Container jobs: the client exited because WE removed its container (cancel, wall-clock limit).
-  if (containerSpec && containerState.cancelled && (exitReason === "exit" || exitReason === "cancelled")) exitReason = "cancelled";
-  else if (containerSpec && containerState.runtimeExceeded && exitReason === "exit") exitReason = "container_max_runtime";
+  // "signal" here is this runner's own fallback kill of the client (the stop wait passed), which
+  // is still a cancel or a wall-clock stop, not a failure of its own kind.
+  const ownStop = exitReason === "exit" || exitReason === "cancelled" || (exitReason === "signal" && containerState.fallbackFired);
+  if (containerSpec && containerState.cancelled && ownStop) exitReason = "cancelled";
+  else if (containerSpec && containerState.runtimeExceeded && ownStop) exitReason = "container_max_runtime";
   const combinedTail = `${stdoutTail.join("\n")}\n${stderrTail.join("\n")}`;
   const warnings = [];
   if (BASH_AUTO_BACKGROUND_KILLED_RE.test(combinedTail)) {
@@ -320,7 +325,8 @@ function recordExit(cleanup = null) {
                         cancelled: containerState.cancelled, maxRuntimeExceeded: containerState.runtimeExceeded };
     if (containerState.runtimeExceeded) {
       warnings.push(`the container ran past its wall-clock limit (${containerSpec.maxRuntimeMs} ms, ` +
-        "CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS) and was removed");
+        "CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS) and was stopped" +
+        (cleanup && cleanup.confirmed ? "; its removal is confirmed" : "; its removal is NOT confirmed yet (claude_check retries it)"));
     }
     // 125 is docker run's own failure (daemon down, bad flag, image refused), not the CLI's.
     if (exitInfo.exitCode === 125) warnings.push("docker run itself failed (exit 125) before or while starting the container; see stderrTail");
@@ -483,12 +489,45 @@ if (child && containerSpec) {
   if (process.env.CLAUDE_ASYNC_TEST_DIE_AFTER_SPAWN === "1") process.kill(process.pid, "SIGKILL");
   try { if (child.pid) fs.writeFileSync(dockerPidPath, String(child.pid)); } catch {}
   writeLaunchState("spawned", child.pid || null);
+  // One bounded stop procedure for every way a running container job ends early: a cancel
+  // (cancel_requested), the wall-clock limit, and a catchable signal to this runner. It removes the
+  // job's containers by label now, retries at most every CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS (the
+  // docker calls are synchronous, up to 15 s each, so a retry on every 1 s poll tick would starve
+  // the heartbeat), and if the client has not exited after CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS it
+  // kills the client and finishes with the terminal result (cancelled / container_max_runtime /
+  // signal) and the cleanup recorded as NOT confirmed, so job-core's reconcile keeps retrying.
+  // Windows TerminateProcess can't be caught at all, which is why job-core's checkJob() also cleans
+  // up after a runner that died, and cancelJob() removes the containers itself.
+  const stopWaitMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS) || 30_000;
+  const rmRetryMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS) || 5_000;
+  const stop = { started: false, lastAttemptEnd: 0, sig: null };
+  const tryRemove = (why) => {
+    if (done) return;
+    const r = removeJobContainers(why);
+    stop.lastAttemptEnd = Date.now();
+    return r;
+  };
+  const beginStop = (why, { sig = null, exitCode = 137 } = {}) => {
+    if (stop.started) return;
+    stop.started = true;
+    stop.sig = sig;
+    try { fs.writeSync(errFd, `\n[job-runner] ${why}; removing container ${containerSpec.name} (stop wait ${stopWaitMs} ms)\n`); } catch {}
+    tryRemove(why);
+    setTimeout(() => {
+      if (done) return;
+      containerState.fallbackFired = true;
+      try { fs.writeSync(errFd, `\n[job-runner] WARN: the docker client did not exit within ${stopWaitMs} ms after ${why}; killing it. ` +
+        "The container may still exist; cleanup is recorded as not confirmed and claude_check / claude_cancel retry it\n"); } catch {}
+      killClient(child);
+      exitInfo = { exitCode: null, exitSignal: sig || "SIGKILL", exitReason: "signal" };
+      finish(sig ? 1 : exitCode);
+    }, stopWaitMs).unref();
+  };
   // A cancel that landed between the pre-spawn check and here is acted on at once, not on the
   // first poll tick.
   if (fs.existsSync(cancelPath)) {
     containerState.cancelled = true;
-    try { fs.writeSync(errFd, `\n[job-runner] cancel request seen right after docker run started; removing container ${containerSpec.name}\n`); } catch {}
-    removeJobContainers("cancel");
+    beginStop("cancel request seen right after docker run started");
   }
   const startedMs = Date.now();
   const maxRuntimeMs = Number(containerSpec.maxRuntimeMs) > 0 ? Number(containerSpec.maxRuntimeMs) : DEFAULT_MAX_RUNTIME_MS;
@@ -497,40 +536,19 @@ if (child && containerSpec) {
     if (done) return;
     if (!containerState.cancelled && fs.existsSync(cancelPath)) {
       containerState.cancelled = true;
-      try { fs.writeSync(errFd, `\n[job-runner] cancel request seen; removing container ${containerSpec.name}\n`); } catch {}
+      beginStop("cancel request seen");
     }
     if (!containerState.runtimeExceeded && Date.now() - startedMs > maxRuntimeMs) {
       containerState.runtimeExceeded = true;
-      try { fs.writeSync(errFd, `\n[job-runner] wall-clock limit (${maxRuntimeMs} ms) reached; removing container ${containerSpec.name}\n`); } catch {}
+      beginStop(`wall-clock limit (${maxRuntimeMs} ms) reached`);
     }
-    if (containerState.cancelled || containerState.runtimeExceeded) removeJobContainers("cancel/limit");
+    // Still attached after the first attempt (a container still being created, a slow daemon):
+    // retry, throttled.
+    if (stop.started && Date.now() - stop.lastAttemptEnd >= rmRetryMs) tryRemove("retry");
   }, pollMs);
   containerWatch.unref();
-}
-
-// Container jobs: a cancel (or any catchable termination of this runner) removes the job's
-// containers; the docker client then exits on its own and the normal exit path records it. If the
-// client never exits, the fallback kills it and finishes with the cleanup NOT confirmed. Windows
-// TerminateProcess can't be caught at all, which is why job-core's checkJob() also cleans up after
-// a runner that died, and cancelJob() removes the containers itself.
-if (child && containerSpec) {
-  let stopping = false;
-  const stopWaitMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS) || 30_000;
-  const stopContainer = (sig) => {
-    if (stopping) return;
-    stopping = true;
-    try { fs.writeSync(errFd, `\n[job-runner] ${sig} received; removing container ${containerSpec.name}\n`); } catch {}
-    removeJobContainers(sig);
-    setTimeout(() => {
-      if (done) return;
-      containerState.fallbackFired = true;
-      killClient(child);
-      exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
-      finish(1);
-    }, stopWaitMs).unref();
-  };
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])]) {
-    process.on(sig, () => stopContainer(sig));
+    process.on(sig, () => beginStop(`${sig} received`, { sig }));
   }
 }
 

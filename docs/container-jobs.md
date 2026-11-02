@@ -487,8 +487,9 @@ remove "send it to GitHub".
 | wall-clock limit (runner-enforced) | 4h | `CLAUDE_ASYNC_CONTAINER_MAX_RUNTIME_MS` (60000 to 604800000) |
 
 The runner's heartbeat never goes stale while it is alive, so `CLAUDE_ASYNC_JOB_TIMEOUT_MS` alone
-would never stop a hung container. Past the wall-clock limit the runner removes the container, and
-the job reads `status: "timed_out"` with `exit.exitReason: "container_max_runtime"`. These limits
+would never stop a hung container. Past the wall-clock limit the runner removes the container (the
+bounded stop under "Lifecycle"), and the job reads `status: "timed_out"` with
+`exit.exitReason: "container_max_runtime"`, also when the client had to be killed. These limits
 apply inside Docker Desktop's WSL2 VM, whose size is set in `%USERPROFILE%\.wslconfig`. Disk isn't
 limited per container; the clone and everything else live in the writable layer and go with `--rm`.
 
@@ -531,12 +532,20 @@ limited per container; the clone and everything else live in the writable layer 
   3. The runner checks `cancel_requested` before `docker run` (the container is then never started)
      and polls it while the client runs, so a container that was still being created when the cancel
      arrived is removed the moment it exists. The client then exits 137 and the runner records
-     `exitReason: "cancelled"`, the card close and the Discord ping through its normal path.
+     `exitReason: "cancelled"`, the card close and the Discord ping through its normal path. If the
+     client does not exit (the daemon ignores or fails the removal), the **bounded stop** below
+     applies: after `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` the runner kills the client and finishes
+     with `exitReason: "cancelled"` and cleanup NOT confirmed; `claude_check` keeps retrying.
   4. On a job that already finished, `claude_cancel` is the cleanup retry: it returns
      `alreadyFinished: true` only once cleanup is confirmed.
-- **SIGTERM/SIGINT/SIGHUP/SIGBREAK to the runner**: remove by label, then wait for the client up to
-  `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` (30 s). If it never exits (a wedged daemon), the runner kills
-  the client and records the cleanup as NOT confirmed; `claude_check` confirms it later.
+- **One bounded stop for cancel, the wall-clock limit and SIGTERM/SIGINT/SIGHUP/SIGBREAK**: remove
+  by label now, retry at most every `CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS` (5 s; the docker calls are
+  synchronous, so a retry per poll tick would starve the heartbeat), and wait for the client up to
+  `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` (30 s). If it never exits (a wedged or unreachable daemon),
+  the runner kills the client, finishes with the terminal result (`cancelled`, `container_max_runtime`
+  which reads `timed_out`, or `signal`), records `docker_launch` = `killed` and the cleanup as NOT
+  confirmed (`clientKilled: true`), and never claims the container was removed; `claude_check`
+  confirms it later under the launch-state rules.
 - **A runner that died** (`taskkill /F`, `TerminateProcess`): `claude_check` classifies the job
   `died`/`timed_out`, writes `cancel_requested` (so a slow runner never starts docker), removes by
   label, and confirms only under the launch-state rules above (recorded client gone, no process with
@@ -610,6 +619,7 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_CONTAINER_OLLAMA_URL` | `http://host.docker.internal:11434` | |
 | `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD` | `container/CLAUDE.md` | |
 | `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` | `30000` | runner: how long to wait for the client after a signal, cancel or the wall-clock limit before killing it |
+| `CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS` | `5000` | runner: minimum gap between removal retries during a stop |
 | `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` | `120000` | job-core: how long after a killed docker client an empty listing does not yet confirm cleanup |
 
 Removed in review round 1: `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, `_DENIED_ROOTS` and
