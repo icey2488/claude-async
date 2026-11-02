@@ -16,7 +16,7 @@
  */
 import { z } from "zod";
 import os from "node:os";
-import { startJob, checkJob, listJobs } from "./job-core.mjs";
+import { startJob, checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
 import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
@@ -35,8 +35,8 @@ export function defaultCtx() {
 export function startLocal(args, cfg, startOptions = {}) {
   const jobId = mintJobId({ host: cfg.localHost, descriptor: args.jobId, now: startOptions.now,
                             ...(startOptions.suffix ? { suffix: startOptions.suffix() } : {}) });
-  const { prompt, workFolder, model, effort, intent } = args;
-  return startJob({ prompt, workFolder, jobId, model, effort, intent },
+  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef } = args;
+  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef },
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
@@ -77,9 +77,12 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
   const route = resolveRoute(args.host, ctx.cfg);
   if (route.error) return { error: route.error, host: args.host ?? null, hostname: os.hostname() };
   if (route.kind === "local") return startLocal(args, ctx.cfg, ctx.startOptions);
-  const { host, prompt, workFolder, jobId, model, effort, intent } = args;
+  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef } = args;
+  // sandbox/repo/baseRef are only sent when given, so a forwarded host-mode start's body is unchanged.
   const out = await forward(ctx, route, "POST", "/v1/start",
-                            { host, prompt, workFolder, jobId, model, effort, intent }, FORWARD_TIMEOUT_MS);
+                            { host, prompt, workFolder, jobId, model, effort, intent, ...(sandbox ? { sandbox } : {}),
+                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}) },
+                            FORWARD_TIMEOUT_MS);
   return { host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
 
@@ -98,6 +101,24 @@ export async function dispatchCheck(jobId, tailBytes = 8000, ctx = defaultCtx())
   if (route.kind === "local") return { host, ...checkJob(jobId, tailBytes) };
   const out = await forward(ctx, route, "GET",
     `/v1/check?jobId=${encodeURIComponent(jobId)}&tailBytes=${encodeURIComponent(tailBytes)}`, null, FORWARD_TIMEOUT_MS);
+  return { jobId, host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
+}
+
+// Routed like claude_check: a job id prefixed with another registry host is forwarded to that
+// host's POST /v1/cancel (a container job runs, and is cancelled, on the host that started it);
+// an un-prefixed or local id is cancelled here.
+export async function dispatchCancel(jobId, ctx = defaultCtx()) {
+  const { host } = parseHostPrefix(jobId);
+  if (!host) return { host: ctx.cfg.localHost ?? null, ...cancelJob(jobId) };
+  if (!ctx.cfg.error && !knownHosts(ctx.cfg).includes(host)) {
+    return { jobId, host, hostname: os.hostname(),
+             error: `job id ${JSON.stringify(jobId)} has host prefix "${host}", which is not in ${ctx.cfg.file} ` +
+                    `(known hosts: ${knownHosts(ctx.cfg).join(", ")})` };
+  }
+  const route = resolveRoute(host, ctx.cfg);
+  if (route.error) return { jobId, host, hostname: os.hostname(), error: route.error };
+  if (route.kind === "local") return { host, ...cancelJob(jobId) };
+  const out = await forward(ctx, route, "POST", "/v1/cancel", { jobId }, FORWARD_TIMEOUT_MS);
   return { jobId, host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
 
@@ -170,7 +191,8 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "When supplied it is used verbatim (bounded); otherwise a heuristic summary of the " +
                   "prompt's opener is used. Prefer supplying this for a clean card face."),
       workFolder: z.string().optional().describe("Directory to run in, on the EXECUTING host " +
-                  "(default: that host's $HOME or CLAUDE_ASYNC_DEFAULT_CWD)."),
+                  "(default: that host's $HOME or CLAUDE_ASYNC_DEFAULT_CWD). Host jobs only: a container job " +
+                  "refuses it (pass repo instead)."),
       jobId: z.string().optional().describe("Optional descriptor. The final id is always " +
                   "<host>.<descriptor>-YYYYMMDD-<8 random chars>."),
       model: z.string().optional().describe("--model override, e.g. claude-opus-4-8 / claude-sonnet-5. " +
@@ -178,6 +200,16 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultracode"]).optional()
         .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
                   "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),
+      sandbox: z.enum(["host", "container"]).optional()
+        .describe("Where the job runs. \"host\" (the default unless the host sets CLAUDE_ASYNC_JOB_SANDBOX=container): " +
+                  "directly on the executing host, as before -- use it for Windows-admin work (scheduled tasks, " +
+                  "services, firewall). \"container\": in a Docker container that clones `repo` itself (no host " +
+                  "folder is mounted), with a full shell and a one-hour GitHub App installation token scoped to that one " +
+                  "repo, so the job can commit, push a branch and open a PR as the App. See docs/container-jobs.md."),
+      repo: z.string().optional().describe("Container jobs only (required there): the GitHub repo to clone inside " +
+                  "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
+      baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
+                  "(default: the repo's default branch). The job works on a new branch and opens a PR."),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 
@@ -218,6 +250,15 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
     },
   }, async ({ jobId, tailBytes }) => ok(await dispatchCheck(jobId, tailBytes || 8000, getCtx())));
+
+  server.registerTool("claude_cancel", {
+    description: "Cancel a CONTAINER job (sandbox: \"container\"), routed by the jobId's host prefix like claude_check. " +
+                 "Records the cancel (so a container that does not exist yet is never started, or is stopped the moment " +
+                 "it is) and removes the job's containers by label (docker rm -f). The job then finishes through its normal " +
+                 "path (exit.json, card, Discord ping) with a non-zero exit. On a finished job it retries an unconfirmed " +
+                 "container cleanup. Host jobs cannot be cancelled with this tool.",
+    inputSchema: { jobId: z.string() },
+  }, async ({ jobId }) => ok(await dispatchCancel(jobId, getCtx())));
 
   server.registerTool("claude_jobs", {
     description: "List background jobs on this host and every host in hosts.json, each row tagged with " +

@@ -435,6 +435,82 @@ this:
   permanent misconfiguration still fails fast) — all via injected interfaces/listen/sleep/now, no
   real Tailscale or sockets.
 
+## Container jobs (`feat/container-jobs`, 2026-11-01)
+
+**Behaviour change (review round 3): the HTTP bridge on `127.0.0.1:7842` now refuses to start without
+a bearer token, on every host, whether or not container mode is used.** If you use 7842 without a
+token today, `claude-async-http.mjs` will exit 78 at its next restart with `refusing to start: a
+bearer token is required`. Fix: `node claude-async-http.mjs --new-token` (under the same
+`CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes), give the printed token to the bridge's clients as
+`Authorization: Bearer <token>`, restart. The explicit opt-out `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1`
+starts it open with a WARNING, but only on a machine that has never run a container job: the first
+container preflight writes `%USERPROFILE%\.claude-async\container-mode`, the code never removes it,
+and while it exists the opt-out is refused (whatever the bridge's own env or config dir says).
+Delete that file only by hand, after container mode is off.
+
+Opt-in per job with `claude_start`'s `sandbox: "container"` plus `repo: "owner/repo"`, and only on a
+host whose `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes `container`; host jobs are untouched. The
+container clones the repo itself; no host folder is mounted read-write. Design, threat model,
+configuration and the rollout checklist: `docs/container-jobs.md`. Operational notes:
+
+- **Preflight refusals name the cause.** `errorCode: "invalid"` for a sandbox the policy doesn't
+  allow; `errorCode: "preflight"` with "not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS", "do not take
+  workFolder", "docker image ... is not built" (run `container\smoke-test.ps1`), "is Docker Desktop
+  running?", "env file ..." (it may hold only `CLAUDE_CODE_OAUTH_TOKEN`; a `GH_TOKEN` line is
+  refused), "HTTP MCP bridge is not token-locked" (`node claude-async-http.mjs --new-token`, restart
+  the bridge), or the GitHub App: "CLAUDE_ASYNC_GITHUB_APP_ID is not set", "key file ... does not
+  exist / readable by group or others (chmod 600) / is not a PEM private key", "the GitHub App is not
+  installed on <repo> ... install the app on that repository", or "CLAUDE_ASYNC_GITHUB_APP_ID and
+  CLAUDE_ASYNC_GITHUB_APP_KEY_FILE do not match" (401). `node tools\mint-app-token.mjs <owner/repo>
+  <tmpfile>` runs the same App preflight by hand and prints the slug, bot id and installation.
+  Nothing is written for a refused start.
+- **Exit codes:** 125 is `docker run` itself failing (daemon down, image missing; it never pulls);
+  78 with the warning "could not mint the GitHub App installation token" is the runner failing to
+  get the first token (no container was started; check the App settings, the key file and that
+  api.github.com is reachable from the host); 70 is the entrypoint failing to clone `repo` or check
+  out `baseRef`; 137 is a removed container (`claude_cancel`, the wall-clock limit, OOM at
+  `--memory`, or the runner's own stop on SIGTERM).
+- **GitHub token refresh:** the runner re-mints the one-hour installation token every 45 minutes
+  (`CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`) and republishes `<job dir>\creds\token` (temp file, then
+  rename). A refresh failure is a `WARN: GitHub App installation token refresh failed ... retrying
+  in N s with backoff` line in `err.log` (once per distinct error; the old token stays until it
+  expires); retries come at 30 s, 1, 2, 4, then every 5 minutes, and at least once more 2 minutes
+  before expiry. If the token gets within 5 minutes of expiry without a newer one, `err.log` and
+  `exit.json` say so at that moment; git/gh calls in such a job may have failed with auth errors.
+  The `creds` folder is deleted when the job ends, and `claude_check` deletes it for a runner that
+  died. A token file the image's helper finds torn or malformed is retried for 2 s and then refused
+  (`not a single valid installation token` on the job's stderr).
+- **Windows ACLs are checked:** preflight refuses the App key if `icacls` shows a grant to
+  Everyone/Users/Authenticated Users (or cannot be parsed); fix with `icacls <pem> /inheritance:r
+  /grant:r "%USERNAME%:F" "SYSTEM:F"`. The runner locks each job's `creds` folder to its own account
+  and SYSTEM and refuses to start the container if `icacls` fails there.
+- **Cancel = `claude_cancel`.** It writes `cancel_requested` in the job dir, then removes the job's
+  containers by label. Killing the runner or `docker.exe` with `taskkill /F` does NOT stop the
+  container; `claude_check` cleans up when it classifies the job `died`/`timed_out`. By hand:
+  `docker ps -a --filter label=claude-async.job=<jobId>` and `docker rm -f <id>`.
+- **`containerCleanup: "unconfirmed"`** on a finished job means something with the job's label may
+  still exist (usually the daemon was unreachable at the end), or the docker client ended before the
+  runner saw its container (`docker_launch` = `exited-uncertain`, e.g. `docker.exe` killed from
+  outside: its `com.docker.cli.exe` or the daemon may still create the container). Every
+  `claude_check` or `claude_cancel` retries; it turns `confirmed` once no process carries the job's
+  `docker run` argv, the 2-minute hold after a kill or uncertain exit has passed, and docker lists
+  nothing. Until then the job holds a concurrency slot.
+- **`exit 3` in a job's err.log with `runner.lock`:** a second runner for the same job dir found the
+  lock held (or still being written) and exited without running anything. Harmless; the first runner
+  owns the job.
+- **Tokens in logs:** `out.log`/`err.log` are raw and may hold the installation token or the OAuth
+  token if a job printed them; exit.json, `claude_check` and the Discord ping are redacted (every
+  token generation the runner minted, plus token shapes).
+- **The HTTP bridge won't start** (`claude-async-http: refusing to start: ... holds no valid
+  tokenSha256`, exit 78): see the behaviour change at the top of this section. Run `node
+  claude-async-http.mjs --new-token` under the same `CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes
+  (the message prints the `http.json` path it read), give the token to the bridge's clients, restart.
+  `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` is refused when the bridge's policy allows container
+  mode or `%USERPROFILE%\.claude-async\container-mode` exists, and is logged loudly otherwise.
+- **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; uninstall the GitHub App from the repo(s)
+  (outstanding tokens die within the hour), delete its private key, and revoke the setup-token for a
+  full cut-off. See the doc's "Rollback".
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /

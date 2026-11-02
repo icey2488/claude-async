@@ -5,56 +5,52 @@
  * CLAUDE_ASYNC_TLS_KEY are set (else plain HTTP for local checks). Same tools/logic as the stdio
  * server. Register in the app's Connectors UI as: http://127.0.0.1:<port>/mcp
  * (this deployment runs plain HTTP — no TLS cert/key are set; see ecosystem.config.cjs)
- * Security: binds to 127.0.0.1 ONLY + DNS-rebinding protection scoped to loopback.
- * Env: CLAUDE_ASYNC_HTTP_PORT (default 7842), CLAUDE_ASYNC_TLS_CERT, CLAUDE_ASYNC_TLS_KEY.
- * Self-test: node claude-async-http.mjs --selftest
+ * Security: binds to 127.0.0.1 ONLY + DNS-rebinding protection scoped to loopback, plus
+ * bearer-token auth from ~/.claude-async/http.json (see http-bridge.mjs). The token is REQUIRED by
+ * default: with no valid hash this script refuses to start (exit 78). The only way to run without
+ * one is CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1, which is refused when this process allows
+ * container jobs (CLAUDE_ASYNC_ALLOWED_SANDBOXES includes container, or CLAUDE_ASYNC_JOB_SANDBOX is
+ * container) and when the machine-wide container-mode marker (~/.claude-async/container-mode, fixed
+ * under the user's home whatever CLAUDE_ASYNC_CONFIG_DIR says) exists; when honoured it prints a
+ * WARNING on stdout and stderr.
+ * Env: CLAUDE_ASYNC_HTTP_PORT (default 7842), CLAUDE_ASYNC_TLS_CERT, CLAUDE_ASYNC_TLS_KEY,
+ *      CLAUDE_ASYNC_ALLOWED_SANDBOXES, CLAUDE_ASYNC_JOB_SANDBOX, CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED.
+ *   node claude-async-http.mjs --new-token   mint a token, store its hash in http.json, print it ONCE
+ *   node claude-async-http.mjs --selftest
  */
-import express from "express";
 import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { runSelfTest } from "./job-core.mjs";
-import { registerTools } from "./dispatch.mjs";
+import { createHttpApp, newHttpToken, resolveHttpBridgeAuth } from "./http-bridge.mjs";
+import { httpBridgeConfigPath, readHttpBridgeTokenHash } from "./container.mjs";
 
 if (process.argv.includes("--selftest")) {
   await runSelfTest(); // exits the process
 }
+if (process.argv.includes("--new-token")) {
+  const { token, file, error } = newHttpToken();
+  if (error) { console.error(`claude-async-http: ${error}`); process.exit(1); }
+  console.log(`Stored sha256 of a new token in ${file} (the token itself is not stored). Restart the bridge.`);
+  console.log(`Token (shown once; give it to each client of this bridge as "Authorization: Bearer <token>"):\n${token}`);
+  process.exit(0);
+}
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.CLAUDE_ASYNC_HTTP_PORT || 7842);
-
-const app = express();
-app.use(express.json({ limit: "8mb" }));
-
-app.post("/mcp", async (req, res) => {
-  const server = new McpServer({ name: "claude-async", version: "1.0.0" });
-  registerTools(server);
-  const transport = new StreamableHTTPServerTransport({
-    sessionIdGenerator: undefined,            // stateless
-    enableJsonResponse: true,                 // plain JSON responses (no SSE needed locally)
-    enableDnsRebindingProtection: true,       // defense-in-depth on top of loopback bind
-    allowedHosts: [`${HOST}:${PORT}`, `localhost:${PORT}`],
-  });
-  res.on("close", () => { transport.close(); server.close(); });
-  try {
-    await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
-  } catch (e) {
-    if (!res.headersSent) {
-      res.status(500).json({ jsonrpc: "2.0", id: null,
-        error: { code: -32603, message: String(e?.message || e) } });
-    }
-  }
-});
-
-const noSession = (_req, res) => res.status(405).json({ jsonrpc: "2.0", id: null,
-  error: { code: -32000, message: "Method not allowed (stateless server)" } });
-app.get("/mcp", noSession);
-app.delete("/mcp", noSession);
-
-app.get("/healthz", (_req, res) => res.json({ ok: true, name: "claude-async-http", port: PORT }));
+const configFile = httpBridgeConfigPath();
+const auth = resolveHttpBridgeAuth({ tokenSha256: readHttpBridgeTokenHash(configFile), configFile });
+if (auth.error) {
+  console.error(`claude-async-http: refusing to start: ${auth.error}`);
+  process.exit(78);
+}
+if (auth.warning) {
+  const line = `claude-async-http: WARNING: ${auth.warning}`;
+  console.log(line);
+  console.error(line);
+}
+const tokenSha256 = auth.tokenSha256;
+const app = createHttpApp({ port: PORT, tokenSha256 });
 
 const CERT = process.env.CLAUDE_ASYNC_TLS_CERT;
 const KEY = process.env.CLAUDE_ASYNC_TLS_KEY;
@@ -64,5 +60,6 @@ const httpServer = useTls
   : http.createServer(app);
 const scheme = useTls ? "https" : "http";
 httpServer.listen(PORT, HOST, () => {
-  console.log(`claude-async-${scheme} listening on ${scheme}://${HOST}:${PORT}/mcp`);
+  console.log(`claude-async-${scheme} listening on ${scheme}://${HOST}:${PORT}/mcp` +
+              (tokenSha256 ? " (bearer token required)" : " (no token: unauthenticated loopback)"));
 });

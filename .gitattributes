@@ -8,6 +8,11 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 
+# Scripts that run inside the Linux container image: always LF, even in a Windows checkout
+# (bash would read a CR as part of each line).
+*.sh text eol=lf
+container/Dockerfile text eol=lf
+
 # Binaries
 *.exe binary
 *.png binary

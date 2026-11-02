@@ -3,8 +3,9 @@
  * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
  * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
- *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent? }
+ *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
+ *   POST /v1/cancel  body { jobId }   (container jobs only; see job-core.mjs cancelJob)
  *   GET  /v1/jobs
  *
  * Backed by the EXISTING local path: a start goes through dispatch.mjs's startLocal() ->
@@ -37,7 +38,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkJob, listJobs } from "./job-core.mjs";
+import { checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
 import { loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
 import { DEPTH_HEADER } from "./guard.mjs";
@@ -46,6 +47,7 @@ import { writeJsonAtomic } from "./atomic.mjs";
 export const DEFAULT_PORT = 7850;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultracode"]);
+const SANDBOXES = new Set(["host", "container"]);
 
 // 100.64.0.0/10 (RFC 6598 CGNAT space, which Tailscale assigns node addresses from): first octet
 // 100, top two bits of the second octet 01 -> second octet 64..127.
@@ -170,15 +172,19 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
                                   host: localHost, hostname });
         }
         if (typeof body.prompt !== "string" || !body.prompt) return send(res, 400, { error: "prompt is required", hostname });
-        for (const k of ["workFolder", "jobId", "model", "intent"]) {
+        for (const k of ["workFolder", "jobId", "model", "intent", "repo", "baseRef"]) {
           if (!optStr(body[k])) return send(res, 400, { error: `${k} must be a string`, hostname });
         }
         if (body.effort !== undefined && body.effort !== null && !EFFORTS.has(body.effort)) {
           return send(res, 400, { error: `invalid effort ${JSON.stringify(body.effort)}`, hostname });
         }
+        if (body.sandbox !== undefined && body.sandbox !== null && !SANDBOXES.has(body.sandbox)) {
+          return send(res, 400, { error: `invalid sandbox ${JSON.stringify(body.sandbox)}`, hostname });
+        }
         const out = await startLocal(
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
-            model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined },
+            model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,
+            sandbox: body.sandbox || undefined, repo: body.repo || undefined, baseRef: body.baseRef || undefined },
           cfg, { ...startOptions, depth: req.headers[DEPTH_HEADER] ?? "" });
         return send(res, out.error ? (STATUS_BY_CODE[out.errorCode] || 400) : 200, { ...out, hostname: out.hostname || hostname });
       }
@@ -191,6 +197,23 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
                                   error: `job ${jobId} belongs to host ${host}, not ${localHost}` });
         }
         return send(res, 200, { host: localHost, ...checkJob(jobId, tailBytes) });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/cancel") {
+        let body;
+        try { body = JSON.parse(await readBody(req)); }
+        catch (e) { return send(res, e.status || 400, { error: e.status ? e.message : "invalid JSON body", hostname }); }
+        if (!body || typeof body !== "object" || typeof body.jobId !== "string" || !body.jobId) {
+          return send(res, 400, { error: "jobId (a string) is required", hostname });
+        }
+        const { host } = parseHostPrefix(body.jobId);
+        if (host && host !== localHost) {
+          return send(res, 404, { jobId: body.jobId, host, hostname, error: `job ${body.jobId} belongs to host ${host}, not ${localHost}` });
+        }
+        const out = cancelJob(body.jobId);
+        // 404 unknown job; 503 a finished job whose container cleanup could not be confirmed (retry);
+        // 400 anything else refused (invalid id, a host job).
+        const status = out.error === "no such job" ? 404 : out.cleanup === "unconfirmed" ? 503 : out.error ? 400 : 200;
+        return send(res, status, { host: localHost, ...out, hostname: out.hostname || hostname });
       }
       if (req.method === "GET" && url.pathname === "/v1/jobs") {
         const jobs = listJobs().map((r) => ({ ...r, host: localHost, hostname }));

@@ -25,6 +25,11 @@ import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
+import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
+         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues, readTokenFileSecretValues,
+         redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME,
+         writeContainerModeMarker, containerModeMarkerPath } from "./container.mjs";
+import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -225,6 +230,17 @@ const SAFE_PERMISSIONS_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIO
 // LOCALAPPDATA is not itself a live-chassis hazard, only HERMES_HOME pointing there directly is.
 const JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION !== "0";
 
+// Container jobs (design: docs/container-jobs.md; argv building and validation: container.mjs).
+// DEFAULT OFF: a job runs in a Docker container only when claude_start passes sandbox:"container",
+// or this is exactly "container" and the call doesn't pass sandbox:"host". Windows-admin jobs
+// (scheduled tasks, services, firewall) stay on the host. With it off, startJob() builds the same
+// argv, env and spec.json as before this mode existed.
+const SANDBOX_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SANDBOX;
+// The host's sandbox POLICY (container.mjs parseAllowedSandboxes): which modes it runs at all.
+// Default "host" only, so turning on container mode is an explicit operator decision, and a
+// container-only host ("container") refuses sandbox:"host" from any caller (MCP or /v1/start).
+const ALLOWED_SANDBOXES_ENV = process.env.CLAUDE_ASYNC_ALLOWED_SANDBOXES;
+
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
 // avoid backslash/quote-escaping ambiguity across cmd.exe/PowerShell/sh -- Windows node.exe
@@ -404,7 +420,11 @@ const jobPaths = (id) => {
   return { d, out: path.join(d, "out.log"), err: path.join(d, "err.log"),
            exit: path.join(d, "exit_code"), meta: path.join(d, "meta.json"),
            spec: path.join(d, "spec.json"), heartbeat: path.join(d, "runner_heartbeat"),
-           exitJson: path.join(d, "exit.json") };
+           exitJson: path.join(d, "exit.json"),
+           // container jobs only: the persisted cancel intent (job-core writes, the runner reads) and
+           // the docker client's pid (the runner writes, job-core reads; see containerLaunchPending;
+           // the fuller launch state is docker_launch, read by readDockerLaunchState)
+           cancel: path.join(d, "cancel_requested"), dockerPid: path.join(d, "docker_client.pid") };
 };
 
 export function pidAlive(pid) {
@@ -432,7 +452,7 @@ function getProcessImageName(pid) {
 
 // True when the process is ours (node runner or claude CLI). If the image name can't be
 // determined (permissions, OS quirk) we give benefit of the doubt — conservative/safe.
-function isOurProcess(pid) {
+export function isOurProcess(pid) {
   const name = getProcessImageName(pid);
   if (!name) return true;
   return name.includes("node") || name.includes("claude");
@@ -796,8 +816,12 @@ function launchPosix(p, extraEnv = {}) {
   return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
-async function launch(p, command, argv, cwd, extraEnv = {}) {
-  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
+// launchExtra.container (container jobs only): the runner's container record (name, docker binary,
+// repo path, git-state baseline), written into spec.json. Host jobs pass nothing, so their
+// spec.json is unchanged.
+async function launch(p, command, argv, cwd, extraEnv = {}, launchExtra = {}) {
+  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit,
+                            ...(launchExtra.container ? { container: launchExtra.container } : {}) }, { space: 0 });
   return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
@@ -865,6 +889,16 @@ export const INFLIGHT_RESERVATION_MS = 2 * 60 * 1000;
 export function isPlainObject(x) {
   return x !== null && typeof x === "object" && !Array.isArray(x);
 }
+// File reads only (meta.json, exit.json), never docker: is this a container job whose cleanup has
+// not been confirmed yet? false for host jobs and for anything unreadable that is not a container job.
+function containerJobCleanupUnconfirmed(p, meta = null) {
+  try {
+    if (!meta) meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+    if (!isPlainObject(meta) || meta.sandbox !== "container" || !meta.container) return false;
+    return !containerCleanupConfirmed(meta, readExitJson(p));
+  } catch { return false; }
+}
+
 export function countActiveJobs(nowMs, { check = checkJob } = {}) {
   let count = 0;
   const warnings = [];
@@ -874,17 +908,24 @@ export function countActiveJobs(nowMs, { check = checkJob } = {}) {
     const p = jobPaths(id);
     let dirStat;
     try { dirStat = fs.statSync(p.d); } catch { continue; } // raced away
-    if (!dirStat.isDirectory() || fs.existsSync(p.exit)) continue;
+    if (!dirStat.isDirectory()) continue;
+    const finished = fs.existsSync(p.exit);
+    if (finished && !containerJobCleanupUnconfirmed(p)) continue;
     let problem = null;
     let running = false;
     let meta;
     try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); }
     catch (e) { problem = e.code === "ENOENT" ? "has no meta.json" : `has an unreadable meta.json (${e.message})`; }
     if (!problem && !isPlainObject(meta)) problem = "has an unreadable meta.json (not a JSON object)";
-    if (!problem) {
-      try { running = check(id, 0).status === "running"; }
+    if (!problem && !finished) {
+      // containerCleanup:false: the cap count only needs a status, never docker housekeeping (which
+      // could spend docker timeouts inside the start lock when the daemon is down).
+      try { running = check(id, 0, { containerCleanup: false }).status === "running"; }
       catch (e) { problem = `has a readable meta.json but its status check failed (${e.message})`; }
     }
+    // A container job whose cleanup is not confirmed may still own a running container (4 CPUs, 8g
+    // in the WSL2 VM), whatever its status says: it holds a slot until a check confirms the cleanup.
+    if (!problem && !running && containerJobCleanupUnconfirmed(p, meta)) running = true;
     if (!problem) { if (running) count++; continue; }
     let lastModMs = dirStat.mtimeMs;
     try { lastModMs = Math.max(lastModMs, fs.statSync(p.meta).mtimeMs); } catch {}
@@ -916,9 +957,16 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // error text), caps (see guard.mjs resolveCaps), depth (the CALLER's dispatch depth; default from
 // CLAUDE_ASYNC_DEPTH), now (Date, tests), claudeBin + launch (test seams: the preflight binary and
 // a replacement for launch() so tests never touch schtasks or spawn a runner), fsImpl (test seam
-// for the post-launch meta.json write, see writeNewMeta()).
+// for the post-launch meta.json write, see writeNewMeta()). Container-mode seams (tests only):
+// sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), allowedSandboxes (replaces
+// CLAUDE_ASYNC_ALLOWED_SANDBOXES), containerConfig (replaces
+// loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight), checkHttpBridge
+// (replaces the loopback-bridge lock check), checkGitHubApp (replaces github-app.mjs's
+// preflightGitHubApp: the App installation lookup and identity fetch against api.github.com).
+// repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
+// start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent }, opts = {}) {
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef }, opts = {}) {
   const hostname = os.hostname();
   const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
   const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
@@ -927,7 +975,46 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
   const cwd = workFolder || DEFAULT_CWD;
 
-  const pf = preflight({ claudeBin: opts.claudeBin, cwd, hostLabel });
+  const sb = resolveSandbox(sandbox, opts.sandboxDefault !== undefined ? opts.sandboxDefault : SANDBOX_ENV_DEFAULT,
+                            "allowedSandboxes" in opts ? opts.allowedSandboxes : ALLOWED_SANDBOXES_ENV);
+  if (sb.error) return fail("invalid", sb.error);
+  if (sb.mode === "host" && ((repo !== undefined && repo !== null && repo !== "") || (baseRef !== undefined && baseRef !== null && baseRef !== ""))) {
+    return fail("invalid", "repo and baseRef are only for container jobs (sandbox: \"container\"); a host job runs in workFolder");
+  }
+  // Container mode: validate the repo name, secrets file, config, docker binary and image now,
+  // before anything is written (see container.mjs's planContainerJob()). No host folder is
+  // involved: the job clones `repo` inside the container.
+  let containerPlan = null;
+  if (sb.mode === "container") {
+    const planned = planContainerJob({ jobId: id, repo, baseRef, workFolder, cfg: opts.containerConfig || loadContainerConfig(),
+                                       jobDir: jobPaths(id).d, resolveBin: (b) => resolveBinary(b) });
+    if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
+    const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
+    if (img.error) return fail("preflight", `preflight failed on ${hostLabel}: ${img.error}`);
+    // The loopback HTTP MCP bridge must be token-locked: a container reaches the host's 127.0.0.1
+    // through host.docker.internal and could otherwise start an unsandboxed host job there.
+    const pc = planned.plan.cfg;
+    const br = await (opts.checkHttpBridge || checkHttpBridgeLocked)({ port: pc.httpBridgePort, configFile: pc.httpBridgeConfig, tls: pc.httpBridgeTls });
+    if (br.error) return fail("preflight", `preflight failed on ${hostLabel}: ${br.error}`);
+    // The GitHub App (github-app.mjs): the key parses, the App is installed on this repo, and its
+    // slug + bot user id (commit authorship). Fails closed; the message says what to do. Nothing
+    // is minted here: the runner mints the installation token right before `docker run`.
+    const ga = planned.plan.githubApp;
+    const app = await (opts.checkGitHubApp || preflightGitHubApp)({ appId: ga.appId, keyFile: ga.keyFile, repo: planned.plan.repo, apiBase: ga.apiBase });
+    if (app.error) return fail("preflight", `preflight failed on ${hostLabel}: ${app.error}`);
+    // Review round 3 (B1): mark the machine as one that runs container jobs, before any container can
+    // launch. The HTTP bridge refuses to start unauthenticated while this marker exists, whatever its
+    // own environment or config dir (container.mjs containerModeMarkerPath). Never removed here.
+    const mk = writeContainerModeMarker(opts.containerModeMarker || containerModeMarkerPath());
+    if (mk.error) return fail("preflight", `preflight failed on ${hostLabel}: ${mk.error}`);
+    // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
+    containerPlan = { ...planned.plan, imageId: img.imageId, ...resolveGitIdentity(pc, app),
+                      githubApp: { ...ga, installationId: app.installationId, slug: app.slug, botUserId: app.botUserId } };
+  }
+
+  // A container job has no workFolder; preflight only checks the docker binary (JOB_ROOT always exists).
+  const pf = preflight({ claudeBin: containerPlan ? containerPlan.dockerBin : opts.claudeBin,
+                         cwd: containerPlan ? JOB_ROOT : cwd, hostLabel });
   if (pf.error) return fail("preflight", pf.error);
 
   const d = opts.depth !== undefined ? parseDepth(opts.depth) : parseDepth(process.env[DEPTH_ENV]);
@@ -964,7 +1051,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const liveHermesHome = process.env.HERMES_HOME || null;
   const hermesHomeIsolationEnabled = opts.hermesHomeIsolation !== undefined
     ? Boolean(opts.hermesHomeIsolation) : JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT;
-  const jobHermesHome = hermesHomeIsolationEnabled ? path.join(p.d, "hermes_home") : null;
+  // Container jobs never see the host's HERMES_HOME (nothing from the host env reaches the
+  // container except container.mjs's allowlist), so there is nothing to isolate for them.
+  const jobHermesHome = hermesHomeIsolationEnabled && !containerPlan ? path.join(p.d, "hermes_home") : null;
   if (jobHermesHome) fs.mkdirSync(jobHermesHome, { recursive: true });
 
   const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
@@ -1056,22 +1145,57 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // ...process.env spread in launch(), same as every var this function doesn't touch).
   if (liveHermesHome) extraEnv.CLAUNKER_LIVE_HERMES_HOME = liveHermesHome;
   if (jobHermesHome) extraEnv.HERMES_HOME = jobHermesHome;
+  // Container mode: the runner spawns `docker run ...` instead of the CLI. The CLI argv inside the
+  // container is built by container.mjs (same prompt/model/effort, --dangerously-skip-permissions
+  // because the container is the boundary); the host argv built above is not used.
+  let launchCommand = opts.claudeBin || CLAUDE_BIN;
+  let launchArgv = argv;
+  // The docker client runs in the job's own dir: a container job has no host folder at all.
+  const launchCwd = containerPlan ? p.d : cwd;
+  const launchExtra = {};
+  if (containerPlan) {
+    const effortArgv = eff === "ultracode" ? ["--effort", "xhigh"] : FLAG_EFFORT.has(eff) ? ["--effort", eff] : [];
+    const cliArgv = buildContainerCliArgv({ prompt, model: resolvedModel, effortArgv,
+                                            settings: buildContainerSettings({ ultracode: eff === "ultracode" }) });
+    launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
+    launchCommand = containerPlan.dockerBin;
+    // jobId: the claude-async.job label every cleanup lists by; maxRuntimeMs: the runner's wall-clock limit.
+    // envFile: a PATH (the runner reads the values into memory only, to redact what it sends out).
+    // githubApp: what the runner needs to mint and refresh the installation token (app id, the key
+    // PATH, the installation, the repo name); credsDir: where it writes the token for the mount.
+    const ga = containerPlan.githubApp;
+    launchExtra.container = { name: containerPlan.name, jobId: id, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo,
+                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs, envFile: containerPlan.envFile,
+                              githubApp: { appId: ga.appId, keyFile: ga.keyFile, installationId: ga.installationId,
+                                           repoName: repoNameOf(containerPlan.repo), refreshMs: ga.refreshMs, apiBase: ga.apiBase },
+                              credsDir: containerPlan.credsDir };
+  }
   const { pid, pidSource, jobMembership, launchPath } =
-    await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
+    await (opts.launch || launch)(p, launchCommand, launchArgv, launchCwd, extraEnv, launchExtra);
 
-  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
+  // Container jobs: no host git, anywhere (noGit). There is no host clone to look at, and the
+  // delivery is the PR the job reports on stdout (job-runner.mjs records it in exit.json).
+  const { cardId, startHead, error: cardError } = containerPlan
+    ? mintCard(id, launchCwd, resolvedModel, eff, prompt, intent, { noGit: true })
+    : mintCard(id, cwd, resolvedModel, eff, prompt, intent);
   // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
   // ping's title (discord-notify.mjs) can use the same value the dispatch card shows -- omitted
   // entirely (no key) when no intent was given, rather than stored as null/empty.
   const persistedIntent = boundIntent(intent);
   const meta = { jobId: id, ...(opts.host ? { host: opts.host } : {}), hostname,
                  pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
-                 workFolder: cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
+                 workFolder: containerPlan ? null : cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null,
                  ...(persistedIntent ? { intent: persistedIntent } : {}),
-                 ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}) };
+                 ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
+                 ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
+                       image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
+                       jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null,
+                       envFile: containerPlan.envFile, credsDir: containerPlan.credsDir,
+                       githubApp: { appId: containerPlan.githubApp.appId, slug: containerPlan.githubApp.slug,
+                                    botUserId: containerPlan.githubApp.botUserId, installationId: containerPlan.githubApp.installationId } } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -1082,7 +1206,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
            ...(warnings.length ? { warnings } : {}) };
 }
 
-export function checkJob(id, tailBytes = 8000) {
+// opts.containerCleanup === false: skip container housekeeping (countActiveJobs). opts.cleanupContainers:
+// test seam replacing container.mjs's cleanupJobContainers.
+export function checkJob(id, tailBytes = 8000, opts = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
@@ -1159,6 +1285,23 @@ export function checkJob(id, tailBytes = 8000) {
     }
   }
 
+  // Container jobs: once the job is terminal (exit_code written, or the runner died/timed out), make
+  // sure nothing it owns is still running, and keep retrying on every check until that is
+  // CONFIRMED (see reconcileContainerCleanup). A running job is left to its runner.
+  // The job's current installation token is read BEFORE cleanup can delete creds/ (review round 3,
+  // C1), so the tails below are still redacted with it.
+  const tokenValues = meta.sandbox === "container"
+    ? readTokenFileSecretValues((meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME)) : [];
+  if (meta.sandbox === "container" && meta.container && opts.containerCleanup !== false) {
+    const terminal = exitCode !== null || state === "died" || state === "timed_out";
+    if (terminal) {
+      const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "checkJob", runnerFinished: exitCode !== null,
+                                                                   cleanup: opts.cleanupContainers, findClients: opts.findDockerClients });
+      extra.containerCleanup = cl.confirmed ? "confirmed" : "unconfirmed";
+      if (!cl.confirmed && cl.reason) extra.containerCleanupError = cl.reason;
+    }
+  }
+
   const runnerJobMembership = readRunnerJobMembership(p);
 
   // reportComplete (exit.json, written by job-runner.mjs's recordExit()) measures only whether
@@ -1177,11 +1320,258 @@ export function checkJob(id, tailBytes = 8000) {
       "and ending its turn";
   }
 
+  // A container job the runner stopped at its wall-clock limit reads as timed_out, like a host job
+  // whose heartbeat went stale past JOB_TIMEOUT_MS. Applied after the reaps above: the runner has
+  // already closed the card and cleaned up through its normal path.
+  if (exitCode !== null && exitRecord && exitRecord.exitReason === "container_max_runtime") state = "timed_out";
+
+  // Container jobs: out.log/err.log on disk stay raw (a job can print its own environment), but what
+  // claude_check returns -- to a chat session, or over /v1/check to another host -- is redacted:
+  // the env file's two values (and their base64 forms), plus GitHub/Anthropic token shapes. The
+  // redaction happens on a wider window BEFORE the caller's tailBytes cut (readRedactedTail), since
+  // tailBytes is caller-controlled and a cut inside a token would otherwise return its suffix in the
+  // clear. Host jobs are unchanged.
+  let stdout, stderr, exitOut = exitRecord;
+  if (meta.sandbox === "container") {
+    // The OAuth token from the env file plus the job's current installation token (the runner's
+    // creds/token, while the job runs); older token generations are covered by the ghs_ patterns.
+    const values = [...readEnvFileSecretValues(meta.container && meta.container.envFile), ...tokenValues];
+    stdout = readRedactedTail(p.out, tailBytes, values);
+    stderr = readRedactedTail(p.err, tailBytes, values);
+    if (exitRecord && typeof exitRecord === "object") {
+      exitOut = { ...exitRecord };
+      for (const k of ["stdoutTail", "stderrTail"]) {
+        if (Array.isArray(exitOut[k])) exitOut[k] = exitOut[k].map((l) => redactSecrets(String(l), values));
+      }
+    }
+  } else {
+    stdout = readTail(p.out, tailBytes);
+    stderr = readTail(p.err, tailBytes);
+  }
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
-           ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
+           ...(exitRecord !== undefined ? { exit: exitOut } : {}),
            ...(state === "died" ? { diedCause: classifyDiedCause(exitRecord) } : {}),
-           stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
+           stdout, stderr };
+}
+
+// ------------------------------------------------------------------ container cleanup state ---
+//
+// A container job's cleanup is tracked separately from the CLI's completion: exit_code says the
+// docker client exited, not that nothing the job owns is still running (the client can exit, or be
+// killed, while its container keeps going, and the final removal can fail while the daemon is
+// unreachable). Cleanup is CONFIRMED only when (a) no launch can still be pending (decided FIRST,
+// see containerLaunchPending: the recorded docker client is gone, the runner is gone or finished, no
+// process carrying the job's label exists, and a killed client's create request has had time to
+// land), and then (b) docker lists no container with the job's claude-async.job label after
+// removing what it found. Confirmation is stored once -- by the runner in exit.json
+// (container.cleanup.confirmed) or by job-core in meta.json (containerCleanup) -- and every later
+// check/cancel retries until then. Until then the job also holds a concurrency slot
+// (countActiveJobs), since its container may still be running.
+
+export function containerCleanupConfirmed(meta, exitRecord) {
+  return !!((exitRecord && exitRecord.container && exitRecord.container.cleanup && exitRecord.container.cleanup.confirmed === true) ||
+            (meta && meta.containerCleanup && meta.containerCleanup.confirmed === true));
+}
+
+// The runner's launch state (docker_launch in the job dir, see job-runner.mjs writeLaunchState):
+// { state: "pending" | "spawned" | "exited" | "exited-uncertain" | "killed", pid, at }. null when the runner never got as
+// far as the container section (or the file is unreadable), which is treated as uncertain below.
+function readDockerLaunchState(p) {
+  try {
+    const j = JSON.parse(fs.readFileSync(path.join(p.d, "docker_launch"), "utf8"));
+    if (!isPlainObject(j) || typeof j.state !== "string") return null;
+    return { state: j.state, pid: Number(j.pid) || null, at: j.at ? new Date(j.at).getTime() : NaN };
+  } catch { return null; }
+}
+
+// After a docker client was KILLED (the runner's stop-wait fallback), its create request may still be
+// in flight daemon-side, so an empty listing taken right afterwards proves nothing. The job stays
+// unconfirmed for this long after the kill (every check in between still removes whatever appears).
+export const CONTAINER_CONFIRM_HOLD_MS_DEFAULT = 2 * 60 * 1000;
+const confirmHoldMs = () => Number(process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS) || CONTAINER_CONFIRM_HOLD_MS_DEFAULT;
+
+// Process scan: every live process whose command line carries this job's container label
+// (`--label claude-async.job=<jobId>`), i.e. a docker client (or, on Docker Desktop for Windows,
+// the com.docker.cli.exe grandchild docker.exe hands the real work to, which TerminateProcess on
+// docker.exe does not kill) that could still create the job's container. This is how a client whose
+// pid was never recorded (runner died between spawn and the pid write) is still found. Returns pids;
+// [] when nothing is found; null when the scan itself failed (treated as uncertain by the caller).
+// Review round 3 (B3): the match is the COMPLETE label argument (`--label <l>` or `--label=<l>`,
+// optionally quoted, followed by whitespace or the end), never a substring, so neither the scanner's
+// own command line (the PowerShell script contains the needle) nor a job whose id merely starts with
+// this one's can match; and the scanner excludes itself ($PID and PowerShell processes on win32, the
+// ps child's pid on POSIX) and the calling node process.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Also (Argon #1) only a `docker run` of ours: the `run` subcommand and `--pull=never` must both be
+// whole tokens, so job-core's and the runner's own `docker ps --filter label=...` and `docker rm`
+// (or an inspect) can never count as a launch still in progress.
+export function processScanMatches(cmdline, jobId) {
+  const line = String(cmdline || "");
+  const label = escapeRe(`${CONTAINER_JOB_LABEL}=${jobId}`);
+  return /(?:^|\s)["']?run["']?(?=\s)/.test(line) && /(?:^|\s)["']?--pull=never["']?(?=\s|$)/.test(line) &&
+    new RegExp(`(?:^|\\s)--label(?:=|\\s+)(["']?)${label}\\1(?=\\s|$)`).test(line);
+}
+export function buildWin32ProcessScanScript(jobId) {
+  const needle = `${CONTAINER_JOB_LABEL}=${jobId}`.replace(/'/g, "''");
+  // Prefilter by substring in PowerShell (cheap), print "<pid>\t<name>\t<command line>"; the exact
+  // token match runs in JS (processScanMatches). $PID is this PowerShell; powershell/pwsh are excluded
+  // by name as well (a scanner started by another check of the same job).
+  return `$n = '${needle}'; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.ProcessId -ne ${process.pid} -and ` +
+    "$_.Name -notmatch '^(powershell|pwsh)(\\.exe)?$' -and $_.CommandLine -and $_.CommandLine.Contains($n) -and " +
+    "$_.CommandLine.Contains('--pull=never') } | " +
+    "ForEach-Object { \"$($_.ProcessId)`t$($_.Name)`t$($_.CommandLine -replace '[\\r\\n]', ' ')\" }";
+}
+export function findDockerClientsForJob(jobId, { spawnSync: run = spawnSync, platform = process.platform } = {}) {
+  try {
+    if (platform === "win32") {
+      const r = run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", buildWin32ProcessScanScript(jobId)],
+                    { encoding: "utf8", timeout: 15_000, windowsHide: true });
+      if (r.error || r.status !== 0) return null;
+      const pids = [];
+      for (const line of String(r.stdout || "").split(/\r?\n/)) {
+        const m = /^\s*(\d+)\t([^\t]*)\t(.*)$/.exec(line);
+        if (!m) continue;
+        const pid = Number(m[1]);
+        if (!(pid > 0) || pid === process.pid || pid === r.pid || /^(powershell|pwsh)(\.exe)?$/i.test(m[2].trim())) continue;
+        if (processScanMatches(m[3], jobId)) pids.push(pid);
+      }
+      return pids;
+    }
+    const r = run("ps", ["-eo", "pid=,args="], { encoding: "utf8", timeout: 15_000 });
+    if (r.error || r.status !== 0) return null;
+    const pids = [];
+    for (const line of String(r.stdout || "").split("\n")) {
+      const m = /^\s*(\d+)\s+(.*)$/.exec(line);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      if (!(pid > 0) || pid === process.pid || pid === r.pid) continue;
+      if (processScanMatches(m[2], jobId)) pids.push(pid);
+    }
+    return pids;
+  } catch { return null; }
+}
+
+// Could a `docker run` of this job still create (or start) a container? Decided BEFORE the final
+// listing (see reconcileContainerCleanup). Returns { pending, reason }. In order:
+//   1. the recorded client pid is alive: pending (whether or not the runner finished -- the
+//      fallback path writes exit_code with the client possibly still winding down).
+//   2. the runner itself is alive and not finished: it may spawn the client yet.
+//   3. a process scan for any process carrying this job's label (a client whose pid was never
+//      recorded, Docker Desktop's com.docker.cli.exe descendant of a killed docker.exe): found, or
+//      a failed scan, is pending. This runs in EVERY launch state, "exited" included (review round
+//      3, B2): the state file says what the runner saw, not that nothing else is still running.
+//   4. launch state "exited": the launch demonstrably completed; nothing more can be created.
+//   5. state "killed" or "exited-uncertain" (or the runner's record says the client was killed or
+//      its exit was uncertain) within the confirm hold: the daemon may still be serving the create.
+function containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClients } = {}) {
+  const launch = readDockerLaunchState(p);
+  let pid = launch ? launch.pid : null;
+  if (!pid) { try { pid = Number(fs.readFileSync(p.dockerPid, "utf8").trim()) || null; } catch {} }
+  if (pid && pidAlive(pid)) return { pending: true, reason: "no container found, but the docker client is still alive and may still create one" };
+  if (!runnerFinished) {
+    let runnerPid = meta && Number(meta.pid) || null;
+    try { runnerPid = Number(fs.readFileSync(path.join(p.d, "runner.pid"), "utf8").trim()) || runnerPid; } catch {}
+    if (runnerPid && pidAlive(runnerPid) && isOurProcess(runnerPid)) {
+      return { pending: true, reason: "no container found, but the runner is still alive and may still run docker" };
+    }
+  }
+  const jobId = (meta.container && meta.container.jobId) || meta.jobId || path.basename(p.d);
+  const found = (findClients || findDockerClientsForJob)(jobId);
+  if (found === null) return { pending: true, reason: "no container found, and the process scan for this job's docker client failed" };
+  if (found.length) return { pending: true, reason: `no container found, but a docker client process carrying this job's label is alive (pid ${found.join(", ")})` };
+  if (launch && launch.state === "exited") return { pending: false };
+  const cl = exitRecord && exitRecord.container && exitRecord.container.cleanup;
+  const heldAt = launch && (launch.state === "killed" || launch.state === "exited-uncertain") ? launch.at
+    : (cl && (cl.clientKilled || cl.uncertainExit) && exitRecord.endedAt) ? new Date(exitRecord.endedAt).getTime() : NaN;
+  if (Number.isFinite(heldAt)) {
+    const since = Date.now() - heldAt;
+    if (since < confirmHoldMs()) {
+      const what = launch && launch.state === "exited-uncertain" || (cl && cl.uncertainExit && !cl.clientKilled)
+        ? "exited before its launch was seen to complete (killed by someone else?)" : "was killed";
+      return { pending: true, reason: `the docker client ${what} ${Math.round(since / 1000)}s ago; its create request may still be in flight daemon-side (holding ${Math.round(confirmHoldMs() / 1000)}s before an empty listing counts)` };
+    }
+  }
+  return { pending: false };
+}
+
+function removeJobCredsDir(p, meta) {
+  const dir = (meta && meta.container && meta.container.credsDir) || path.join(p.d, CREDS_DIR_NAME);
+  if (!fs.existsSync(dir)) return;
+  try { fs.rmSync(dir, { recursive: true, force: true }); }
+  catch (e) { try { fs.appendFileSync(p.err, `\n[job-core] WARN: could not delete ${dir}: ${e.message}\n`); } catch {} }
+}
+
+// A write-once flag (its existence is the signal): created with O_EXCL, an existing one is kept.
+function writeCancelIntent(p, why) {
+  try { fs.writeFileSync(p.cancel, `${new Date().toISOString()} ${why}\n`, { flag: "wx" }); } catch {}
+}
+
+// Removes whatever the job still owns and confirms if it can. Returns { confirmed, removed, reason }.
+// Order matters: "launch activity has ended" is established FIRST, then the listing. A client that
+// creates its container and exits between the two observations is then seen by the listing; the
+// other order (list, then liveness) could confirm an empty listing taken before the create landed.
+function reconcileContainerCleanup(p, meta, exitRecord, { by, runnerFinished, cleanup, findClients }) {
+  // A terminal job keeps no credential on disk (review round 3, C1): a runner that died (or hung past
+  // its timeout) never ran finish(), which is what normally deletes creds/. The caller has already read
+  // the token for redaction. Done before anything else, confirmed or not.
+  removeJobCredsDir(p, meta);
+  if (containerCleanupConfirmed(meta, exitRecord)) return { confirmed: true, removed: 0 };
+  // A runner that died before `docker run` must never start it later.
+  if (!runnerFinished) writeCancelIntent(p, `${by}: runner not alive`);
+  const pending = containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClients });
+  const jobId = (meta.container && meta.container.jobId) || meta.jobId || path.basename(p.d);
+  let r;
+  try { r = (cleanup || cleanupJobContainers)({ dockerBin: meta.container.dockerBin, jobId }); }
+  catch (e) { r = { ok: false, error: e.message }; }
+  if (!r.ok) return { confirmed: false, removed: r.removed || 0, reason: r.error || "docker cleanup failed" };
+  if (!r.absent) return { confirmed: false, removed: r.removed, reason: `container(s) still present after docker rm -f: ${(r.remaining || []).map((x) => x.id.slice(0, 12)).join(", ")}` };
+  if (pending.pending) return { confirmed: false, removed: r.removed, reason: pending.reason };
+  meta.containerCleanup = { confirmed: true, at: new Date().toISOString(), by };
+  try { writeJsonAtomic(p.meta, meta); } catch {}
+  return { confirmed: true, removed: r.removed };
+}
+
+// Cancels a container job. The cancel intent is persisted FIRST (cancel_requested in the job dir):
+// the runner checks it before `docker run` and on every poll while the client runs, so a cancel
+// that lands before the container exists still stops it the moment it does. Then every container
+// with the job's label is removed (`docker rm -f` by ID: running or still Created). The runner is
+// left alone; once the container is gone the docker client exits (137) and the runner records the
+// exit, card close and Discord ping through its normal path. For a job whose runner already
+// finished, this is the cleanup retry: alreadyFinished is returned only once cleanup is confirmed.
+// Host jobs are not cancellable here (unchanged from before container mode).
+// opts.cleanupContainers: test seam replacing container.mjs's cleanupJobContainers.
+export function cancelJob(id, opts = {}) {
+  const hostname = os.hostname();
+  if (!isSafeJobId(id)) return { jobId: id, hostname, error: "invalid jobId" };
+  const p = jobPaths(id);
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); } catch { return { jobId: id, hostname, error: "no such job" }; }
+  if (meta.sandbox !== "container" || !meta.container) {
+    return { jobId: id, hostname, error: "cancel is only supported for container jobs (sandbox: \"container\")" };
+  }
+  const name = meta.container.name;
+  const runnerFinished = fs.existsSync(p.exit);
+  if (runnerFinished) {
+    const exitRecord = readExitJson(p);
+    const cl = reconcileContainerCleanup(p, meta, exitRecord, { by: "cancelJob", runnerFinished: true, cleanup: opts.cleanupContainers,
+                                                                 findClients: opts.findDockerClients });
+    if (cl.confirmed) return { jobId: id, hostname, ok: true, alreadyFinished: true, cleanup: "confirmed", container: name, removed: cl.removed };
+    return { jobId: id, hostname, ok: false, cleanup: "unconfirmed", container: name,
+             error: `the job has finished but its container cleanup is not confirmed: ${cl.reason}` };
+  }
+  writeCancelIntent(p, "cancelJob");
+  try { fs.appendFileSync(p.err, `\n[job-core] cancel requested at ${new Date().toISOString()}; removing container ${name}\n`); } catch {}
+  let r;
+  try { r = (opts.cleanupContainers || cleanupJobContainers)({ dockerBin: meta.container.dockerBin, jobId: meta.container.jobId || id }); }
+  catch (e) { r = { ok: false, error: e.message }; }
+  const base = { jobId: id, hostname, ok: true, cancelRequested: true, container: name, cleanup: "pending" };
+  if (!r.ok) {
+    return { ...base, removed: 0, warning: `docker cleanup failed (${r.error}); the runner will remove the container when it sees the cancel request` };
+  }
+  return { ...base, removed: r.removed,
+           ...(r.removed === 0 ? { note: "no container exists yet; the runner will not start one, or will stop it as soon as it exists" } : {}),
+           ...(!r.absent ? { warning: "a container was still listed after docker rm -f; the runner and later checks keep retrying" } : {}) };
 }
 
 export function listJobs() {

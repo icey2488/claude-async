@@ -160,9 +160,13 @@ export function getGitHead(dir) {
  * one-line intent, not the jobId, which stays confined to provenance. If neither
  * source yields a body (no intent, no prompt), jobId is the last-resort title so the
  * positional arg is never sent blank.
+ *
+ * opts.noGit (container jobs): skip the HEAD lookup entirely, so no git runs on the host for a job
+ * whose repo exists only inside its container; startHead is then null and closeCard's delivery
+ * check never runs either.
  */
-export function mintCard(jobId, workFolder, model, effort, prompt, intent) {
-  const startHead = getGitHead(workFolder);
+export function mintCard(jobId, workFolder, model, effort, prompt, intent, opts = {}) {
+  const startHead = opts.noGit ? null : getGitHead(workFolder);
   const args = [
     "create", "--state", "dispatched", "--actor", "claude-code",
     "--project", "Dispatch Log",

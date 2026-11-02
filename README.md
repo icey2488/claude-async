@@ -82,8 +82,9 @@ If you'd rather not use the prompt above, or you're not on Windows:
 
 | Tool | Input | Returns |
 |---|---|---|
-| `claude_start` | `host` (required; one of the hosts in `hosts.json`, see Multi-host), `prompt` (required), `workFolder?`, `jobId?` (descriptor), `model?`, `effort?`, `intent?` | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
+| `claude_start` | `host` (required; one of the hosts in `hosts.json`, see Multi-host), `prompt` (required), `workFolder?` (host jobs), `jobId?` (descriptor), `model?`, `effort?`, `intent?`, `sandbox?` (`"host"` default, or `"container"`), `repo?` + `baseRef?` (container jobs: the `owner/repo` cloned inside the container; see [docs/container-jobs.md](docs/container-jobs.md)) | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
 | `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
+| `claude_cancel` | `jobId` (required) | cancels a **container** job (routed by host prefix): records the cancel so a not-yet-created container never runs, removes the job's containers by label, and on a finished job retries an unconfirmed cleanup. Host jobs can't be cancelled with it |
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
 
 `status` is one of `running | completed | incomplete | failed | died | timed_out`. `completed` is reported only when the job exited with code 0 AND wasn't killed by the CLI's own background-task wait ceiling (see `exitReason: "bg_tasks_terminated"` below); a non-zero exit, or that kill, is `failed`. An exit-0 job whose exit.json has `reportComplete:false` (no DELEGATION-METRICS marker in stdout) reports status `incomplete` instead of `completed`; `failed` always takes precedence over `incomplete`. `died` means the process exited without recording a result (crash, SIGKILL, pid recycled to a foreign process); `timed_out` means no heartbeat for longer than `CLAUDE_ASYNC_JOB_TIMEOUT_MS`.
@@ -129,6 +130,8 @@ Optional environment variables:
 | `CLAUDE_ASYNC_PING_TIMEOUT_MS` | `10000` | Per-ping timeout before counting a miss |
 | `CLAUDE_ASYNC_PING_MAX_MISSES` | `3` | Consecutive misses before the watchdog exits, if the parent also looks gone |
 | `CLAUDE_ASYNC_PING_HARD_CAP_MISSES` | `6` | Consecutive misses before the watchdog exits unconditionally |
+| `CLAUDE_ASYNC_ALLOWED_SANDBOXES` | `host` | Which modes this host runs at all: `host`, `container` or `host,container`. Container jobs need `container` in it |
+| `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | Exactly `container` makes container jobs the default. The `CLAUDE_ASYNC_CONTAINER_*` and `CLAUDE_ASYNC_GITHUB_APP_*` settings container jobs need (the GitHub App they act as, its private key file, the OAuth env file) are listed in [docs/container-jobs.md](docs/container-jobs.md#configuration-reference) |
 | `CLAUDE_ASYNC_PING_RESUME_FACTOR` | `2` | A tick-to-tick gap bigger than this many ping intervals is treated as a sleep/resume, forgiving that tick's miss |
 
 ## Discord notifications
