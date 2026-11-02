@@ -64,3 +64,12 @@ test("POST /v1/start: repo/baseRef must be strings; on a host job they are refus
   assert.equal(tickets().length, 0);
   assert.equal(jobDirs().length, 0);
 });
+
+test("POST /v1/start: sandbox:\"container\" is refused under the default policy (host only); nothing is written", async () => {
+  const url = await apiServer();
+  const r = await post(url, "/v1/start", { host: "claunker", prompt: "p", sandbox: "container", repo: "icey2488/scratch" });
+  assert.equal(r.status, 400);
+  assert.match(r.body.error, /not allowed on this host \(CLAUDE_ASYNC_ALLOWED_SANDBOXES=host\)/);
+  assert.equal(tickets().length, 0);
+  assert.equal(jobDirs().length, 0);
+});

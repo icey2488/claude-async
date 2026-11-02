@@ -17,8 +17,9 @@
  * no-background hook). Nothing the job writes reaches the host disk except the runner's captured
  * stdout/stderr.
  *
- * OFF BY DEFAULT. A job runs in a container only when claude_start passes sandbox:"container", or
- * CLAUDE_ASYNC_JOB_SANDBOX is exactly "container" and the call does not pass sandbox:"host". Host jobs (Windows-admin work: scheduled tasks, services, firewall checks) keep
+ * OFF BY DEFAULT, and gated twice: a job runs in a container only when the call (or
+ * CLAUDE_ASYNC_JOB_SANDBOX) asks for it AND CLAUDE_ASYNC_ALLOWED_SANDBOXES permits it (default
+ * "host" only). Host jobs (Windows-admin work: scheduled tasks, services, firewall checks) keep
  * today's argv, env and spec byte-for-byte.
  *
  * This module builds and validates argv and config, and runs the small docker housekeeping
@@ -104,18 +105,42 @@ const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 // ------------------------------------------------------------------------------ selection ---
 
+// CLAUDE_ASYNC_ALLOWED_SANDBOXES: which modes this host will run at all. Default "host" (container
+// mode must be switched on explicitly); "container" alone disables host jobs; "host,container"
+// allows both. Returns { allowed } or { error } (an unknown value fails closed: no mode allowed).
+export function parseAllowedSandboxes(value) {
+  if (value === undefined || value === null || String(value).trim() === "") return { allowed: ["host"] };
+  const parts = String(value).split(",").map((s) => s.trim()).filter(Boolean);
+  const bad = parts.filter((p) => !SANDBOX_MODES.includes(p));
+  if (bad.length || parts.length === 0) {
+    return { error: `CLAUDE_ASYNC_ALLOWED_SANDBOXES ${JSON.stringify(value)} is invalid (use host, container, or host,container)` };
+  }
+  return { allowed: [...new Set(parts)] };
+}
+
 // Which sandbox a job gets. `requested` is claude_start's optional `sandbox` param; `envDefault`
-// is CLAUDE_ASYNC_JOB_SANDBOX. Only the exact string "container" turns the env default on (the
-// same "exact value or it's off" convention as CLAUDE_ASYNC_JOB_TOOL_GATE / _SAFE_PERMISSIONS);
-// an explicit request always wins, in either direction. Returns { mode } or { error }.
-export function resolveSandbox(requested, envDefault = process.env.CLAUDE_ASYNC_JOB_SANDBOX) {
+// is CLAUDE_ASYNC_JOB_SANDBOX; `allowedValue` is CLAUDE_ASYNC_ALLOWED_SANDBOXES. Only the exact
+// string "container" turns the env default on (the same "exact value or it's off" convention as
+// CLAUDE_ASYNC_JOB_TOOL_GATE / _SAFE_PERMISSIONS). The chosen mode -- requested or defaulted -- must
+// be in the allowed list, so a caller can neither escape a container-only host with
+// sandbox:"host" nor reach skip-permissions on a host-only host with sandbox:"container".
+// Returns { mode } or { error }.
+export function resolveSandbox(requested, envDefault = process.env.CLAUDE_ASYNC_JOB_SANDBOX,
+                               allowedValue = process.env.CLAUDE_ASYNC_ALLOWED_SANDBOXES) {
+  let mode;
   if (requested === undefined || requested === null || requested === "") {
-    return { mode: envDefault === "container" ? "container" : "host" };
-  }
-  if (!SANDBOX_MODES.includes(requested)) {
+    mode = envDefault === "container" ? "container" : "host";
+  } else if (!SANDBOX_MODES.includes(requested)) {
     return { error: `invalid sandbox ${JSON.stringify(requested)} (expected one of: ${SANDBOX_MODES.join(", ")})` };
+  } else {
+    mode = requested;
   }
-  return { mode: requested };
+  const pol = parseAllowedSandboxes(allowedValue);
+  if (pol.error) return { error: pol.error };
+  if (!pol.allowed.includes(mode)) {
+    return { error: `sandbox ${JSON.stringify(mode)} is not allowed on this host (CLAUDE_ASYNC_ALLOWED_SANDBOXES=${pol.allowed.join(",")})` };
+  }
+  return { mode };
 }
 
 export function containerName(jobId) {

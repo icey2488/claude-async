@@ -233,6 +233,10 @@ const JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_HERME
 // (scheduled tasks, services, firewall) stay on the host. With it off, startJob() builds the same
 // argv, env and spec.json as before this mode existed.
 const SANDBOX_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SANDBOX;
+// The host's sandbox POLICY (container.mjs parseAllowedSandboxes): which modes it runs at all.
+// Default "host" only, so turning on container mode is an explicit operator decision, and a
+// container-only host ("container") refuses sandbox:"host" from any caller (MCP or /v1/start).
+const ALLOWED_SANDBOXES_ENV = process.env.CLAUDE_ASYNC_ALLOWED_SANDBOXES;
 
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
@@ -935,7 +939,8 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // CLAUDE_ASYNC_DEPTH), now (Date, tests), claudeBin + launch (test seams: the preflight binary and
 // a replacement for launch() so tests never touch schtasks or spawn a runner), fsImpl (test seam
 // for the post-launch meta.json write, see writeNewMeta()). Container-mode seams (tests only):
-// sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), containerConfig (replaces
+// sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), allowedSandboxes (replaces
+// CLAUDE_ASYNC_ALLOWED_SANDBOXES), containerConfig (replaces
 // loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight).
 // repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
 // start from); a host job that passes either is refused, so host-mode calls are unaffected.
@@ -949,7 +954,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
   const cwd = workFolder || DEFAULT_CWD;
 
-  const sb = resolveSandbox(sandbox, opts.sandboxDefault !== undefined ? opts.sandboxDefault : SANDBOX_ENV_DEFAULT);
+  const sb = resolveSandbox(sandbox, opts.sandboxDefault !== undefined ? opts.sandboxDefault : SANDBOX_ENV_DEFAULT,
+                            "allowedSandboxes" in opts ? opts.allowedSandboxes : ALLOWED_SANDBOXES_ENV);
   if (sb.error) return fail("invalid", sb.error);
   if (sb.mode === "host" && ((repo !== undefined && repo !== null && repo !== "") || (baseRef !== undefined && baseRef !== null && baseRef !== ""))) {
     return fail("invalid", "repo and baseRef are only for container jobs (sandbox: \"container\"); a host job runs in workFolder");

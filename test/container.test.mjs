@@ -67,18 +67,35 @@ const allValuesAfter = (argv, flag) => argv.flatMap((a, i) => (a === flag ? [arg
 
 // ------------------------------------------------------------------------------ selection ---
 
+const BOTH = "host,container";
+
 test("resolveSandbox: off by default; only the exact env value \"container\" turns the default on", () => {
-  assert.deepEqual(c.resolveSandbox(undefined, undefined), { mode: "host" });
+  assert.deepEqual(c.resolveSandbox(undefined, undefined, BOTH), { mode: "host" });
   for (const v of ["", "1", "true", "Container", "CONTAINER", " container", "docker"]) {
-    assert.deepEqual(c.resolveSandbox(undefined, v), { mode: "host" }, `env ${JSON.stringify(v)}`);
+    assert.deepEqual(c.resolveSandbox(undefined, v, BOTH), { mode: "host" }, `env ${JSON.stringify(v)}`);
   }
-  assert.deepEqual(c.resolveSandbox(undefined, "container"), { mode: "container" });
+  assert.deepEqual(c.resolveSandbox(undefined, "container", BOTH), { mode: "container" });
 });
 
-test("resolveSandbox: an explicit request wins in both directions; anything else is refused", () => {
-  assert.deepEqual(c.resolveSandbox("host", "container"), { mode: "host" });
-  assert.deepEqual(c.resolveSandbox("container", undefined), { mode: "container" });
-  for (const bad of ["docker", "Container", "vm", 1, true]) assert.ok(c.resolveSandbox(bad).error, `refuses ${JSON.stringify(bad)}`);
+test("resolveSandbox: an explicit request picks the mode; anything else is refused", () => {
+  assert.deepEqual(c.resolveSandbox("host", "container", BOTH), { mode: "host" });
+  assert.deepEqual(c.resolveSandbox("container", undefined, BOTH), { mode: "container" });
+  for (const bad of ["docker", "Container", "vm", 1, true]) assert.ok(c.resolveSandbox(bad, undefined, BOTH).error, `refuses ${JSON.stringify(bad)}`);
+});
+
+test("CLAUDE_ASYNC_ALLOWED_SANDBOXES: default host only; the chosen mode must be allowed in both directions", () => {
+  assert.deepEqual(c.parseAllowedSandboxes(undefined), { allowed: ["host"] });
+  assert.deepEqual(c.parseAllowedSandboxes(""), { allowed: ["host"] });
+  assert.deepEqual(c.parseAllowedSandboxes("container"), { allowed: ["container"] });
+  assert.deepEqual(c.parseAllowedSandboxes(" host , container "), { allowed: ["host", "container"] });
+  for (const bad of ["docker", "host,docker", "Host", ",", "*"]) assert.ok(c.parseAllowedSandboxes(bad).error, bad);
+  // default policy: a caller can't reach skip-permissions + GH_TOKEN with sandbox:"container"
+  assert.match(c.resolveSandbox("container", undefined, undefined).error, /not allowed on this host/);
+  // container-only host: neither the call nor a missing env default escapes to the bare host
+  assert.match(c.resolveSandbox("host", "container", "container").error, /not allowed/);
+  assert.match(c.resolveSandbox(undefined, undefined, "container").error, /not allowed/);
+  assert.deepEqual(c.resolveSandbox(undefined, "container", "container"), { mode: "container" });
+  assert.match(c.resolveSandbox("host", undefined, "bogus").error, /ALLOWED_SANDBOXES .* invalid/, "a bad policy fails closed");
 });
 
 // ------------------------------------------------------------------------------- argv ---
@@ -472,7 +489,7 @@ function fakeLaunch(capture) {
 const CAPS = { maxConcurrent: 1000, maxStartsPerMinute: 1000 };
 const jid = (s) => `${s}-${crypto.randomBytes(4).toString("hex")}`;
 // Container-mode startJob seams shared by the tests below.
-const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, containerConfig: { ...fx.cfg, dockerBin: process.execPath },
+const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, allowedSandboxes: BOTH, containerConfig: { ...fx.cfg, dockerBin: process.execPath },
                                        checkImage: () => ({ ok: true, imageId: `sha256:${"ab".repeat(32)}` }), ...extra });
 
 test("startJob: with container mode off (default), argv/command/env are what they were before container mode", async () => {
@@ -482,7 +499,7 @@ test("startJob: with container mode off (default), argv/command/env are what the
   const opts = { claudeBin: process.execPath, caps: CAPS, hermesHomeIsolation: false, toolGate: false, safePermissions: false };
   const r1 = await core.startJob({ ...base, jobId: jid("off-a") }, { ...opts, launch: fakeLaunch(a) });
   const r2 = await core.startJob({ ...base, jobId: jid("off-b"), sandbox: "host" },
-    { ...opts, launch: fakeLaunch(b), sandboxDefault: "container" });
+    { ...opts, launch: fakeLaunch(b), sandboxDefault: "container", allowedSandboxes: BOTH });
   for (const r of [r1, r2]) { assert.ok(!r.error, r.error); assert.equal(r.sandbox, undefined); assert.equal(r.container, undefined); }
   assert.deepEqual(a[0].argv, b[0].argv, "sandbox:\"host\" over a container default is identical to the default");
   assert.equal(a[0].command, process.execPath);
@@ -509,6 +526,24 @@ test("startJob: unknown env values never enable container mode", async () => {
       { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch(cap), sandboxDefault: v, hermesHomeIsolation: false });
     assert.ok(!r.error, r.error);
     assert.equal(cap[0].command, process.execPath, `env ${v}`);
+  }
+});
+
+test("startJob: the sandbox policy refuses a disallowed mode before the job dir exists", async () => {
+  const fx = fixture();
+  const cases = [
+    [{ sandbox: "container", repo: REPO }, { allowedSandboxes: undefined }],           // default policy: host only
+    [{ sandbox: "host" }, { allowedSandboxes: "container" }],
+    [{}, { allowedSandboxes: "container" }],                                            // host by default, not allowed
+    [{}, { allowedSandboxes: "nonsense" }],
+  ];
+  for (const [args, o] of cases) {
+    const id = jid("pol");
+    const r = await core.startJob({ prompt: "p", jobId: id, ...args },
+      { ...ctrOpts(fx, { launch: fakeLaunch([]) }), claudeBin: process.execPath, hermesHomeIsolation: false, ...o });
+    assert.equal(r.errorCode, "invalid", JSON.stringify(r));
+    assert.match(r.error, /CLAUDE_ASYNC_ALLOWED_SANDBOXES/);
+    assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)));
   }
 });
 
