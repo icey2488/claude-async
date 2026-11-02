@@ -1,7 +1,7 @@
 // End-to-end tests for job-runner.mjs's container-job handling, using the REAL runner and a fake
 // docker CLI (test/fixtures/fake-docker.mjs) so no Docker daemon is needed: stdout/stderr capture,
-// exit.json, the completeness marker, kill-by-name on SIGTERM and in finish(), and the post-run
-// .git audit. Host-job behavior of the runner is covered by test/multihost/exit-reason.test.mjs.
+// exit.json, the completeness marker, kill-by-name on SIGTERM and in finish(), the entrypoint's
+// clone-failure exit, the reported PR URL, and that no host git ever runs for a container job. Host-job behavior of the runner is covered by test/multihost/exit-reason.test.mjs.
 // Run: node --test test/container-runner.test.mjs
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -16,7 +16,6 @@ const RUNNER = path.join(here, "..", "job-runner.mjs");
 const FAKE_DOCKER = path.join(here, "fixtures", "fake-docker.mjs");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "claude-async-container-runner-"));
 after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
-const HAVE_GIT = spawnSync("git", ["--version"]).status === 0;
 
 // The fake docker is a node script; on win32 a .mjs can't be spawned directly, so the "docker
 // binary" in spec.json is a small launcher: node itself, with the script as the first argv entry.
@@ -30,26 +29,24 @@ function makeDockerShim(dir) {
 }
 
 let seq = 0;
-function setup(extraEnv = {}) {
+const REPO = "icey2488/container-job-scratch";
+function setup(extraEnv = {}, { meta = {} } = {}) {
   const dir = path.join(TMP, `job-${++seq}`);
-  const repo = path.join(TMP, `repo-${seq}`);
   fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(path.join(repo, ".git", "hooks"), { recursive: true });
-  fs.writeFileSync(path.join(repo, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
   const docker = makeDockerShim(dir);
   const name = `claude-async-cjob-${seq}`;
   const log = path.join(dir, "docker-calls.jsonl");
-  const spec = { command: docker, argv: ["run", "--rm", "--name", name, "img", "claude", "-p", "--", "x"], cwd: repo,
-                 out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
-                 container: { name, dockerBin: docker, repo, gitBaseline: [] } };
+  const spec = { command: docker, argv: ["run", "--rm", "--name", name, "img", "/usr/local/bin/claude-async-job-entry", REPO, "", "--", "claude", "-p", "--", "x"],
+                 cwd: dir, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
+                 container: { name, dockerBin: docker, repo: REPO } };
   fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
-  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId: `cjob-${seq}`, pid: 1 }));
+  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId: `cjob-${seq}`, pid: 1, ...meta }));
   const env = { ...process.env, FAKE_DOCKER_LOG: log, CLAUDE_ASYNC_TEST: "1", HOME: path.join(TMP, "home"),
                 USERPROFILE: path.join(TMP, "home"), CLAUDE_ASYNC_CONFIG_DIR: path.join(TMP, "home", ".claude-async"),
                 CLAUNKER_JOBCARD_CMD: JSON.stringify(["__no_such_jobcard_binary__"]), ...extraEnv };
   const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l).argv) : []);
   const exitRecord = () => JSON.parse(fs.readFileSync(path.join(dir, "exit.json"), "utf8"));
-  return { dir, repo, name, env, calls, exitRecord, spec: path.join(dir, "spec.json") };
+  return { dir, name, env, calls, exitRecord, spec: path.join(dir, "spec.json") };
 }
 
 const SKIP = process.platform === "win32" ? "fake docker shim is POSIX-only" : false;
@@ -64,7 +61,9 @@ test("container job: docker output is captured, exit.json written, container kil
   const rec = j.exitRecord();
   assert.equal(rec.exitCode, 0);
   assert.equal(rec.reportComplete, true, "the DELEGATION-METRICS marker is still detected through docker");
-  assert.deepEqual(rec.container, { name: j.name, newGitFindings: [] });
+  assert.equal(rec.container.name, j.name);
+  assert.equal(rec.container.repo, REPO);
+  assert.equal(rec.container.newGitFindings, undefined, "no host .git audit any more");
   assert.equal(fs.readFileSync(path.join(j.dir, "exit_code"), "utf8"), "0");
   const calls = j.calls();
   assert.equal(calls[0][0], "run");
@@ -98,25 +97,35 @@ test("container job: SIGTERM to the runner kills the container by name and the j
   assert.match(fs.readFileSync(path.join(j.dir, "err.log"), "utf8"), /SIGTERM received; killing container/);
 });
 
-test("container job: git config/hooks planted by the job are reported and the card's host git call is skipped",
-  { skip: SKIP || (!HAVE_GIT && "git not available") }, () => {
-  const j0 = setup();
-  const plant = { [path.join(j0.repo, ".git", "hooks", "post-checkout")]: "#!/bin/sh\necho pwned\n",
-                  [path.join(j0.repo, ".git", "config")]: "[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /tmp/x.sh\n" };
-  const env = { ...j0.env, FAKE_DOCKER_PLANT: JSON.stringify(plant) };
-  spawnSync(process.execPath, [RUNNER, j0.spec], { env, encoding: "utf8", timeout: 60_000 });
-  const rec = j0.exitRecord();
-  assert.deepEqual(rec.container.newGitFindings, ["config:.git/config:core.fsmonitor", "hook:.git/hooks/post-checkout"]);
-  assert.ok(rec.warnings.some((w) => /would run on the HOST/.test(w)));
-  assert.match(fs.readFileSync(path.join(j0.dir, "err.log"), "utf8"), /new \.git findings/);
+test("container job: the entrypoint's clone failure (exit 70) gets its own warning", { skip: SKIP }, () => {
+  const j = setup({ FAKE_DOCKER_RUN_EXIT: "70", FAKE_DOCKER_KILL_GONE: "1" });
+  spawnSync(process.execPath, [RUNNER, j.spec], { env: j.env, encoding: "utf8", timeout: 60_000 });
+  const rec = j.exitRecord();
+  assert.equal(rec.exitCode, 70);
+  assert.ok(rec.warnings.some((w) => /could not clone icey2488\/container-job-scratch/.test(w)), JSON.stringify(rec.warnings));
 });
 
-test("container job: findings present BEFORE the job (baseline) are not reported again", { skip: SKIP || (!HAVE_GIT && "git not available") }, () => {
-  const j = setup();
-  fs.writeFileSync(path.join(j.repo, ".git", "hooks", "pre-push"), "#!/bin/sh\n");
-  const spec = JSON.parse(fs.readFileSync(j.spec, "utf8"));
-  spec.container.gitBaseline = ["hook:.git/hooks/pre-push"];
-  fs.writeFileSync(j.spec, JSON.stringify(spec));
+test("container job: the PR URL the job printed for its own repo is recorded; other repos' URLs are not", { skip: SKIP }, () => {
+  const j = setup({ FAKE_DOCKER_STDOUT: "see https://github.com/someone/else/pull/9\nPR: https://github.com/icey2488/container-job-scratch/pull/12\nDELEGATION-METRICS: zero calls" });
   spawnSync(process.execPath, [RUNNER, j.spec], { env: j.env, encoding: "utf8", timeout: 60_000 });
-  assert.deepEqual(j.exitRecord().container.newGitFindings, []);
+  assert.equal(j.exitRecord().container.prUrl, "https://github.com/icey2488/container-job-scratch/pull/12");
+  const k = setup({ FAKE_DOCKER_STDOUT: "no pr: https://github.com/someone/else/pull/9" });
+  spawnSync(process.execPath, [RUNNER, k.spec], { env: k.env, encoding: "utf8", timeout: 60_000 });
+  assert.equal(k.exitRecord().container.prUrl, null);
+});
+
+test("container job: the card close never runs host git, even with a startHead in meta", { skip: SKIP }, () => {
+  const bin = path.join(TMP, `gitshim-${seq}`);
+  fs.mkdirSync(bin, { recursive: true });
+  const log = path.join(bin, "git-calls.log");
+  fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\necho "$PWD $*" >> "${log}"\necho 0000000000000000000000000000000000000001\n`);
+  fs.chmodSync(path.join(bin, "git"), 0o755);
+  // A jobcard command that always succeeds, so closeCard gets as far as its delivery check.
+  const okCard = JSON.stringify([process.execPath, "-e", "process.stdout.write('card-1')"]);
+  const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, CLAUNKER_JOBCARD_CMD: okCard,
+                FAKE_DOCKER_STDOUT: "DELEGATION-METRICS: zero calls" };
+  const j = setup(env, { meta: { cardId: "card-1", startHead: "ffffffffffffffffffffffffffffffffffffffff" } });
+  spawnSync(process.execPath, [RUNNER, j.spec], { env: j.env, encoding: "utf8", timeout: 60_000 });
+  assert.equal(j.exitRecord().exitCode, 0);
+  assert.ok(!fs.existsSync(log), `host git ran for a container job: ${fs.existsSync(log) ? fs.readFileSync(log, "utf8") : ""}`);
 });

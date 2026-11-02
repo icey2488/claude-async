@@ -35,15 +35,15 @@
  * Container jobs (spec.container present; see container.mjs and docs/container-jobs.md): `command`
  * is the docker CLI and argv is a `docker run --rm --name claude-async-<jobId> ...` line, so the CLI
  * runs inside the container while this runner keeps owning the child's stdout/stderr, heartbeat,
- * exit.json, card close and Discord ping exactly as for a host job. Three additions, all inert for
- * host jobs: (1) on SIGTERM/SIGINT/SIGBREAK/SIGHUP the runner `docker kill`s the container BY NAME
- * (stopping the docker client alone leaves the container running) and then records the exit as
- * usual; (2) finish() always runs a best-effort `docker kill <name>` too, for a docker client that
- * died while its container kept going; (3) after the container exits, the repo's .git config and
- * hooks are re-audited against the baseline job-core took at launch, and anything new is reported
- * in exit.json (container.newGitFindings + a warning) and err.log. Code a job planted there would
- * run on the HOST the next time git runs in that repo, so when there are findings the card hook's
- * host-side `git rev-parse HEAD` is skipped too.
+ * exit.json, card close and Discord ping exactly as for a host job. The container clones its repo
+ * itself; no host folder is mounted, so there is no host clone to audit and the card hook never runs
+ * host git for a container job. Additions, all inert for host jobs: (1) on
+ * SIGTERM/SIGINT/SIGBREAK/SIGHUP the runner `docker kill`s the container BY NAME (stopping the
+ * docker client alone leaves the container running) and then records the exit as usual; (2)
+ * finish() always runs a best-effort `docker kill <name>` too, for a docker client that died while
+ * its container kept going; (3) exit.json gets a `container` record: the repo, the PR URL the job
+ * reported on stdout for that repo (prUrl), and a warning when the image's entrypoint could not
+ * clone the repo (exit 70).
  *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
@@ -66,7 +66,7 @@ import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
-import { killContainer, auditRepoGitState } from "./container.mjs";
+import { killContainer, extractPrUrl, ENTRY_EXIT_CLONE } from "./container.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -91,7 +91,7 @@ try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
 catch { process.exit(2); }
 
 const { command, argv, cwd, out, err, exit } = spec;
-// Container jobs only (see the header): { name, dockerBin, repo, gitBaseline }. null for host jobs.
+// Container jobs only (see the header): { name, dockerBin, repo }. null for host jobs.
 const containerSpec = spec.container && typeof spec.container === "object" ? spec.container : null;
 
 const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
@@ -170,7 +170,10 @@ const TAIL_BYTES = 64 * 1024;
 // possibly a partial/split character too), since the cut point lands mid-line rather than on a
 // line boundary. Any failure (missing file, read error, decode error, ...) yields [] -- this is
 // best-effort diagnostic data, never allowed to break exit recording.
-function readTail(file) {
+// Container jobs: how many lines of stdout extractPrUrl() looks at.
+const PR_SCAN_LINES = 400;
+
+function readTail(file, maxLines = TAIL_LINES) {
   let fd;
   try {
     fd = fs.openSync(file, "r");
@@ -190,7 +193,7 @@ function readTail(file) {
     if (!text) return [];
     const lines = text.split("\n");
     if (lines[lines.length - 1] === "") lines.pop(); // trailing newline from the last write
-    return lines.slice(-TAIL_LINES).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+    return lines.slice(-maxLines).map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
   } catch {
     return [];
   } finally {
@@ -223,19 +226,6 @@ const BG_TASKS_TERMINATED_RE = /Background tasks still running after \d+s; termi
 // guarantee it does, which is why this is a best-effort warning, not a status change.
 const BASH_AUTO_BACKGROUND_KILLED_RE = /stopped after reaching its background time limit/;
 
-// Container jobs: the repo's .git config/hooks findings that were NOT there at launch (see the
-// header). [] for host jobs and when the audit itself fails.
-function newGitFindings() {
-  if (!containerSpec || !containerSpec.repo) return [];
-  try {
-    const before = new Set(Array.isArray(containerSpec.gitBaseline) ? containerSpec.gitBaseline : []);
-    return auditRepoGitState(containerSpec.repo).filter((f) => !before.has(f));
-  } catch (e) {
-    try { fs.writeSync(errFd, `\n[job-runner] container git audit failed: ${e.message}\n`); } catch {}
-    return [];
-  }
-}
-
 // Best-effort: a runner that cannot record must still finish normally.
 function recordExit() {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
@@ -258,15 +248,17 @@ function recordExit() {
   }
   let containerRecord;
   if (containerSpec) {
-    const findings = newGitFindings();
-    containerRecord = { name: containerSpec.name, newGitFindings: findings };
-    if (findings.length) {
-      warnings.push(`the container job added git config keys or hooks to ${containerSpec.repo}/.git that would run on ` +
-        `the HOST the next time git runs there (${findings.slice(0, 10).join(", ")}); inspect and remove them before using the repo`);
-      try { fs.writeSync(errFd, `\n[job-runner] WARN: new .git findings after the container exited: ${findings.join(", ")}\n`); } catch {}
-    }
-    // 125 is docker run's own failure (daemon down, bad flag, mount refused), not the CLI's.
+    // The PR the job reported for its own repo (searched over the whole stdout tail window the runner
+    // reads, not just the last 20 lines, since the report usually ends with the delegation lines).
+    let prUrl = null;
+    try { prUrl = extractPrUrl(readTail(out, PR_SCAN_LINES), containerSpec.repo); } catch {}
+    containerRecord = { name: containerSpec.name, repo: containerSpec.repo || null, prUrl };
+    // 125 is docker run's own failure (daemon down, bad flag, image refused), not the CLI's.
     if (exitInfo.exitCode === 125) warnings.push("docker run itself failed (exit 125) before or while starting the container; see stderrTail");
+    if (exitInfo.exitCode === ENTRY_EXIT_CLONE) {
+      warnings.push(`the container could not clone ${containerSpec.repo} (exit ${ENTRY_EXIT_CLONE} from the image's entrypoint); ` +
+        "check that the bot can read the repo and that baseRef exists; see stderrTail");
+    }
   }
   const record = {
     exitCode: exitInfo.exitCode,
@@ -324,10 +316,9 @@ async function finish(code) {
     startedAt = m.startedAt || null;
     intent = m.intent || null;
   } catch {}
-  // A container job that planted host-executing git config must not get host git run over it, so the
-  // delivery check (closeCard's `git rev-parse HEAD`) is skipped by passing no startHead.
-  const gitTainted = !!(exitRecord && exitRecord.container && exitRecord.container.newGitFindings.length);
-  try { closeCard(cardId, code, cwd, gitTainted ? null : startHead, exitRecord); } catch {}
+  // Container jobs: never host git. The repo exists only inside the (now gone) container, and the
+  // delivery is exit.json's container.prUrl, so the card's HEAD-moved check is skipped entirely.
+  try { closeCard(cardId, code, cwd, containerSpec ? null : startHead, exitRecord); } catch {}
   // Discord ping: strictly best-effort and bounded (see discord-notify.mjs). Runs AFTER exit.json
   // and exit_code are both on disk, and is awaited (its own timeout bounds the wait) so the
   // process does not exit mid-request -- but nothing here can change `code` or any file already

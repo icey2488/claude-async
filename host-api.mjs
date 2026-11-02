@@ -3,7 +3,7 @@
  * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
  * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
- *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox? }
+ *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
  *   GET  /v1/jobs
  *
@@ -171,7 +171,7 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
                                   host: localHost, hostname });
         }
         if (typeof body.prompt !== "string" || !body.prompt) return send(res, 400, { error: "prompt is required", hostname });
-        for (const k of ["workFolder", "jobId", "model", "intent"]) {
+        for (const k of ["workFolder", "jobId", "model", "intent", "repo", "baseRef"]) {
           if (!optStr(body[k])) return send(res, 400, { error: `${k} must be a string`, hostname });
         }
         if (body.effort !== undefined && body.effort !== null && !EFFORTS.has(body.effort)) {
@@ -183,7 +183,7 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
         const out = await startLocal(
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
             model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,
-            sandbox: body.sandbox || undefined },
+            sandbox: body.sandbox || undefined, repo: body.repo || undefined, baseRef: body.baseRef || undefined },
           cfg, { ...startOptions, depth: req.headers[DEPTH_HEADER] ?? "" });
         return send(res, out.error ? (STATUS_BY_CODE[out.errorCode] || 400) : 200, { ...out, hostname: out.hostname || hostname });
       }

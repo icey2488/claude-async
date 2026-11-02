@@ -4,8 +4,9 @@
 #   docker build -t claude-async-job:local -f container/Dockerfile container
 #
 # Contents: Node 24 (the bridge's own major, see README "Linux receiver"), git, gh, python3 + uv,
-# ripgrep, curl, and the Claude Code CLI. NO secrets: the bot's GitHub token and the Claude Code
-# OAuth token arrive at `docker run` time through --env-file, never at build time, and nothing in
+# ripgrep, curl, the Claude Code CLI, and the job entrypoint (job-entry.sh), which clones the job's
+# repo into /workspace inside the container. No host folder is mounted read-write. NO secrets: the
+# bot's GitHub token and the Claude Code OAuth token arrive at `docker run` time through --env-file, never at build time, and nothing in
 # this file reads them. The image never contains any host path, config or credential.
 #
 # Pinning: every downloaded tool is pinned to an exact version AND a checksum. gh, uv: SHA-256 from
@@ -78,8 +79,6 @@ RUN set -eu; \
 #   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: no telemetry/error reporting/update checks, which also
 #     shrinks the phase-2 egress allowlist to the inference endpoint.
 #   GH_PROMPT_DISABLED / GIT_TERMINAL_PROMPT: never block waiting for input.
-#   /workspace is bind-mounted from the host and owned by the host user, so git's ownership check
-#     would refuse it; safe.directory is set system-wide for exactly that one path.
 ENV HOME=/home/agent \
     DISABLE_AUTOUPDATER=1 \
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -88,11 +87,19 @@ ENV HOME=/home/agent \
     GIT_TERMINAL_PROMPT=0 \
     UV_LINK_MODE=copy \
     PYTHONDONTWRITEBYTECODE=1
-RUN git config --system safe.directory /workspace \
- && git config --system init.defaultBranch main
+# git over https to github.com asks gh, which answers from GH_TOKEN in the environment: the token is
+# never written to a file or put in a remote URL. System config (root-owned, /etc/gitconfig), so it
+# is in place before the job's first command and a job's own ~/.gitconfig can only add to it.
+RUN git config --system init.defaultBranch main \
+ && git config --system credential.https://github.com.helper '!/usr/local/bin/gh auth git-credential'
+
+# The entrypoint that clones the job's repo (see job-entry.sh). CRs are stripped in case the file
+# came from a Windows checkout without the .gitattributes rule.
+COPY job-entry.sh /usr/local/bin/claude-async-job-entry
+RUN sed -i 's/\r$//' /usr/local/bin/claude-async-job-entry && chmod 0755 /usr/local/bin/claude-async-job-entry
 
 USER agent
 WORKDIR /workspace
-# No ENTRYPOINT: job-core.mjs names the command (`claude ...`) explicitly, and the smoke test runs
-# plain `git --version` etc. `docker run --init` supplies PID 1.
+# No ENTRYPOINT: job-core.mjs names the command (claude-async-job-entry <repo> <ref> -- claude ...)
+# explicitly, and the smoke test runs plain `git --version` etc. `docker run --init` supplies PID 1.
 CMD ["claude", "--version"]

@@ -8,36 +8,50 @@
  * runner still owns the child process and its stdout/stderr -- the child just happens to be the
  * docker CLI, attached to the container's stdout/stderr.
  *
- * OFF BY DEFAULT. A job runs in a container only when claude_start passes sandbox:"container", or
- * CLAUDE_ASYNC_JOB_SANDBOX is exactly "container" and the call does not pass sandbox:"host".
- * Host jobs (Windows-admin work: scheduled tasks, services, firewall checks) keep today's argv,
- * env and spec byte-for-byte.
+ * NO HOST FOLDER IS MOUNTED READ-WRITE. A container job names a GitHub repo ("owner/repo", checked
+ * against CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS) and an optional base ref. The image's entrypoint
+ * (container/job-entry.sh) clones it over https inside the container, with the bot's GH_TOKEN
+ * supplied to git by gh's credential helper (the token is never in argv or in a file), and the job
+ * works in container-local storage, pushes a branch and opens a PR as the bot. The only host
+ * mounts are two READ-ONLY ones: container/CLAUDE.md (the job rules) and this repo's hooks/ (the
+ * no-background hook). Nothing the job writes reaches the host disk except the runner's captured
+ * stdout/stderr.
  *
- * This module only builds and validates: argv, mounts, config. It never runs `docker run` itself
- * (job-runner.mjs does) and never reads secret VALUES -- the env file is passed to docker by path
- * (--env-file), and checkEnvFile() below reads it only to verify key names and format, returning
- * names, never values.
+ * OFF BY DEFAULT. A job runs in a container only when claude_start passes sandbox:"container", or
+ * CLAUDE_ASYNC_JOB_SANDBOX is exactly "container" and the call does not pass sandbox:"host". Host jobs (Windows-admin work: scheduled tasks, services, firewall checks) keep
+ * today's argv, env and spec byte-for-byte.
+ *
+ * This module builds and validates argv and config, and runs the small docker housekeeping
+ * commands (image inspect, kill). It never runs `docker run` itself (job-runner.mjs does) and
+ * never reads secret VALUES: the env file is passed to docker by path (--env-file), and
+ * checkEnvFile() reads it only to verify key names and format, returning names, never values.
  */
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { isInside, parseAllowedRoots, findUnsafeConfig } from "./scripts/publish-branch.mjs";
+import { isInside } from "./scripts/publish-branch.mjs";
 
 const REPO_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 export const SANDBOX_MODES = Object.freeze(["host", "container"]);
 export const CONTAINER_NAME_PREFIX = "claude-async-";
-// Fixed paths INSIDE the image (container/Dockerfile creates the user and directories).
+export const CONTAINER_JOB_LABEL = "claude-async.job";
+// Fixed paths INSIDE the image (container/Dockerfile creates the user, directories and entrypoint).
 export const CONTAINER_USER = "1000:1000";                       // the image's non-root "agent" user
 export const CONTAINER_HOME = "/home/agent";
-export const CONTAINER_WORKDIR = "/workspace";
+export const CONTAINER_WORKDIR = "/workspace";                   // container-local; the clone lives here
 export const CONTAINER_CLAUDE_MD = `${CONTAINER_HOME}/.claude/CLAUDE.md`; // user-level memory file
 export const CONTAINER_HOOKS_DIR = "/opt/claude-async/hooks";
+export const CONTAINER_ENTRYPOINT = "/usr/local/bin/claude-async-job-entry"; // container/job-entry.sh
 // Inline MCP config: the host's empty-mcp.json path does not exist inside the container, and the
 // CLI's --mcp-config accepts a JSON string as well as a file path.
 export const EMPTY_MCP_INLINE = JSON.stringify({ mcpServers: {} });
+// job-entry.sh's exit codes for its own failures (anything else is the CLI's).
+export const ENTRY_EXIT_USAGE = 64;
+export const ENTRY_EXIT_CLONE = 70;
+export const ENTRY_EXIT_CONFIG = 78;
 
 // The only keys the host secrets env file may hold. Anything else (notably ANTHROPIC_API_KEY,
 // which would silently switch the job from Erick's subscription to API billing -- it outranks
@@ -65,7 +79,6 @@ const DEFAULTS = Object.freeze({
   pidsLimit: "1024",
   network: "bridge",
   ollamaUrl: "http://host.docker.internal:11434",
-  autocrlf: "true",
 });
 
 const IMAGE_RE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$/;
@@ -75,6 +88,12 @@ const MEMORY_RE = /^\d{1,6}[kmg]?$/i;
 const PIDS_RE = /^\d{2,6}$/;
 const EMAIL_RE = /^[^\s<>@"]+@[^\s<>@"]+$/;
 const HTTP_URL_RE = /^http:\/\/[A-Za-z0-9.-]+(?::\d{1,5})?\/?$/;
+// GitHub: owner 1-39 chars of [A-Za-z0-9-], not starting with "-"; repo name [A-Za-z0-9._-]{1,100}.
+// The same pattern is re-checked inside the container by job-entry.sh.
+export const REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
+// A branch, tag or commit to start from. Conservative: no leading "-" (never an option), no "..",
+// no "@{", no trailing "/" or ".lock", only [A-Za-z0-9._/-]. Re-checked by job-entry.sh.
+const BASE_REF_RE = /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$/;
 // eslint-disable-next-line no-control-regex
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
@@ -100,27 +119,27 @@ export function containerName(jobId) {
 
 // ------------------------------------------------------------------------------- config ---
 
-// parseAllowedRoots() falls back to D:\code on win32 when its input is empty; here an unset or
-// empty value means "no roots", never a default.
-function rootList(value, platform) {
-  return value && String(value).trim() ? parseAllowedRoots(value, platform) : [];
+// CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS: owner/repo entries separated by commas, semicolons or
+// whitespace. Compared case-insensitively (GitHub names are). Unset/empty = no repo allowed.
+export function parseAllowedRepos(value) {
+  const entries = String(value || "").split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
+  return { repos: entries.filter((e) => REPO_RE.test(e) && !/\/\.{1,2}$/.test(e)),
+           invalid: entries.filter((e) => !REPO_RE.test(e) || /\/\.{1,2}$/.test(e)) };
 }
 
 // Read once per startJob() from the bridge's env. Nothing here is a secret: envFile is a PATH.
-export function loadContainerConfig(env = process.env, platform = process.platform) {
+export function loadContainerConfig(env = process.env) {
+  const ar = parseAllowedRepos(env.CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS);
   return {
     dockerBin: env.CLAUDE_ASYNC_DOCKER_BIN || DEFAULTS.dockerBin,
     image: env.CLAUDE_ASYNC_CONTAINER_IMAGE || DEFAULTS.image,
     envFile: env.CLAUDE_ASYNC_CONTAINER_ENV_FILE || null,
     claudeMd: env.CLAUDE_ASYNC_CONTAINER_CLAUDE_MD || path.join(REPO_DIR, "container", "CLAUDE.md"),
     hooksDir: path.join(REPO_DIR, "hooks"),
-    // REQUIRED, no default (unlike publish-branch.mjs's D:\code): the roots a container job's repo
-    // may live under. Recommended: a folder of dedicated job clones, not Erick's own working copies.
-    allowedRoots: rootList(env.CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS, platform),
-    // The claude-async checkout itself is never mountable: a job that could edit it would be editing
-    // the code the bridge and runner execute ON THE HOST, unreviewed. Extra denied roots (e.g. the
-    // live chassis) use the same separator as the allowed roots.
-    deniedRoots: [REPO_DIR, ...rootList(env.CLAUDE_ASYNC_CONTAINER_DENIED_ROOTS, platform)],
+    // REQUIRED, no default: the GitHub repos a container job may clone. Keep it to repos the bot is
+    // a collaborator on and that jobs should push to.
+    allowedRepos: ar.repos,
+    allowedReposInvalid: ar.invalid,
     cpus: env.CLAUDE_ASYNC_CONTAINER_CPUS || DEFAULTS.cpus,
     memory: env.CLAUDE_ASYNC_CONTAINER_MEMORY || DEFAULTS.memory,
     pidsLimit: env.CLAUDE_ASYNC_CONTAINER_PIDS_LIMIT || DEFAULTS.pidsLimit,
@@ -128,7 +147,6 @@ export function loadContainerConfig(env = process.env, platform = process.platfo
     gitName: env.CLAUDE_ASYNC_CONTAINER_GIT_NAME || null,
     gitEmail: env.CLAUDE_ASYNC_CONTAINER_GIT_EMAIL || null,
     ollamaUrl: env.CLAUDE_ASYNC_CONTAINER_OLLAMA_URL || DEFAULTS.ollamaUrl,
-    autocrlf: env.CLAUDE_ASYNC_CONTAINER_GIT_AUTOCRLF || DEFAULTS.autocrlf,
     // Phase 2 egress allowlist (docs/container-jobs.md): an HTTP proxy reachable on the job network.
     egressProxy: env.CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY || null,
   };
@@ -140,8 +158,8 @@ export function validateContainerConfig(cfg) {
   if (!IMAGE_RE.test(cfg.image || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_IMAGE ${JSON.stringify(cfg.image)} is not a valid image reference`);
   if (!NETWORK_RE.test(cfg.network || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_NETWORK ${JSON.stringify(cfg.network)} is not a valid network name`);
   else if (["host", "none"].includes(cfg.network.toLowerCase())) {
-    // host: the container would share the host's network namespace (every loopback service, incl.
-    // this bridge's own unauthenticated 127.0.0.1 HTTP MCP endpoint). none: no route to Anthropic.
+    // host: the container would share the host's network namespace (every loopback service).
+    // none: no route to GitHub or Anthropic.
     errs.push(`CLAUDE_ASYNC_CONTAINER_NETWORK must not be ${JSON.stringify(cfg.network)}`);
   }
   if (!CPUS_RE.test(cfg.cpus || "") || Number(cfg.cpus) <= 0) errs.push(`CLAUDE_ASYNC_CONTAINER_CPUS ${JSON.stringify(cfg.cpus)} must be a positive number like 4 or 2.5`);
@@ -154,18 +172,42 @@ export function validateContainerConfig(cfg) {
     errs.push("CLAUDE_ASYNC_CONTAINER_GIT_EMAIL (the bot account's commit email, e.g. <id>+<login>@users.noreply.github.com) must be set to a plain address");
   }
   if (!HTTP_URL_RE.test(cfg.ollamaUrl || "")) errs.push(`CLAUDE_ASYNC_CONTAINER_OLLAMA_URL ${JSON.stringify(cfg.ollamaUrl)} must be a plain http://host:port URL`);
-  if (!["true", "false", "input"].includes(cfg.autocrlf)) errs.push("CLAUDE_ASYNC_CONTAINER_GIT_AUTOCRLF must be true, false or input");
   if (cfg.egressProxy !== null && cfg.egressProxy !== undefined && !HTTP_URL_RE.test(cfg.egressProxy)) {
     errs.push(`CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY ${JSON.stringify(cfg.egressProxy)} must be a plain http://host:port URL`);
+  }
+  if ((cfg.allowedReposInvalid || []).length) {
+    errs.push(`CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS has invalid entries: ${cfg.allowedReposInvalid.map((e) => JSON.stringify(e)).join(", ")} (use owner/repo)`);
   }
   return errs;
 }
 
-// ---------------------------------------------------------------------------- host paths ---
+// ------------------------------------------------------------------------- repo + base ref ---
 
-// realpath that also resolves Windows junctions (fs.realpathSync.native does; the JS fallback
-// does not) and strips a \\?\ long-path prefix so path.win32 math and Docker both see a plain
-// drive path.
+// Returns { repo } (as the caller spelled it, after the allowlist matched case-insensitively) or
+// { error }. There is no default allowlist: unset means every container job is refused.
+export function validateRepo(repo, allowedRepos) {
+  if (typeof repo !== "string" || repo === "") return { error: "repo (\"owner/repo\") is required for a container job" };
+  if (!REPO_RE.test(repo) || /\/\.{1,2}$/.test(repo)) return { error: `repo ${JSON.stringify(repo)} is not a GitHub owner/repo name` };
+  if (!allowedRepos || allowedRepos.length === 0) {
+    return { error: "no container repos are allowed on this host (set CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS); refusing" };
+  }
+  if (!allowedRepos.some((a) => a.toLowerCase() === repo.toLowerCase())) {
+    return { error: `repo ${repo} is not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` };
+  }
+  return { repo };
+}
+
+export function validateBaseRef(ref) {
+  if (ref === undefined || ref === null || ref === "") return { ref: "" };
+  if (typeof ref !== "string" || !BASE_REF_RE.test(ref) || ref.includes("..") || ref.includes("@{") ||
+      ref.endsWith("/") || ref.endsWith(".lock") || ref.includes("//")) {
+    return { error: `baseRef ${JSON.stringify(ref)} is not a plain branch, tag or commit name` };
+  }
+  return { ref };
+}
+
+// --------------------------------------------------------------------------- secrets file ---
+
 export function stripLongPathPrefix(r) {
   return typeof r === "string" && r.startsWith("\\\\?\\") && !r.startsWith("\\\\?\\UNC\\") ? r.slice(4) : r;
 }
@@ -173,10 +215,72 @@ function defaultRealpath(p) {
   return stripLongPathPrefix(fs.realpathSync.native(p));
 }
 
-// Host path -> the `source=` value of a --mount flag. Docker Desktop accepts D:/code/x for a
-// Windows drive path; forward slashes avoid every backslash-escaping question. --mount is a CSV
-// field list, so a comma or quote in a path would split or quote it: such paths are refused rather
-// than escaped. UNC/network paths are refused (Docker Desktop file sharing covers local drives).
+function badEnvValue(v) {
+  return v.trim() === "" ? "is empty" : null;
+}
+
+// Parses the env file's text. Returns { entries: [[key, value]] } or { error } (error text never
+// carries a value).
+function parseEnvFileText(text, real) {
+  if (text.includes("\r")) return { error: `container env file ${real} has CR characters (CRLF line endings); docker would keep them in the values. Rewrite it with LF endings` };
+  const entries = [];
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) return { error: `container env file ${real} line ${i + 1} is not KEY=value (a bare KEY would copy the host's own value of that variable into the container)` };
+    const key = line.slice(0, eq);
+    if (!ENV_FILE_ALLOWED_KEYS.includes(key)) return { error: `container env file ${real} line ${i + 1}: key ${JSON.stringify(key)} is not allowed (allowed: ${ENV_FILE_ALLOWED_KEYS.join(", ")})` };
+    if (entries.some(([k]) => k === key)) return { error: `container env file ${real}: key ${key} appears twice` };
+    const bad = badEnvValue(line.slice(eq + 1));
+    if (bad) return { error: `container env file ${real}: the value of ${key} ${bad}` };
+    entries.push([key, line.slice(eq + 1)]);
+  }
+  return { entries };
+}
+
+function readEnvFileBytes(envFile, realpath) {
+  let real;
+  try { real = realpath(envFile); } catch { return { error: `container env file ${envFile} does not exist` }; }
+  try {
+    const st = fs.statSync(real);
+    if (!st.isFile()) return { error: `container env file ${real} is not a regular file` };
+    if (st.size > ENV_FILE_MAX_BYTES) return { error: `container env file ${real} is larger than ${ENV_FILE_MAX_BYTES} bytes` };
+    return { real, buf: fs.readFileSync(real) };
+  } catch (e) { return { error: `container env file ${real} is not readable (${e.code || "error"})` }; }
+}
+
+// Reads the secrets env file ONLY to check its shape. Returns { keys, real } (names only) or
+// { error }. Never returns, logs or throws a value. Docker parses the file itself at `docker run`
+// time. forbidInside: folders the file must not be in (the claude-async checkout, so it can never
+// be committed or reach the read-only hooks mount).
+export function checkEnvFile(envFile, { forbidInside = [], platform = process.platform, realpath = defaultRealpath } = {}) {
+  if (!envFile) return { error: "CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set (the host secrets file holding GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN)" };
+  const rd = readEnvFileBytes(envFile, realpath);
+  if (rd.error) return { error: rd.error };
+  for (const root of forbidInside) {
+    let r; try { r = realpath(root); } catch { continue; }
+    if (isInside(r, rd.real, platform) || r === rd.real) return { error: `container env file ${rd.real} is inside ${r}; keep secrets outside the claude-async checkout` };
+  }
+  const buf = rd.buf;
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return { error: `container env file ${rd.real} starts with a UTF-8 BOM, which docker would make part of the first key name; rewrite it without a BOM` };
+  }
+  const parsed = parseEnvFileText(buf.toString("utf8"), rd.real);
+  if (parsed.error) return { error: parsed.error };
+  const keys = parsed.entries.map(([k]) => k);
+  const missing = ENV_FILE_REQUIRED_KEYS.filter((k) => !keys.includes(k));
+  if (missing.length) return { error: `container env file ${rd.real} is missing ${missing.join(", ")}` };
+  return { keys, real: rd.real };
+}
+
+// --------------------------------------------------------------------------- host paths ---
+
+// Host path -> the `source=` value of a --mount flag (only the two read-only mounts use this now).
+// Docker Desktop accepts D:/code/x for a Windows drive path; forward slashes avoid every
+// backslash-escaping question. --mount is a CSV field list, so a comma or quote in a path would
+// split or quote it: such paths are refused rather than escaped. UNC/network paths are refused.
 export function toDockerMountSource(p, platform = process.platform) {
   if (typeof p !== "string" || p === "") return { error: "empty path" };
   if (/[,"]/.test(p) || CONTROL_RE.test(p)) return { error: `path ${JSON.stringify(p)} contains a comma, quote or control character, which --mount cannot carry safely` };
@@ -189,116 +293,48 @@ export function toDockerMountSource(p, platform = process.platform) {
   return { source: p };
 }
 
-// Validates the job's workFolder for mounting. It must resolve (realpath, so a symlink or junction
-// that points elsewhere is judged by its TARGET) strictly inside one allowed root -- not equal to the
-// root, which would mount every repo under it -- must not overlap a denied root in either direction,
-// and must be a git top-level with a real .git DIRECTORY: a linked worktree's .git file points at a
-// git dir outside the mount, so git inside the container would not work. Returns { real } or { error }.
-// realpath / fsImpl are test seams (fsImpl: statSync + lstatSync), so the win32 path logic can be
-// exercised on any OS.
-export function validateWorkFolder(workFolder, { allowedRoots, deniedRoots = [], platform = process.platform,
-                                                 realpath = defaultRealpath, fsImpl = fs } = {}) {
-  const pm = platform === "win32" ? path.win32 : path.posix;
-  if (typeof workFolder !== "string" || !workFolder) return { error: "workFolder is required for a container job" };
-  if (!pm.isAbsolute(workFolder)) return { error: `workFolder ${JSON.stringify(workFolder)} must be an absolute path for a container job` };
-  const rp = (p) => { try { return realpath(p); } catch { return null; } };
-  const roots = (allowedRoots || []).map(rp).filter(Boolean);
-  if (roots.length === 0) return { error: "no container allowed roots exist (set CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS); refusing to mount anything" };
-  const real = rp(workFolder);
-  if (!real) return { error: `workFolder ${JSON.stringify(workFolder)} does not exist` };
-  let isDir = false;
-  try { isDir = fsImpl.statSync(real).isDirectory(); } catch {}
-  if (!isDir) return { error: `workFolder ${JSON.stringify(workFolder)} is not a directory` };
-  const inside = roots.find((r) => isInside(r, real, platform));
-  if (!inside) return { error: `workFolder ${real} (realpath of ${workFolder}) is outside the container allowed roots (${roots.join(", ")})` };
-  const same = (a, b) => (platform === "win32" ? pm.resolve(a).toLowerCase() === pm.resolve(b).toLowerCase() : pm.resolve(a) === pm.resolve(b));
-  if (same(inside, real)) return { error: `workFolder ${real} is an allowed root itself; mount a single repo under it, not the whole root` };
-  for (const d of (deniedRoots || []).map(rp).filter(Boolean)) {
-    if (isInside(d, real, platform) || isInside(real, d, platform)) {
-      return { error: `workFolder ${real} overlaps the denied path ${d} (the claude-async checkout, or CLAUDE_ASYNC_CONTAINER_DENIED_ROOTS); use a separate clone` };
-    }
-  }
-  let gitStat = null;
-  try { gitStat = fsImpl.lstatSync(pm.join(real, ".git")); } catch {}
-  if (!gitStat) return { error: `workFolder ${real} is not a git repository top-level (no .git); container jobs mount exactly one repo` };
-  if (!gitStat.isDirectory()) return { error: `workFolder ${real} has a .git FILE (a linked worktree or submodule) whose git dir is outside the mount; use a full clone` };
-  return { real };
-}
-
-// Reads the secrets env file ONLY to check its shape. Returns { keys } (names only) or { error }.
-// Never returns, logs or throws a value. Docker parses the file itself at `docker run` time.
-export function checkEnvFile(envFile, { forbidInside = [], platform = process.platform, realpath = defaultRealpath } = {}) {
-  if (!envFile) return { error: "CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set (the host secrets file holding GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN)" };
-  let real;
-  try { real = realpath(envFile); } catch { return { error: `container env file ${envFile} does not exist` }; }
-  for (const root of forbidInside) {
-    let r; try { r = realpath(root); } catch { continue; }
-    if (isInside(r, real, platform)) return { error: `container env file ${real} is inside ${r}; keep secrets outside every repo and allowed root` };
-  }
-  let buf;
-  try {
-    const st = fs.statSync(real);
-    if (!st.isFile()) return { error: `container env file ${real} is not a regular file` };
-    if (st.size > ENV_FILE_MAX_BYTES) return { error: `container env file ${real} is larger than ${ENV_FILE_MAX_BYTES} bytes` };
-    buf = fs.readFileSync(real);
-  } catch (e) { return { error: `container env file ${real} is not readable (${e.code || "error"})` }; }
-  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
-    return { error: `container env file ${real} starts with a UTF-8 BOM, which docker would make part of the first key name; rewrite it without a BOM` };
-  }
-  const text = buf.toString("utf8");
-  if (text.includes("\r")) return { error: `container env file ${real} has CR characters (CRLF line endings); docker would keep them in the values. Rewrite it with LF endings` };
-  const keys = [];
-  const lines = text.split("\n");
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.trim() === "" || line.trimStart().startsWith("#")) continue;
-    const eq = line.indexOf("=");
-    if (eq <= 0) return { error: `container env file ${real} line ${i + 1} is not KEY=value (a bare KEY would copy the host's own value of that variable into the container)` };
-    const key = line.slice(0, eq);
-    if (!ENV_FILE_ALLOWED_KEYS.includes(key)) return { error: `container env file ${real} line ${i + 1}: key ${JSON.stringify(key)} is not allowed (allowed: ${ENV_FILE_ALLOWED_KEYS.join(", ")})` };
-    if (keys.includes(key)) return { error: `container env file ${real}: key ${key} appears twice` };
-    if (line.slice(eq + 1).trim() === "") return { error: `container env file ${real}: ${key} is empty` };
-    keys.push(key);
-  }
-  const missing = ENV_FILE_REQUIRED_KEYS.filter((k) => !keys.includes(k));
-  if (missing.length) return { error: `container env file ${real} is missing ${missing.join(", ")}` };
-  return { keys, real };
+function statKind(p, fsImpl) {
+  try { const st = fsImpl.statSync(p); return st.isDirectory() ? "dir" : st.isFile() ? "file" : "other"; } catch { return null; }
 }
 
 // Validates everything a container job needs on the host, before the job dir exists. Returns
-// { plan } with the resolved paths, or { error }. resolveBin is job-core's resolveBinary().
-export function planContainerJob({ jobId, workFolder, cfg, platform = process.platform, resolveBin,
-                                   realpath = defaultRealpath }) {
+// { plan } or { error }. resolveBin is job-core's resolveBinary(). workFolder must be absent: a
+// container job never runs in (or mounts) a host folder.
+export function planContainerJob({ jobId, repo, baseRef, workFolder, cfg, platform = process.platform, resolveBin,
+                                   realpath = defaultRealpath, fsImpl = fs }) {
+  if (workFolder !== undefined && workFolder !== null && workFolder !== "") {
+    return { error: "container jobs do not take workFolder (no host folder is mounted); pass repo (\"owner/repo\") and optionally baseRef instead" };
+  }
   const cfgErrs = validateContainerConfig(cfg);
   if (cfgErrs.length) return { error: `container mode misconfigured: ${cfgErrs.join("; ")}` };
+  const rv = validateRepo(repo, cfg.allowedRepos);
+  if (rv.error) return { error: rv.error };
+  const bv = validateBaseRef(baseRef);
+  if (bv.error) return { error: bv.error };
   const dockerBin = resolveBin ? resolveBin(cfg.dockerBin) : cfg.dockerBin;
   if (!dockerBin) return { error: `docker binary ${JSON.stringify(cfg.dockerBin)} not found (set CLAUDE_ASYNC_DOCKER_BIN to docker.exe's full path)` };
-  const wf = validateWorkFolder(workFolder, { allowedRoots: cfg.allowedRoots, deniedRoots: cfg.deniedRoots, platform, realpath });
-  if (wf.error) return { error: wf.error };
-  const ef = checkEnvFile(cfg.envFile, { forbidInside: [wf.real, ...cfg.allowedRoots], platform, realpath });
+  const ef = checkEnvFile(cfg.envFile, { forbidInside: [REPO_DIR], platform, realpath });
   if (ef.error) return { error: ef.error };
-  const mdReal = (() => { try { return realpath(cfg.claudeMd); } catch { return null; } })();
-  if (!mdReal || !fs.statSync(mdReal).isFile()) return { error: `container CLAUDE.md ${cfg.claudeMd} does not exist` };
-  if (isInside(wf.real, mdReal, platform)) return { error: `container CLAUDE.md ${mdReal} is inside the mounted repo, where the job could rewrite its own rules` };
-  const hooksReal = (() => { try { return realpath(cfg.hooksDir); } catch { return null; } })();
-  if (!hooksReal) return { error: `hooks dir ${cfg.hooksDir} does not exist` };
+  const rp = (p) => { try { return realpath(p); } catch { return null; } };
+  const mdReal = rp(cfg.claudeMd);
+  if (!mdReal || statKind(mdReal, fsImpl) !== "file") return { error: `container CLAUDE.md ${cfg.claudeMd} does not exist` };
+  const hooksReal = rp(cfg.hooksDir);
+  if (!hooksReal || statKind(hooksReal, fsImpl) !== "dir") return { error: `hooks dir ${cfg.hooksDir} does not exist` };
   const mounts = {};
-  for (const [k, p] of [["workFolder", wf.real], ["claudeMd", mdReal], ["hooks", hooksReal]]) {
+  for (const [k, p] of [["claudeMd", mdReal], ["hooks", hooksReal]]) {
     const m = toDockerMountSource(p, platform);
     if (m.error) return { error: `cannot mount ${k}: ${m.error}` };
     mounts[k] = m.source;
   }
   return { plan: { jobId, name: containerName(jobId), dockerBin, image: cfg.image, envFile: ef.real,
-                   envFileKeys: ef.keys, workFolderReal: wf.real, mounts, cfg } };
+                   envFileKeys: ef.keys, repo: rv.repo, baseRef: bv.ref, mounts, cfg } };
 }
 
 // ------------------------------------------------------------------------------- argv ---
 
 // The --settings object for the CLI INSIDE the container: the same catch-all no-background hook
 // job-core.mjs wires for host jobs (buildNoBackgroundHookSettings), but pointing at the image's
-// node and the read-only hooks mount. The job-tool-gate and Ollama-guard hooks are host-only (the
-// gate needs the host's claunker-hermes checkout; the Ollama guard exists for dontAsk mode, which
-// container jobs don't use).
+// node and the read-only hooks mount. The job-tool-gate and Ollama-guard hooks are host-only.
 export function buildContainerSettings({ ultracode = false } = {}) {
   const s = {
     hooks: {
@@ -312,19 +348,18 @@ export function buildContainerSettings({ ultracode = false } = {}) {
   return s;
 }
 
-// The CLI argv inside the container. --dangerously-skip-permissions is deliberate here: the
-// container is the permission boundary (docs/container-jobs.md, "Why skip-permissions inside").
-// The prompt goes last, after "--", and the model is bound with "=", so neither can ever be parsed
-// as a CLI option no matter what the caller sent.
+// The CLI argv inside the container. --dangerously-skip-permissions is deliberate: the container is
+// the permission boundary (docs/container-jobs.md, "Why skip-permissions inside"). The prompt goes
+// last, after "--", and the model is bound with "=", so neither can ever be parsed as a CLI option.
 export function buildContainerCliArgv({ prompt, model, effortArgv = [], settings }) {
   return ["-p", "--dangerously-skip-permissions", "--strict-mcp-config", "--mcp-config", EMPTY_MCP_INLINE,
           `--model=${model}`, ...effortArgv, "--settings", JSON.stringify(settings), "--", prompt];
 }
 
-// -e NAME=value pairs for the container: the allowlisted job env, git identity, Ollama, and (phase
-// 2) the egress proxy. Never secrets (those come from --env-file), never a bare -e NAME (which
-// would copy the docker CLI process's own host value in).
-export function buildContainerEnv({ extraEnv = {}, cfg, jobId }) {
+// -e NAME=value pairs for the container: the allowlisted job env, git identity, the repo, Ollama,
+// and (phase 2) the egress proxy. Never secrets (those come from --env-file), never a bare -e NAME
+// (which would copy the docker CLI process's own host value in).
+export function buildContainerEnv({ extraEnv = {}, cfg, jobId, repo = null, baseRef = "" }) {
   const env = [];
   const add = (k, v) => {
     if (SECRET_NAME_RE.test(k)) throw new Error(`refusing to pass ${k} on the docker command line; secrets go through --env-file`);
@@ -333,14 +368,12 @@ export function buildContainerEnv({ extraEnv = {}, cfg, jobId }) {
   };
   add("CLAUDE_ASYNC_JOB_ID", jobId);
   add("CLAUDE_ASYNC_SANDBOX", "container");
+  if (repo) add("CLAUDE_ASYNC_REPO", repo);
+  if (baseRef) add("CLAUDE_ASYNC_BASE_REF", baseRef);
   for (const k of FORWARDED_ENV_KEYS) if (extraEnv[k] !== undefined) add(k, extraEnv[k]);
-  // Commits are the bot's, even if the repo's local config names someone else.
+  // Commits are the bot's.
   add("GIT_AUTHOR_NAME", cfg.gitName); add("GIT_COMMITTER_NAME", cfg.gitName);
   add("GIT_AUTHOR_EMAIL", cfg.gitEmail); add("GIT_COMMITTER_EMAIL", cfg.gitEmail);
-  // A Windows checkout made with core.autocrlf=true (Git for Windows' default, set in the HOST's
-  // global config, which the container doesn't see) has CRLF in the working tree; without the same
-  // setting inside, Linux git reports every text file as modified.
-  add("GIT_CONFIG_COUNT", "1"); add("GIT_CONFIG_KEY_0", "core.autocrlf"); add("GIT_CONFIG_VALUE_0", cfg.autocrlf);
   add("OLLAMA_HOST", cfg.ollamaUrl);
   add("CLAUDE_ASYNC_OLLAMA_URL", cfg.ollamaUrl);
   if (cfg.egressProxy) {
@@ -359,7 +392,7 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
   const hostCpus = plan.hostCpus || os.availableParallelism?.() || os.cpus().length || 1;
   const cpus = String(Math.min(Number(cfg.cpus), hostCpus));
   const argv = [
-    "run", "--rm", "--name", name, "--label", `claude-async.job=${jobId}`,
+    "run", "--rm", "--name", name, "--label", `${CONTAINER_JOB_LABEL}=${jobId}`,
     "--init",                                   // PID 1 reaps the CLI's children and forwards signals
     "--user", CONTAINER_USER,
     "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
@@ -368,13 +401,13 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
     "--add-host", "host.docker.internal:host-gateway",
     "--env-file", plan.envFile,
   ];
-  for (const [k, v] of buildContainerEnv({ extraEnv, cfg, jobId })) argv.push("-e", `${k}=${v}`);
+  for (const [k, v] of buildContainerEnv({ extraEnv, cfg, jobId, repo: plan.repo, baseRef: plan.baseRef })) argv.push("-e", `${k}=${v}`);
   argv.push(
-    "--mount", `type=bind,source=${mounts.workFolder},target=${CONTAINER_WORKDIR}`,
     "--mount", `type=bind,source=${mounts.claudeMd},target=${CONTAINER_CLAUDE_MD},readonly`,
     "--mount", `type=bind,source=${mounts.hooks},target=${CONTAINER_HOOKS_DIR},readonly`,
     "--workdir", CONTAINER_WORKDIR,
     plan.image,
+    CONTAINER_ENTRYPOINT, plan.repo, plan.baseRef || "", "--",
     "claude", ...cliArgv,
   );
   return argv;
@@ -396,7 +429,7 @@ export function checkDockerImage({ dockerBin, image, spawnSync = nodeSpawnSync, 
   return { ok: true, imageId: String(r.stdout || "").trim() };
 }
 
-// ------------------------------------------------------------------------- kill / audit ---
+// ----------------------------------------------------------------------------- kill ---
 
 export function buildKillArgv(name) {
   if (typeof name !== "string" || !name.startsWith(CONTAINER_NAME_PREFIX)) throw new Error(`not a claude-async container name: ${name}`);
@@ -417,27 +450,19 @@ export function killContainer({ dockerBin, name, spawnSync = nodeSpawnSync, time
   return { ok: false, error: err.slice(0, 300) || `docker kill exited ${r.status}` };
 }
 
-// The repo's .git is mounted read-write, and the host later runs git in that same repo (the card
-// hook's `git rev-parse HEAD`, and Erick himself). A job could plant config that executes on the
-// HOST (core.fsmonitor, core.hooksPath, filter drivers, include.path...) or a hook script. This
-// lists what is there now (publish-branch.mjs's allowlist decides what is "unsafe"); the runner
-// compares it with the same list taken before the job started and reports anything new.
-export function auditRepoGitState(repo, { gitBin = "git", spawnSync = nodeSpawnSync } = {}) {
-  const findings = [];
-  const gitDir = path.join(repo, ".git");
-  for (const file of ["config", "config.worktree"]) {
-    const f = path.join(gitDir, file);
-    if (!fs.existsSync(f)) continue;
-    // --file reads that one file and nothing else: no repo discovery, no fsmonitor, no hooks.
-    // cwd outside the repo, so git never discovers (and reads the config of) the repo under audit.
-    const r = spawnSync(gitBin, ["config", "--file", f, "--list", "--name-only"],
-      { encoding: "utf8", timeout: 10_000, windowsHide: true, cwd: os.tmpdir(), env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
-    if (r.error || r.status !== 0) { findings.push(`unreadable:.git/${file}`); continue; }
-    const scoped = String(r.stdout).split(/\r?\n/).filter(Boolean).map((k) => `local\t${k}`).join("\n");
-    for (const bad of findUnsafeConfig(scoped)) findings.push(`config:.git/${file}:${bad.replace(/^local:/, "")}`);
+// ----------------------------------------------------------------------- stdout: PR URL ---
+
+// The PR URL the job reported, if it names the job's own repo (or a fork's PR against it shows the
+// upstream URL, which is the same thing). Read off stdout by the runner; the card hook no longer
+// runs host git for container jobs, so this is how claude_check shows what was delivered.
+export function extractPrUrl(lines, repo) {
+  if (!repo || !Array.isArray(lines)) return null;
+  const want = `https://github.com/${repo}/pull/`.toLowerCase();
+  let found = null;
+  for (const l of lines) {
+    for (const m of String(l).matchAll(/https:\/\/github\.com\/[A-Za-z0-9-]+\/[A-Za-z0-9._-]+\/pull\/\d+/g)) {
+      if (m[0].toLowerCase().startsWith(want)) found = m[0];
+    }
   }
-  let hooks = [];
-  try { hooks = fs.readdirSync(path.join(gitDir, "hooks")); } catch {}
-  for (const h of hooks) if (!h.endsWith(".sample")) findings.push(`hook:.git/hooks/${h}`);
-  return findings.sort();
+  return found;
 }

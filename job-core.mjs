@@ -26,7 +26,7 @@ import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
-         buildContainerCliArgv, buildDockerRunArgv, auditRepoGitState, killContainer } from "./container.mjs";
+         buildContainerCliArgv, buildDockerRunArgv, killContainer } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -932,8 +932,10 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // for the post-launch meta.json write, see writeNewMeta()). Container-mode seams (tests only):
 // sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), containerConfig (replaces
 // loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight).
+// repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
+// start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox }, opts = {}) {
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef }, opts = {}) {
   const hostname = os.hostname();
   const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
   const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
@@ -944,11 +946,15 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
 
   const sb = resolveSandbox(sandbox, opts.sandboxDefault !== undefined ? opts.sandboxDefault : SANDBOX_ENV_DEFAULT);
   if (sb.error) return fail("invalid", sb.error);
-  // Container mode: validate the repo mount, secrets file, config, docker binary and image now,
-  // before anything is written (see container.mjs's planContainerJob()).
+  if (sb.mode === "host" && ((repo !== undefined && repo !== null && repo !== "") || (baseRef !== undefined && baseRef !== null && baseRef !== ""))) {
+    return fail("invalid", "repo and baseRef are only for container jobs (sandbox: \"container\"); a host job runs in workFolder");
+  }
+  // Container mode: validate the repo name, secrets file, config, docker binary and image now,
+  // before anything is written (see container.mjs's planContainerJob()). No host folder is
+  // involved: the job clones `repo` inside the container.
   let containerPlan = null;
   if (sb.mode === "container") {
-    const planned = planContainerJob({ jobId: id, workFolder: cwd, cfg: opts.containerConfig || loadContainerConfig(),
+    const planned = planContainerJob({ jobId: id, repo, baseRef, workFolder, cfg: opts.containerConfig || loadContainerConfig(),
                                        resolveBin: (b) => resolveBinary(b) });
     if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
     const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
@@ -956,7 +962,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     containerPlan = planned.plan;
   }
 
-  const pf = preflight({ claudeBin: containerPlan ? containerPlan.dockerBin : opts.claudeBin, cwd, hostLabel });
+  // A container job has no workFolder; preflight only checks the docker binary (JOB_ROOT always exists).
+  const pf = preflight({ claudeBin: containerPlan ? containerPlan.dockerBin : opts.claudeBin,
+                         cwd: containerPlan ? JOB_ROOT : cwd, hostLabel });
   if (pf.error) return fail("preflight", pf.error);
 
   const d = opts.depth !== undefined ? parseDepth(opts.depth) : parseDepth(process.env[DEPTH_ENV]);
@@ -1092,6 +1100,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // because the container is the boundary); the host argv built above is not used.
   let launchCommand = opts.claudeBin || CLAUDE_BIN;
   let launchArgv = argv;
+  // The docker client runs in the job's own dir: a container job has no host folder at all.
+  const launchCwd = containerPlan ? p.d : cwd;
   const launchExtra = {};
   if (containerPlan) {
     const effortArgv = eff === "ultracode" ? ["--effort", "xhigh"] : FLAG_EFFORT.has(eff) ? ["--effort", eff] : [];
@@ -1099,29 +1109,31 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                                             settings: buildContainerSettings({ ultracode: eff === "ultracode" }) });
     launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
     launchCommand = containerPlan.dockerBin;
-    // gitBaseline: the repo's unsafe git config keys / hooks BEFORE the job, so the runner can
-    // report (and the card hook can avoid running host git over) anything the job adds.
-    launchExtra.container = { name: containerPlan.name, dockerBin: containerPlan.dockerBin,
-                              repo: containerPlan.workFolderReal, gitBaseline: auditRepoGitState(containerPlan.workFolderReal) };
+    launchExtra.container = { name: containerPlan.name, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo };
   }
   const { pid, pidSource, jobMembership, launchPath } =
-    await (opts.launch || launch)(p, launchCommand, launchArgv, cwd, extraEnv, launchExtra);
+    await (opts.launch || launch)(p, launchCommand, launchArgv, launchCwd, extraEnv, launchExtra);
 
-  const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
+  // Container jobs: no host git, anywhere (noGit). There is no host clone to look at, and the
+  // delivery is the PR the job reports on stdout (job-runner.mjs records it in exit.json).
+  const { cardId, startHead, error: cardError } = containerPlan
+    ? mintCard(id, launchCwd, resolvedModel, eff, prompt, intent, { noGit: true })
+    : mintCard(id, cwd, resolvedModel, eff, prompt, intent);
   // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
   // ping's title (discord-notify.mjs) can use the same value the dispatch card shows -- omitted
   // entirely (no key) when no intent was given, rather than stored as null/empty.
   const persistedIntent = boundIntent(intent);
   const meta = { jobId: id, ...(opts.host ? { host: opts.host } : {}), hostname,
                  pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
-                 workFolder: cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
+                 workFolder: containerPlan ? null : cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null,
                  ...(persistedIntent ? { intent: persistedIntent } : {}),
                  ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
-                       image: containerPlan.image, dockerBin: containerPlan.dockerBin } } : {}) };
+                       image: containerPlan.image, dockerBin: containerPlan.dockerBin,
+                       repo: containerPlan.repo, baseRef: containerPlan.baseRef || null } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];

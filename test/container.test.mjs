@@ -31,33 +31,32 @@ const BOT = { CLAUDE_ASYNC_CONTAINER_GIT_NAME: "claunker-bot",
 const SECRET_GH = "ghp_TESTSECRETVALUE0000000000000000000000";
 const SECRET_OAUTH = "sk-ant-oat01-TESTSECRETVALUE";
 
-// A fixture tree: <TMP>/fx-N/{roots/code/<repo>, secrets/container.env, outside/<repo>}.
+const REPO = "icey2488/container-job-scratch";
+
+// A fixture tree: <TMP>/fx-N/secrets/container.env, plus a plain host folder (never mounted).
 function fixture() {
   const base = fs.mkdtempSync(path.join(TMP, "fx-"));
-  const root = path.join(base, "roots", "code");
-  const repo = path.join(root, "scratch-repo");
-  fs.mkdirSync(path.join(repo, ".git", "hooks"), { recursive: true });
-  const outside = path.join(base, "outside", "other-repo");
-  fs.mkdirSync(path.join(outside, ".git"), { recursive: true });
+  const hostDir = path.join(base, "host-folder");
+  fs.mkdirSync(path.join(hostDir, ".git"), { recursive: true });
   const secrets = path.join(base, "secrets");
   fs.mkdirSync(secrets);
   const envFile = path.join(secrets, "container.env");
   fs.writeFileSync(envFile, `GH_TOKEN=${SECRET_GH}\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
-  const env = { ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS: root, CLAUDE_ASYNC_CONTAINER_ENV_FILE: envFile };
-  return { base, root, repo, outside, envFile, env, cfg: c.loadContainerConfig(env, process.platform) };
+  const env = { ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS: `${REPO}, icey2488/claude-async`, CLAUDE_ASYNC_CONTAINER_ENV_FILE: envFile };
+  return { base, hostDir, envFile, env, cfg: c.loadContainerConfig(env) };
 }
 
 const realpath = (p) => fs.realpathSync.native(p);
 
-function planFor(fx, overrides = {}) {
-  const r = c.planContainerJob({ jobId: "claunker.t-20261101-abcd1234", workFolder: fx.repo,
+function planFor(fx, overrides = {}, { repo = REPO, baseRef } = {}) {
+  const r = c.planContainerJob({ jobId: "claunker.t-20261101-abcd1234", repo, baseRef,
                                  cfg: { ...fx.cfg, ...overrides }, resolveBin: (b) => b });
   assert.ok(!r.error, r.error);
   return { ...r.plan, hostCpus: 16 }; // pin the CPU clamp so argv doesn't depend on the test machine
 }
 
-function sampleArgv(fx, { extraEnv = {}, prompt = "do the thing", cfg = {} } = {}) {
-  const plan = planFor(fx, cfg);
+function sampleArgv(fx, { extraEnv = {}, prompt = "do the thing", cfg = {}, baseRef } = {}) {
+  const plan = planFor(fx, cfg, { baseRef });
   const cliArgv = c.buildContainerCliArgv({ prompt, model: "claude-sonnet-5", effortArgv: ["--effort", "medium"],
                                             settings: c.buildContainerSettings() });
   return { plan, argv: c.buildDockerRunArgv({ plan, cliArgv, extraEnv }) };
@@ -108,11 +107,13 @@ test("docker run argv: exact isolation and lifecycle flags are present", () => {
   assert.equal(valueAfter(argv, "--add-host"), "host.docker.internal:host-gateway");
   assert.equal(valueAfter(argv, "--workdir"), "/workspace");
   assert.ok(!argv.includes("--privileged"));
+  assert.ok(!argv.includes("--volume") && !argv.includes("-v"));
   assert.ok(!argv.some((a) => /^--cap-add/.test(a)));
   assert.ok(!argv.some((a) => /^--pull/.test(a)), "never pulls");
   const img = argv.indexOf("claude-async-job:local");
   assert.ok(img > 0);
-  assert.equal(argv[img + 1], "claude", "the CLI runs inside the image");
+  assert.deepEqual(argv.slice(img + 1, img + 6), ["/usr/local/bin/claude-async-job-entry", REPO, "", "--", "claude"],
+    "the image's entrypoint clones the repo, then execs the CLI");
   assert.ok(argv.slice(img).includes("--dangerously-skip-permissions"));
 });
 
@@ -125,15 +126,27 @@ test("docker run argv: resource limits and image come from config", () => {
   assert.ok(argv.includes("claude-async-job:v2"));
 });
 
-test("docker run argv: exactly three bind mounts; repo rw at /workspace, CLAUDE.md and hooks read-only", () => {
+test("docker run argv: NO read-write host mount; only CLAUDE.md and hooks, both read-only", () => {
   const fx = fixture();
-  const { argv, plan } = sampleArgv(fx);
+  const { argv } = sampleArgv(fx);
   const mounts = allValuesAfter(argv, "--mount");
-  assert.equal(mounts.length, 3);
-  assert.equal(mounts[0], `type=bind,source=${plan.mounts.workFolder},target=/workspace`);
-  assert.match(mounts[1], /^type=bind,source=.+CLAUDE\.md,target=\/home\/agent\/\.claude\/CLAUDE\.md,readonly$/);
-  assert.match(mounts[2], /^type=bind,source=.+hooks,target=\/opt\/claude-async\/hooks,readonly$/);
-  assert.ok(!argv.includes("-v") && !argv.includes("--volume") && !argv.some((a) => /^--volumes-from/.test(a)));
+  assert.equal(mounts.length, 2);
+  assert.match(mounts[0], /^type=bind,source=.+CLAUDE\.md,target=\/home\/agent\/\.claude\/CLAUDE\.md,readonly$/);
+  assert.match(mounts[1], /^type=bind,source=.+hooks,target=\/opt\/claude-async\/hooks,readonly$/);
+  for (const m of mounts) assert.ok(m.endsWith(",readonly"), m);
+  assert.ok(!mounts.some((m) => /target=\/workspace/.test(m)), "the workspace is container-local, never a host folder");
+  assert.ok(!argv.includes("-v") && !argv.includes("--volume") && !argv.some((a) => /^--volumes-from|^--tmpfs/.test(a)));
+});
+
+test("docker run argv: repo and baseRef reach the entrypoint as argv and the job as env", () => {
+  const fx = fixture();
+  const { argv } = sampleArgv(fx, { baseRef: "release/1.2" });
+  const i = argv.indexOf("/usr/local/bin/claude-async-job-entry");
+  assert.deepEqual(argv.slice(i, i + 5), ["/usr/local/bin/claude-async-job-entry", REPO, "release/1.2", "--", "claude"]);
+  const env = allValuesAfter(argv, "-e");
+  assert.ok(env.includes(`CLAUDE_ASYNC_REPO=${REPO}`));
+  assert.ok(env.includes("CLAUDE_ASYNC_BASE_REF=release/1.2"));
+  assert.ok(!env.some((e) => e.startsWith("GIT_CONFIG_")), "no host-checkout git config (autocrlf) is needed for a Linux clone");
 });
 
 test("docker run argv: no Docker socket or daemon pipe anywhere", () => {
@@ -170,7 +183,6 @@ test("docker run argv: only allowlisted job env is forwarded (HERMES_HOME etc. s
   assert.equal(env.GIT_AUTHOR_NAME, "claunker-bot");
   assert.equal(env.GIT_COMMITTER_EMAIL, "123+claunker-bot@users.noreply.github.com");
   assert.equal(env.OLLAMA_HOST, "http://host.docker.internal:11434");
-  assert.equal(env.GIT_CONFIG_KEY_0, "core.autocrlf");
   assert.equal(env.CLAUDE_ASYNC_JOB_ID, "claunker.t-20261101-abcd1234");
 });
 
@@ -228,146 +240,65 @@ test("toDockerMountSource: Windows drive paths become forward-slash paths Docker
   assert.ok(c.toDockerMountSource("srv/code", "linux").error);
 });
 
-// A fake win32 filesystem: realpath resolves junctions/symlinks listed in `links` (and adds the
-// \\?\ prefix fs.realpathSync.native returns for long paths), stat/lstat answer from `dirs`.
-function fakeWin({ dirs, gitDirs = [], gitFiles = [], links = {} }) {
-  const lc = (p) => path.win32.resolve(p).toLowerCase();
-  const dirSet = new Set(dirs.map(lc));
-  const realpath = (p) => {
-    let r = path.win32.resolve(p);
-    for (const [from, to] of Object.entries(links)) {
-      if (lc(r) === lc(from) || lc(r).startsWith(lc(from) + "\\")) r = to + r.slice(from.length);
-    }
-    if (!dirSet.has(lc(r)) && !gitDirs.concat(gitFiles).some((g) => lc(g) === lc(r))) throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-    return "\\\\?\\" + r;
-  };
-  const st = (isDir) => ({ isDirectory: () => isDir, isFile: () => !isDir });
-  const fsImpl = {
-    statSync: (p) => { if (dirSet.has(lc(p))) return st(true); throw new Error("ENOENT"); },
-    lstatSync: (p) => {
-      if (gitDirs.some((g) => lc(g) === lc(p))) return st(true);
-      if (gitFiles.some((g) => lc(g) === lc(p))) return st(false);
-      throw new Error("ENOENT");
-    },
-  };
-  return { realpath: (p) => c.stripLongPathPrefix(realpath(p)), fsImpl };
-}
-
 test("stripLongPathPrefix: drops \\\\?\\ from drive paths, keeps UNC and plain paths", () => {
   assert.equal(c.stripLongPathPrefix("\\\\?\\D:\\code\\x"), "D:\\code\\x");
   assert.equal(c.stripLongPathPrefix("\\\\?\\UNC\\srv\\share"), "\\\\?\\UNC\\srv\\share");
   assert.equal(c.stripLongPathPrefix("D:\\code"), "D:\\code");
 });
 
-test("validateWorkFolder (win32): D:\\code\\x accepted case-insensitively, \\\\?\\ prefix stripped", () => {
-  const w = fakeWin({ dirs: ["D:\\code", "D:\\code\\scratch"], gitDirs: ["D:\\code\\scratch\\.git"] });
-  const r = c.validateWorkFolder("d:\\CODE\\Scratch", { allowedRoots: ["D:\\code"], platform: "win32", ...w });
-  assert.equal(r.error, undefined, r.error);
-  assert.equal(r.real.toLowerCase(), "d:\\code\\scratch");
-  assert.deepEqual(c.toDockerMountSource(r.real, "win32").source.toLowerCase(), "d:/code/scratch");
+// ------------------------------------------------------------------------- repo + base ref ---
+
+test("validateRepo: owner/repo must be well-formed and in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS (case-insensitive)", () => {
+  const allowed = ["icey2488/container-job-scratch"];
+  assert.deepEqual(c.validateRepo("icey2488/container-job-scratch", allowed), { repo: "icey2488/container-job-scratch" });
+  assert.deepEqual(c.validateRepo("ICEY2488/Container-Job-Scratch", allowed), { repo: "ICEY2488/Container-Job-Scratch" });
+  assert.match(c.validateRepo("icey2488/claude-async", allowed).error, /not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS/);
+  for (const bad of ["", "icey2488", "icey2488/", "/repo", "-x/repo", "a/b/c", "icey2488/..", "icey2488/.",
+                     "icey2488/re po", "https://github.com/icey2488/x", "icey2488/x;rm", "git@github.com:a/b", 7]) {
+    assert.ok(c.validateRepo(bad, ["icey2488/x"]).error, `refuses ${JSON.stringify(bad)}`);
+  }
+  assert.match(c.validateRepo("icey2488/x", []).error, /no container repos are allowed/, "no default allowlist");
 });
 
-test("validateWorkFolder (win32): a junction inside D:\\code pointing at C:\\Users is refused", () => {
-  const w = fakeWin({ dirs: ["D:\\code", "C:\\Users\\Raide"], gitDirs: ["C:\\Users\\Raide\\.git"],
-                      links: { "D:\\code\\innocent": "C:\\Users\\Raide" } });
-  const r = c.validateWorkFolder("D:\\code\\innocent", { allowedRoots: ["D:\\code"], platform: "win32", ...w });
-  assert.match(r.error, /outside the container allowed roots/);
-  assert.match(r.error, /C:\\Users\\Raide/);
+test("parseAllowedRepos: comma/semicolon/space separated; bad entries are surfaced as a config error", () => {
+  assert.deepEqual(c.parseAllowedRepos("a/b, c/d;e/f  g/h").repos, ["a/b", "c/d", "e/f", "g/h"]);
+  assert.deepEqual(c.parseAllowedRepos(undefined).repos, []);
+  const cfg = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS: "a/b, not-a-repo, x/*" });
+  assert.deepEqual(cfg.allowedRepos, ["a/b"]);
+  assert.match(c.validateContainerConfig(cfg).join(" "), /ALLOWED_REPOS has invalid entries.*not-a-repo.*x\/\*/);
 });
 
-test("validateWorkFolder (win32): sibling-prefix and other-drive paths are refused", () => {
-  const w = fakeWin({ dirs: ["D:\\code", "D:\\code-private\\x", "E:\\code\\x"],
-                      gitDirs: ["D:\\code-private\\x\\.git", "E:\\code\\x\\.git"] });
-  for (const p of ["D:\\code-private\\x", "E:\\code\\x"]) {
-    assert.match(c.validateWorkFolder(p, { allowedRoots: ["D:\\code"], platform: "win32", ...w }).error, /outside/, p);
+test("validateBaseRef: plain branch/tag/sha only; never an option, never a range or reflog expression", () => {
+  for (const ok of ["main", "release/1.2", "v2.0.1", "feat/x_y", "0123abcd", undefined, null, ""]) {
+    assert.ok(!c.validateBaseRef(ok).error, `accepts ${JSON.stringify(ok)}`);
+  }
+  for (const bad of ["-main", "--upload-pack=x", "a..b", "HEAD@{1}", "a/", "x.lock", "a//b", "a b", "a;b", "a\nb", "$(x)", 1]) {
+    assert.ok(c.validateBaseRef(bad).error, `refuses ${JSON.stringify(bad)}`);
   }
 });
 
-test("validateWorkFolder (win32): a linked worktree (.git file) is refused", () => {
-  const w = fakeWin({ dirs: ["D:\\code", "D:\\code\\wt"], gitFiles: ["D:\\code\\wt\\.git"] });
-  assert.match(c.validateWorkFolder("D:\\code\\wt", { allowedRoots: ["D:\\code"], platform: "win32", ...w }).error, /\.git FILE/);
+test("planContainerJob: refuses workFolder outright (container jobs never mount a host folder)", () => {
+  const fx = fixture();
+  const r = c.planContainerJob({ jobId: "j", repo: REPO, workFolder: fx.hostDir, cfg: fx.cfg, resolveBin: (b) => b });
+  assert.match(r.error, /do not take workFolder/);
 });
 
-// ------------------------------------------------------------------------ workFolder checks ---
-
-test("validateWorkFolder: a repo inside the allowed root is accepted (by realpath)", () => {
+test("planContainerJob: a missing CLAUDE.md or hooks dir is an error, not a throw", () => {
   const fx = fixture();
-  const r = c.validateWorkFolder(fx.repo, { allowedRoots: [fx.root] });
-  assert.equal(r.real, realpath(fx.repo));
+  const gone = path.join(fx.base, "gone.md");
+  assert.match(c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, claudeMd: gone }, resolveBin: (b) => b }).error, /CLAUDE\.md/);
+  // a realpath seam that "resolves" to a path that does not exist must not make statSync throw
+  const r = c.planContainerJob({ jobId: "j", repo: REPO, cfg: fx.cfg, resolveBin: (b) => b,
+    realpath: (p) => (p === fx.cfg.claudeMd ? path.join(fx.base, "vanished.md") : fs.realpathSync.native(p)) });
+  assert.match(r.error, /CLAUDE\.md/);
+  assert.match(c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, hooksDir: path.join(fx.base, "nohooks") }, resolveBin: (b) => b }).error, /hooks dir/);
 });
 
-test("validateWorkFolder: refuses a folder outside every allowed root", () => {
-  const fx = fixture();
-  const r = c.validateWorkFolder(fx.outside, { allowedRoots: [fx.root] });
-  assert.match(r.error, /outside the container allowed roots/);
-});
-
-test("validateWorkFolder: refuses a symlink inside the root that points outside it", () => {
-  const fx = fixture();
-  const link = path.join(fx.root, "sneaky");
-  fs.symlinkSync(fx.outside, link, "dir");
-  const r = c.validateWorkFolder(link, { allowedRoots: [fx.root] });
-  assert.match(r.error, /outside the container allowed roots/);
-});
-
-test("validateWorkFolder: refuses a path that escapes with .. after the root", () => {
-  const fx = fixture();
-  const r = c.validateWorkFolder(path.join(fx.root, "..", "..", "outside", "other-repo"), { allowedRoots: [fx.root] });
-  assert.match(r.error, /outside the container allowed roots/);
-});
-
-test("validateWorkFolder: refuses when the ALLOWED ROOT itself is a symlink and the repo is reached around it", () => {
-  // A root given as a symlink is judged by its target, so a repo under the target is fine, and a
-  // repo merely sharing the link's textual prefix is not.
-  const fx = fixture();
-  const linkRoot = path.join(fx.base, "rootlink");
-  fs.symlinkSync(fx.root, linkRoot, "dir");
-  assert.equal(c.validateWorkFolder(path.join(linkRoot, "scratch-repo"), { allowedRoots: [linkRoot] }).real, realpath(fx.repo));
-  assert.match(c.validateWorkFolder(fx.outside, { allowedRoots: [linkRoot] }).error, /outside/);
-});
-
-test("validateWorkFolder: junction on win32 (skipped elsewhere)", { skip: process.platform !== "win32" }, () => {
-  const fx = fixture();
-  const j = path.join(fx.root, "junction");
-  fs.symlinkSync(fx.outside, j, "junction");
-  assert.match(c.validateWorkFolder(j, { allowedRoots: [fx.root] }).error, /outside the container allowed roots/);
-});
-
-test("validateWorkFolder: refuses the allowed root itself, relative paths, missing dirs, files", () => {
-  const fx = fixture();
-  assert.match(c.validateWorkFolder(fx.root, { allowedRoots: [fx.root] }).error, /allowed root itself/);
-  assert.match(c.validateWorkFolder("relative/repo", { allowedRoots: [fx.root] }).error, /absolute/);
-  assert.match(c.validateWorkFolder(path.join(fx.root, "nope"), { allowedRoots: [fx.root] }).error, /does not exist/);
-  const f = path.join(fx.root, "file.txt"); fs.writeFileSync(f, "x");
-  assert.match(c.validateWorkFolder(f, { allowedRoots: [fx.root] }).error, /not a directory/);
-});
-
-test("validateWorkFolder: refuses no allowed roots at all (no D:\\code fallback)", () => {
-  const fx = fixture();
-  assert.match(c.validateWorkFolder(fx.repo, { allowedRoots: [] }).error, /no container allowed roots/);
-  assert.deepEqual(c.loadContainerConfig({}, "win32").allowedRoots, [], "unset means none, not D:\\code");
-});
-
-test("validateWorkFolder: refuses a non-repo, a subfolder of a repo, and a linked worktree (.git file)", () => {
-  const fx = fixture();
-  const plain = path.join(fx.root, "plain"); fs.mkdirSync(plain);
-  assert.match(c.validateWorkFolder(plain, { allowedRoots: [fx.root] }).error, /not a git repository top-level/);
-  const sub = path.join(fx.repo, "src"); fs.mkdirSync(sub);
-  assert.match(c.validateWorkFolder(sub, { allowedRoots: [fx.root] }).error, /not a git repository top-level/);
-  const wt = path.join(fx.root, "worktree"); fs.mkdirSync(wt);
-  fs.writeFileSync(path.join(wt, ".git"), "gitdir: /elsewhere/.git/worktrees/x\n");
-  assert.match(c.validateWorkFolder(wt, { allowedRoots: [fx.root] }).error, /\.git FILE/);
-});
-
-test("validateWorkFolder: refuses the claude-async checkout and anything overlapping a denied root", () => {
-  const fx = fixture();
-  const cfg = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS: path.dirname(REPO_DIR) });
-  assert.ok(cfg.deniedRoots.includes(REPO_DIR), "the checkout is always denied");
-  assert.match(c.validateWorkFolder(REPO_DIR, { allowedRoots: cfg.allowedRoots, deniedRoots: cfg.deniedRoots }).error, /denied/);
-  assert.match(c.validateWorkFolder(fx.repo, { allowedRoots: [fx.root], deniedRoots: [fx.repo] }).error, /denied/);
-  // a denied path INSIDE the repo also refuses (mounting the repo would expose it)
-  const inner = path.join(fx.repo, "live"); fs.mkdirSync(inner);
-  assert.match(c.validateWorkFolder(fx.repo, { allowedRoots: [fx.root], deniedRoots: [inner] }).error, /denied/);
+test("the removed host-mount machinery is gone (no workFolder validation, no allowed roots, no .git audit)", () => {
+  for (const name of ["validateWorkFolder", "auditRepoGitState"]) assert.equal(c[name], undefined, name);
+  const cfg = c.loadContainerConfig({ ...BOT, CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS: "D:\\code" });
+  assert.equal(cfg.allowedRoots, undefined);
+  assert.equal(cfg.deniedRoots, undefined);
 });
 
 // -------------------------------------------------------------------------- secrets file ---
@@ -402,16 +333,14 @@ test("checkEnvFile: refuses unknown keys (ANTHROPIC_API_KEY), bare keys, empties
   assert.match(c.checkEnvFile(path.join(fx.base, "missing.env")).error, /does not exist/);
 });
 
-test("checkEnvFile / planContainerJob: a secrets file inside the repo or an allowed root is refused", () => {
+test("checkEnvFile / planContainerJob: a secrets file inside the claude-async checkout is refused", () => {
   const fx = fixture();
-  const inRepo = path.join(fx.repo, "container.env");
-  fs.copyFileSync(fx.envFile, inRepo);
-  const r = c.planContainerJob({ jobId: "j", workFolder: fx.repo, cfg: { ...fx.cfg, envFile: inRepo }, resolveBin: (b) => b });
-  assert.match(r.error, /outside every repo/);
-  const inRoot = path.join(fx.root, "container.env");
-  fs.copyFileSync(fx.envFile, inRoot);
-  assert.match(c.planContainerJob({ jobId: "j", workFolder: fx.repo, cfg: { ...fx.cfg, envFile: inRoot }, resolveBin: (b) => b }).error,
-    /outside every repo/);
+  const inCheckout = path.join(REPO_DIR, "hooks", `container-test-${process.pid}.env`);
+  fs.copyFileSync(fx.envFile, inCheckout);
+  try {
+    const r = c.planContainerJob({ jobId: "j", repo: REPO, cfg: { ...fx.cfg, envFile: inCheckout }, resolveBin: (b) => b });
+    assert.match(r.error, /outside the claude-async checkout/);
+  } finally { fs.rmSync(inCheckout, { force: true }); }
 });
 
 // -------------------------------------------------------------------------------- config ---
@@ -430,13 +359,6 @@ test("validateContainerConfig: refuses host/none networks, bad limits, missing b
   assert.ok(c.validateContainerConfig({ ...ok, gitEmail: "not an email" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, ollamaUrl: "http://u:p@evil/" }).length);
   assert.ok(c.validateContainerConfig({ ...ok, egressProxy: "socks5://x" }).length);
-});
-
-test("planContainerJob: refuses a CLAUDE.md inside the mounted repo", () => {
-  const fx = fixture();
-  const md = path.join(fx.repo, "CLAUDE.md"); fs.writeFileSync(md, "x");
-  assert.match(c.planContainerJob({ jobId: "j", workFolder: fx.repo, cfg: { ...fx.cfg, claudeMd: md }, resolveBin: (b) => b }).error,
-    /inside the mounted repo/);
 });
 
 // ---------------------------------------------------------------------------- kill / audit ---
@@ -464,16 +386,6 @@ test("checkDockerImage: distinguishes a missing image from a stopped daemon; nev
   assert.ok(seen.every((a) => a[0] === "image" && a[1] === "inspect"));
 });
 
-test("auditRepoGitState: flags host-executing config and hooks, ignores safe keys and .sample hooks", { skip: spawnSync("git", ["--version"]).status !== 0 }, () => {
-  const fx = fixture();
-  fs.writeFileSync(path.join(fx.repo, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n[user]\n\tname = x\n");
-  fs.writeFileSync(path.join(fx.repo, ".git", "hooks", "pre-commit.sample"), "#!/bin/sh\n");
-  assert.deepEqual(c.auditRepoGitState(fx.repo), []);
-  fs.appendFileSync(path.join(fx.repo, ".git", "config"), "[core]\n\tfsmonitor = /tmp/evil.sh\n");
-  fs.writeFileSync(path.join(fx.repo, ".git", "hooks", "post-checkout"), "#!/bin/sh\n");
-  assert.deepEqual(c.auditRepoGitState(fx.repo), ["config:.git/config:core.fsmonitor", "hook:.git/hooks/post-checkout"]);
-});
-
 // ----------------------------------------------------------- job-core: opt-in selection ---
 
 function fakeLaunch(capture) {
@@ -484,11 +396,14 @@ function fakeLaunch(capture) {
 }
 const CAPS = { maxConcurrent: 1000, maxStartsPerMinute: 1000 };
 const jid = (s) => `${s}-${crypto.randomBytes(4).toString("hex")}`;
+// Container-mode startJob seams shared by the tests below.
+const ctrOpts = (fx, extra = {}) => ({ caps: CAPS, containerConfig: { ...fx.cfg, dockerBin: process.execPath },
+                                       checkImage: () => ({ ok: true, imageId: `sha256:${"ab".repeat(32)}` }), ...extra });
 
 test("startJob: with container mode off (default), argv/command/env are what they were before container mode", async () => {
   const fx = fixture();
   const a = [], b = [];
-  const base = { prompt: "hello", workFolder: fx.repo };
+  const base = { prompt: "hello", workFolder: fx.hostDir };
   const opts = { claudeBin: process.execPath, caps: CAPS, hermesHomeIsolation: false, toolGate: false, safePermissions: false };
   const r1 = await core.startJob({ ...base, jobId: jid("off-a") }, { ...opts, launch: fakeLaunch(a) });
   const r2 = await core.startJob({ ...base, jobId: jid("off-b"), sandbox: "host" },
@@ -496,6 +411,7 @@ test("startJob: with container mode off (default), argv/command/env are what the
   for (const r of [r1, r2]) { assert.ok(!r.error, r.error); assert.equal(r.sandbox, undefined); assert.equal(r.container, undefined); }
   assert.deepEqual(a[0].argv, b[0].argv, "sandbox:\"host\" over a container default is identical to the default");
   assert.equal(a[0].command, process.execPath);
+  assert.equal(a[0].cwd, fx.hostDir, "host jobs still run in workFolder");
   assert.equal(a[0].argv[0], "-p");
   assert.ok(a[0].argv.includes("--dangerously-skip-permissions"));
   assert.ok(!a[0].argv.includes("run") && !a[0].argv.includes("--rm"));
@@ -505,13 +421,16 @@ test("startJob: with container mode off (default), argv/command/env are what the
   assert.deepEqual(a[0].argv.slice(0, i), ["-p", "hello", "--strict-mcp-config", "--mcp-config",
     path.join(REPO_DIR, "empty-mcp.json"), "--dangerously-skip-permissions", "--model", "claude-sonnet-5", "--effort", "medium"]);
   assert.equal(a[0].argv.length, i + 2);
+  const meta = JSON.parse(fs.readFileSync(path.join(a[0].p.d, "meta.json"), "utf8"));
+  assert.equal(meta.workFolder, fx.hostDir);
+  for (const k of ["sandbox", "container", "repo", "baseRef"]) assert.equal(meta[k], undefined, `host meta has no ${k}`);
 });
 
 test("startJob: unknown env values never enable container mode", async () => {
   const fx = fixture();
   for (const v of ["1", "true", "Container"]) {
     const cap = [];
-    const r = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: jid("env") },
+    const r = await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: jid("env") },
       { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch(cap), sandboxDefault: v, hermesHomeIsolation: false });
     assert.ok(!r.error, r.error);
     assert.equal(cap[0].command, process.execPath, `env ${v}`);
@@ -526,17 +445,27 @@ test("startJob: an invalid sandbox value is refused before anything is written",
   assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)));
 });
 
+test("startJob: repo/baseRef on a host job is refused (they only mean something for a container job)", async () => {
+  for (const extra of [{ repo: REPO }, { baseRef: "main" }]) {
+    const id = jid("hostrepo");
+    const r = await core.startJob({ prompt: "p", jobId: id, ...extra },
+      { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
+    assert.equal(r.errorCode, "invalid", JSON.stringify(r));
+    assert.match(r.error, /only for container jobs/);
+    assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)));
+  }
+});
+
 test("startJob: sandbox:\"container\" launches docker with the container argv and records it", async () => {
   const fx = fixture();
   const cap = [];
   const id = jid("ctr");
-  const r = await core.startJob({ prompt: "--version do it", workFolder: fx.repo, jobId: id, sandbox: "container",
-                                  model: "claude-opus-4-8", effort: "ultracode" },
-    { caps: CAPS, launch: fakeLaunch(cap), containerConfig: { ...fx.cfg, dockerBin: process.execPath },
-      checkImage: () => ({ ok: true }) });
+  const r = await core.startJob({ prompt: "--version do it", jobId: id, sandbox: "container", repo: REPO, baseRef: "main",
+                                  model: "claude-opus-4-8", effort: "ultracode" }, ctrOpts(fx, { launch: fakeLaunch(cap) }));
   assert.ok(!r.error, r.error);
-  const { command, argv, extraEnv, launchExtra } = cap[0];
+  const { p, command, argv, cwd, extraEnv, launchExtra } = cap[0];
   assert.equal(command, process.execPath, "the runner spawns the docker binary");
+  assert.equal(cwd, p.d, "the docker client runs in the job dir, never in a repo");
   assert.equal(argv[0], "run");
   assert.equal(valueAfter(argv, "--name"), `claude-async-${id}`);
   assert.equal(argv.at(-1), "--version do it");
@@ -544,22 +473,44 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.ok(argv.includes("--model=claude-opus-4-8"));
   assert.equal(argv[argv.indexOf("--effort") + 1], "xhigh");
   assert.equal(JSON.parse(argv[argv.indexOf("--settings") + 1]).ultracode, true);
+  assert.ok(argv.includes(REPO) && argv.includes("main"));
   assert.equal(r.sandbox, "container");
   assert.equal(r.container.name, `claude-async-${id}`);
+  assert.equal(r.container.repo, REPO);
+  assert.equal(r.workFolder, null, "no host folder");
+  assert.equal(r.startHead, null, "no host git HEAD for a container job");
   assert.equal(r.hermesHome, undefined, "no per-job HERMES_HOME dir for container jobs");
-  assert.equal(launchExtra.container.name, `claude-async-${id}`);
-  assert.equal(launchExtra.container.repo, realpath(fx.repo));
-  assert.deepEqual(launchExtra.container.gitBaseline, []);
+  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "name", "repo"]);
+  assert.equal(launchExtra.container.repo, REPO);
   assert.ok(!JSON.stringify(cap[0]).includes(SECRET_GH), "no secret anywhere in what launch() receives");
   assert.equal(extraEnv.GH_TOKEN, undefined);
+});
+
+test("startJob: a container job never runs host git (no card startHead lookup in any folder)", { skip: process.platform === "win32" }, async () => {
+  const fx = fixture();
+  const bin = path.join(fx.base, "bin");
+  fs.mkdirSync(bin);
+  const log = path.join(fx.base, "git-calls.log");
+  fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\necho "$PWD $*" >> "${log}"\nexit 1\n`);
+  fs.chmodSync(path.join(bin, "git"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${oldPath}`;
+  try {
+    const r = await core.startJob({ prompt: "p", jobId: jid("nogit"), sandbox: "container", repo: REPO }, ctrOpts(fx, { launch: fakeLaunch([]) }));
+    assert.ok(!r.error, r.error);
+    assert.ok(!fs.existsSync(log), `host git ran: ${fs.existsSync(log) ? fs.readFileSync(log, "utf8") : ""}`);
+    // control: a host job in the same process does look up HEAD through the same shim
+    await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: jid("hostgit") },
+      { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
+    assert.ok(fs.existsSync(log), "the shim is on PATH");
+  } finally { process.env.PATH = oldPath; }
 });
 
 test("startJob: CLAUDE_ASYNC_JOB_SANDBOX=container (via seam) selects container mode without a per-call param", async () => {
   const fx = fixture();
   const cap = [];
-  const r = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: jid("envon") },
-    { caps: CAPS, launch: fakeLaunch(cap), sandboxDefault: "container",
-      containerConfig: { ...fx.cfg, dockerBin: process.execPath }, checkImage: () => ({ ok: true }) });
+  const r = await core.startJob({ prompt: "p", jobId: jid("envon"), repo: REPO },
+    ctrOpts(fx, { launch: fakeLaunch(cap), sandboxDefault: "container" }));
   assert.ok(!r.error, r.error);
   assert.equal(cap[0].argv[0], "run");
 });
@@ -567,7 +518,11 @@ test("startJob: CLAUDE_ASYNC_JOB_SANDBOX=container (via seam) selects container 
 test("startJob: container preflight refusals happen before the job dir exists", async () => {
   const fx = fixture();
   const cases = [
-    [{ workFolder: fx.outside }, {}, /outside the container allowed roots/],
+    [{ workFolder: fx.hostDir }, {}, /do not take workFolder/],
+    [{ repo: undefined }, {}, /repo .* is required/],
+    [{ repo: "icey2488/not-allowed" }, {}, /not in CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS/],
+    [{ baseRef: "--upload-pack=x" }, {}, /baseRef/],
+    [{}, { cfg: { allowedRepos: [] } }, /no container repos are allowed/],
     [{}, { cfg: { envFile: null } }, /CLAUDE_ASYNC_CONTAINER_ENV_FILE is not set/],
     [{}, { cfg: { gitName: null } }, /GIT_NAME/],
     [{}, { image: () => ({ error: "docker image claude-async-job:local is not built on this host" }) }, /not built/],
@@ -575,9 +530,9 @@ test("startJob: container preflight refusals happen before the job dir exists", 
   ];
   for (const [args, o, re] of cases) {
     const id = jid("pf");
-    const r = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: id, sandbox: "container", ...args },
-      { caps: CAPS, launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: process.execPath, ...(o.cfg || {}) },
-        checkImage: o.image || (() => ({ ok: true })) });
+    const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO, ...args },
+      ctrOpts(fx, { launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: process.execPath, ...(o.cfg || {}) },
+                    ...(o.image ? { checkImage: o.image } : {}) }));
     assert.equal(r.errorCode, "preflight", JSON.stringify(r));
     assert.match(r.error, re);
     assert.ok(!fs.existsSync(path.join(core.JOB_ROOT, id)), "no job dir on refusal");
@@ -587,14 +542,7 @@ test("startJob: container preflight refusals happen before the job dir exists", 
 test("cancelJob: kills a running container job by name; refuses host jobs; no-op once finished", async () => {
   const fx = fixture();
   const id = jid("cancel");
-  const r = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: id, sandbox: "container" },
-    { caps: CAPS, launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: "docker-test-bin" },
-      checkImage: () => ({ ok: true }), claudeBin: process.execPath });
-  // dockerBin did not resolve on PATH, so this start is refused; use a resolvable one.
-  assert.equal(r.errorCode, "preflight");
-  const r2 = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: id, sandbox: "container" },
-    { caps: CAPS, launch: fakeLaunch([]), containerConfig: { ...fx.cfg, dockerBin: process.execPath },
-      checkImage: () => ({ ok: true }) });
+  const r2 = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO }, ctrOpts(fx, { launch: fakeLaunch([]) }));
   assert.ok(!r2.error, r2.error);
   const kills = [];
   const out = core.cancelJob(id, { killContainer: (a) => { kills.push(a); return { ok: true, killed: true }; } });
@@ -604,7 +552,7 @@ test("cancelJob: kills a running container job by name; refuses host jobs; no-op
   assert.equal(core.cancelJob(id, { killContainer: () => { throw new Error("must not kill"); } }).alreadyFinished, true);
 
   const hostId = jid("hostjob");
-  await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: hostId },
+  await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: hostId },
     { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
   assert.match(core.cancelJob(hostId, { killContainer: () => { throw new Error("must not kill"); } }).error, /only supported for container jobs/);
   assert.match(core.cancelJob("../x").error, /invalid jobId/);
@@ -613,9 +561,8 @@ test("cancelJob: kills a running container job by name; refuses host jobs; no-op
 test("checkJob: a died container job gets its container killed once (reap)", async () => {
   const fx = fixture();
   const id = jid("reap");
-  const r = await core.startJob({ prompt: "p", workFolder: fx.repo, jobId: id, sandbox: "container" },
-    { caps: CAPS, launch: async () => ({ pid: 999999, pidSource: "test", launchPath: "test" }),
-      containerConfig: { ...fx.cfg, dockerBin: process.execPath }, checkImage: () => ({ ok: true }) });
+  const r = await core.startJob({ prompt: "p", jobId: id, sandbox: "container", repo: REPO },
+    ctrOpts(fx, { launch: async () => ({ pid: 999999, pidSource: "test", launchPath: "test" }) }));
   assert.ok(!r.error, r.error);
   const kills = [];
   const killContainer = (a) => { kills.push(a.name); return { ok: true, killed: true }; };
