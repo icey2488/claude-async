@@ -6,8 +6,10 @@
 # Contents: Node 24 (the bridge's own major, see README "Linux receiver"), git, gh, python3 + uv,
 # ripgrep, curl, the Claude Code CLI, and the job entrypoint (job-entry.sh), which clones the job's
 # repo into /workspace inside the container. No host folder is mounted read-write. NO secrets: the
-# bot's GitHub token and the Claude Code OAuth token arrive at `docker run` time through --env-file, never at build time, and nothing in
-# this file reads them. The image never contains any host path, config or credential.
+# Claude Code OAuth token arrives at `docker run` time through --env-file, the GitHub App
+# installation token as a file under the read-only /run/claude-async/creds mount, never at build
+# time, and nothing in this file reads either. The image never contains any host path, config or
+# credential.
 #
 # Pinning: every downloaded tool is pinned to an exact version AND a checksum. gh, uv: SHA-256 from
 # the release's checksum file. Claude Code: the sha512 of the downloaded wrapper and linux-x64
@@ -35,12 +37,15 @@ RUN apt-get update \
       ca-certificates curl git openssl python3 python3-venv ripgrep jq less procps openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
-# gh: release tarball, checksum-verified (no third-party apt repo to trust).
+# gh: release tarball, checksum-verified (no third-party apt repo to trust). The binary goes to
+# /usr/local/lib/gh/gh; /usr/local/bin/gh is the wrapper below, which hands it the GitHub App
+# installation token from the creds mount for that process only.
 RUN set -eu; \
     curl -fsSL -o /tmp/gh.tgz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz"; \
     echo "${GH_SHA256}  /tmp/gh.tgz" | sha256sum -c -; \
     tar -xzf /tmp/gh.tgz -C /tmp; \
-    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/bin/gh; \
+    install -d -m 0755 /usr/local/lib/gh; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" /usr/local/lib/gh/gh; \
     rm -rf /tmp/gh.tgz "/tmp/gh_${GH_VERSION}_linux_amd64"
 
 # uv (and uvx): release tarball, checksum-verified.
@@ -142,16 +147,25 @@ ENV HOME=/home/agent \
     GIT_TERMINAL_PROMPT=0 \
     UV_LINK_MODE=copy \
     PYTHONDONTWRITEBYTECODE=1
-# git over https to github.com asks gh, which answers from GH_TOKEN in the environment: the token is
-# never written to a file or put in a remote URL. System config (root-owned, /etc/gitconfig), so it
-# is in place before the job's first command and a job's own ~/.gitconfig can only add to it.
-RUN git config --system init.defaultBranch main \
- && git config --system credential.https://github.com.helper '!/usr/local/bin/gh auth git-credential'
-
-# The entrypoint that clones the job's repo (see job-entry.sh). CRs are stripped in case the file
-# came from a Windows checkout without the .gitattributes rule.
+# GitHub credentials: the host runner mints a one-hour GitHub App installation token per job and
+# keeps it at /run/claude-async/creds/token (a read-only bind mount it rewrites in place). git over
+# https to github.com asks claude-async-git-credential, which prints username=x-access-token and the
+# file's current content; the gh wrapper at /usr/local/bin/gh exports it as GH_TOKEN for the real gh
+# process only. The token is never in the job's environment, a remote URL or .git/config. System
+# config (root-owned, /etc/gitconfig), so it is in place before the job's first command and a job's
+# own ~/.gitconfig can only add to it. The mount point exists in the image so the mount never
+# creates it. CRs are stripped from the scripts in case they came from a Windows checkout without
+# the .gitattributes rule.
 COPY job-entry.sh /usr/local/bin/claude-async-job-entry
-RUN sed -i 's/\r$//' /usr/local/bin/claude-async-job-entry && chmod 0755 /usr/local/bin/claude-async-job-entry
+COPY git-credential.sh /usr/local/bin/claude-async-git-credential
+COPY gh-wrapper.sh /usr/local/bin/gh
+RUN set -eu; \
+    for f in /usr/local/bin/claude-async-job-entry /usr/local/bin/claude-async-git-credential /usr/local/bin/gh; do \
+      sed -i 's/\r$//' "$f" && chmod 0755 "$f"; done; \
+    install -d -m 0755 /run/claude-async/creds; \
+    git config --system init.defaultBranch main; \
+    git config --system credential.https://github.com.helper /usr/local/bin/claude-async-git-credential; \
+    test "$(gh --version | head -1 | cut -d' ' -f3)" = "${GH_VERSION}"
 
 USER agent
 WORKDIR /workspace

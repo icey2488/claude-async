@@ -15,11 +15,14 @@
 # (test/job-entry.test.mjs); the image never sets it.
 #
 # Credentials: git asks the system-level credential helper the image configures
-# (`!gh auth git-credential` for https://github.com), and gh answers from the GH_TOKEN environment
-# variable that --env-file supplied. The token is never on a command line, in a URL, or in a file.
+# (/usr/local/bin/claude-async-git-credential for https://github.com), which reads the GitHub App
+# installation token the host runner keeps at /run/claude-async/creds/token (a read-only bind
+# mount, rewritten in place while the job runs). The token is never on a command line, in a URL,
+# in the environment, or in .git/config. CLAUDE_ASYNC_CREDS_FILE overrides the path for the
+# host-side test only.
 #
 # Exit codes of its own: 64 usage/validation, 70 clone or checkout failed, 78 configuration
-# (no GH_TOKEN, /workspace not empty). Anything else is the CLI's.
+# (no token file, /workspace not empty). Anything else is the CLI's.
 set -euo pipefail
 
 die() { local code="$1"; shift; echo "[job-entry] $*" >&2; exit "$code"; }
@@ -39,7 +42,8 @@ if [ -n "$base" ]; then
   case "$base" in *..*|*@\{*|*/|*.lock|*//*) die 64 "invalid base ref" ;; esac
 fi
 
-[ -n "${GH_TOKEN:-}" ] || die 78 "GH_TOKEN is not set (the host env file must supply it)"
+creds="${CLAUDE_ASYNC_CREDS_FILE:-/run/claude-async/creds/token}"
+[ -s "$creds" ] || die 78 "${creds} is missing or empty (the host runner writes the GitHub App installation token there before docker run)"
 workspace="${CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE:-/workspace}"
 cd "$workspace" || die 78 "${workspace} does not exist"
 [ -z "$(ls -A "$workspace")" ] || die 78 "${workspace} is not empty; refusing to clone over it"

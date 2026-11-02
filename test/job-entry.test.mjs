@@ -3,7 +3,10 @@
 // no network and no token are involved. Covers baseRef resolution (round 2, N1): a branch, a tag
 // and an abbreviated commit SHA resolve locally in the fresh clone; refs/pull/N/head (GitHub's
 // fork-network objects, not on any branch of the repo), a full SHA that is not in the clone, and an
-// unknown name exit 70; nothing is ever fetched for baseRef.
+// unknown name exit 70; nothing is ever fetched for baseRef. Also the image's two credential
+// scripts, run from the checkout: container/git-credential.sh (git's helper for https://github.com,
+// reads the installation token file) and container/gh-wrapper.sh (/usr/local/bin/gh in the image:
+// exports GH_TOKEN from the file for the exec'd gh only, so the job's environment never carries it).
 // Run: node --test test/job-entry.test.mjs   (POSIX only: bash + git)
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
@@ -15,10 +18,17 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const ENTRY = path.join(here, "..", "container", "job-entry.sh");
+const CRED_HELPER = path.join(here, "..", "container", "git-credential.sh");
+const GH_WRAPPER = path.join(here, "..", "container", "gh-wrapper.sh");
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "claude-async-job-entry-"));
 after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
 const have = (bin) => spawnSync(bin, ["--version"], { encoding: "utf8" }).status === 0;
 const SKIP = process.platform === "win32" ? "bash entrypoint" : (!have("bash") || !have("git")) ? "needs bash and git" : false;
+// The token file the host runner would have bind-mounted at /run/claude-async/creds/token.
+const TOKEN = "ghs_ENTRYTESTTOKEN0000000000000000000000";
+const CREDS = path.join(TMP, "creds", "token");
+fs.mkdirSync(path.dirname(CREDS), { recursive: true });
+fs.writeFileSync(CREDS, `${TOKEN}\n`);
 
 const git = (cwd, ...args) => {
   const r = spawnSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" } });
@@ -58,7 +68,7 @@ function runEntry(remote, baseRef) {
   const gcfg = path.join(TMP, `gitconfig-${n}`);
   fs.writeFileSync(gcfg, `[url "file://${remote.remotesRoot}/"]\n\tinsteadOf = https://github.com/\n`);
   const r = spawnSync("bash", [ENTRY, "owner/repo", baseRef, "--", "sh", "-c", "git rev-parse HEAD; git rev-parse --abbrev-ref HEAD; git remote -v"],
-    { encoding: "utf8", env: { ...process.env, GH_TOKEN: "x", GIT_CONFIG_GLOBAL: gcfg, CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws, GIT_TERMINAL_PROMPT: "0" } });
+    { encoding: "utf8", env: { ...process.env, GH_TOKEN: undefined, CLAUDE_ASYNC_CREDS_FILE: CREDS, GIT_CONFIG_GLOBAL: gcfg, CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws, GIT_TERMINAL_PROMPT: "0" } });
   return { status: r.status, out: r.stdout, err: r.stderr, ws };
 }
 
@@ -94,16 +104,78 @@ test("job-entry: refs/pull/N/head, a SHA not in the clone, and an unknown name e
   assert.notEqual(has.status, 0, "refs/pull objects are not in the clone");
 });
 
-test("job-entry: usage and configuration exits are unchanged (64 bad names, 78 no GH_TOKEN / non-empty workspace)", { skip: SKIP }, () => {
+test("job-entry: usage and configuration exits (64 bad names, 78 no token file / non-empty workspace); GH_TOKEN in the env is not what it checks", { skip: SKIP }, () => {
   const remote = makeRemote();
-  const env = (extra) => ({ ...process.env, GH_TOKEN: "x", ...extra });
+  const env = (extra) => ({ ...process.env, GH_TOKEN: undefined, CLAUDE_ASYNC_CREDS_FILE: CREDS, ...extra });
   const bad = spawnSync("bash", [ENTRY, "owner/repo", "-x", "--", "true"], { encoding: "utf8", env: env({ CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: path.join(TMP, "e1") }) });
   assert.equal(bad.status, 64);
   const ws = path.join(TMP, "e2"); fs.mkdirSync(ws);
-  const noTok = spawnSync("bash", [ENTRY, "owner/repo", "", "--", "true"], { encoding: "utf8", env: { ...process.env, GH_TOKEN: "", CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws } });
-  assert.equal(noTok.status, 78);
+  const noTok = spawnSync("bash", [ENTRY, "owner/repo", "", "--", "true"], { encoding: "utf8", env: { ...process.env, GH_TOKEN: "ghp_irrelevant", CLAUDE_ASYNC_CREDS_FILE: path.join(TMP, "nope"), CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws } });
+  assert.equal(noTok.status, 78, "a GH_TOKEN in the environment does not stand in for the token file");
+  assert.match(noTok.stderr, /missing or empty/);
+  const emptyTok = path.join(TMP, "empty-token"); fs.writeFileSync(emptyTok, "");
+  assert.equal(spawnSync("bash", [ENTRY, "owner/repo", "", "--", "true"], { encoding: "utf8", env: env({ CLAUDE_ASYNC_CREDS_FILE: emptyTok, CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws }) }).status, 78);
   fs.writeFileSync(path.join(ws, "junk"), "");
   const full = spawnSync("bash", [ENTRY, "owner/repo", "", "--", "true"], { encoding: "utf8", env: env({ CLAUDE_ASYNC_JOB_ENTRY_WORKSPACE: ws }) });
   assert.equal(full.status, 78);
   assert.ok(remote);
+});
+
+// ------------------------------------------------------------ the image's credential scripts ---
+
+const helper = (input, extra = {}) => spawnSync("bash", [CRED_HELPER, "get"], { input, encoding: "utf8", env: { ...process.env, CLAUDE_ASYNC_CREDS_FILE: CREDS, ...extra } });
+
+test("git-credential: answers x-access-token + the file's current token for https github.com only; nothing for other hosts, protocols, verbs or a missing file", { skip: SKIP }, () => {
+  const ok = helper("protocol=https\nhost=github.com\npath=icey2488/x.git\n\n");
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(ok.stdout, `username=x-access-token\npassword=${TOKEN}\n`);
+  for (const input of ["protocol=https\nhost=gitlab.com\n\n", "protocol=http\nhost=github.com\n\n", "protocol=https\nhost=evil.github.com\n\n", "protocol=https\nhost=github.com.evil\n\n"]) {
+    const r = helper(input);
+    assert.equal(r.status, 0); assert.equal(r.stdout, "", JSON.stringify(input));
+  }
+  for (const verb of ["store", "erase"]) {
+    const r = spawnSync("bash", [CRED_HELPER, verb], { input: "protocol=https\nhost=github.com\n\n", encoding: "utf8", env: { ...process.env, CLAUDE_ASYNC_CREDS_FILE: CREDS } });
+    assert.equal(r.status, 0); assert.equal(r.stdout, "");
+  }
+  const missing = helper("protocol=https\nhost=github.com\n\n", { CLAUDE_ASYNC_CREDS_FILE: path.join(TMP, "none") });
+  assert.equal(missing.status, 0); assert.equal(missing.stdout, "");
+  // the current content, not a cached one: rewrite the file in place, ask again
+  const t2 = "ghs_ENTRYTESTTOKEN1111111111111111111111";
+  fs.writeFileSync(CREDS, `${t2}\n`);
+  try { assert.equal(helper("protocol=https\nhost=github.com\n\n").stdout, `username=x-access-token\npassword=${t2}\n`); }
+  finally { fs.writeFileSync(CREDS, `${TOKEN}\n`); }
+});
+
+test("git-credential: git itself picks the helper up for https://github.com through the credential protocol (credential fill)", { skip: SKIP }, () => {
+  const r = spawnSync("git", ["-c", "credential.helper=", "-c", `credential.https://github.com.helper=${CRED_HELPER}`, "credential", "fill"],
+    { input: "protocol=https\nhost=github.com\npath=icey2488/x.git\n\n", encoding: "utf8",
+      env: { ...process.env, CLAUDE_ASYNC_CREDS_FILE: CREDS, GIT_TERMINAL_PROMPT: "0", GIT_ASKPASS: "", SSH_ASKPASS: "" } });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^username=x-access-token$/m);
+  assert.match(r.stdout, new RegExp(`^password=${TOKEN}$`, "m"));
+});
+
+test("gh wrapper: the real gh sees GH_TOKEN from the file for its own process only; the job's shell environment has no GH_TOKEN; a caller's GH_TOKEN wins", { skip: SKIP }, () => {
+  const fakeGh = path.join(TMP, "fake-gh");
+  fs.writeFileSync(fakeGh, "#!/bin/sh\necho \"GH_TOKEN=${GH_TOKEN:-<unset>}\"\necho \"argv=$*\"\n");
+  fs.chmodSync(fakeGh, 0o755);
+  const env = { ...process.env, GH_TOKEN: undefined, CLAUDE_ASYNC_CREDS_FILE: CREDS, CLAUDE_ASYNC_GH_BIN: fakeGh };
+  const r = spawnSync("bash", [GH_WRAPPER, "pr", "create", "--base", "main"], { encoding: "utf8", env });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, `GH_TOKEN=${TOKEN}\nargv=pr create --base main\n`);
+  // what a job shell sees: no GH_TOKEN before or after a gh call (the export is in the wrapper's process)
+  const shell = spawnSync("bash", ["-c", `"${GH_WRAPPER}" auth status >/dev/null; env | grep -c '^GH_TOKEN=' || true; printenv GH_TOKEN || echo none`], { encoding: "utf8", env });
+  assert.equal(shell.stdout, "0\nnone\n", shell.stdout + shell.stderr);
+  // a GH_TOKEN the job set deliberately is respected
+  const own = spawnSync("bash", [GH_WRAPPER, "x"], { encoding: "utf8", env: { ...env, GH_TOKEN: "ghp_mine" } });
+  assert.equal(own.stdout, "GH_TOKEN=ghp_mine\nargv=x\n");
+  // no file: gh runs unauthenticated rather than failing in the wrapper
+  const none = spawnSync("bash", [GH_WRAPPER, "y"], { encoding: "utf8", env: { ...env, CLAUDE_ASYNC_CREDS_FILE: path.join(TMP, "none") } });
+  assert.equal(none.stdout, "GH_TOKEN=<unset>\nargv=y\n");
+  // the token is never on the exec'd command line
+  const argvCheck = path.join(TMP, "fake-gh-cmdline");
+  fs.writeFileSync(argvCheck, "#!/bin/sh\ntr '\\0' ' ' < /proc/$$/cmdline; echo\n");
+  fs.chmodSync(argvCheck, 0o755);
+  const cl = spawnSync("bash", [GH_WRAPPER, "z"], { encoding: "utf8", env: { ...env, CLAUDE_ASYNC_GH_BIN: argvCheck } });
+  assert.ok(!cl.stdout.includes(TOKEN), cl.stdout);
 });
