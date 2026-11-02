@@ -39,7 +39,7 @@ shift
 case "$repo" in */.|*/..) die 64 "invalid repo name" ;; esac
 if [ -n "$base" ]; then
   [[ "$base" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$ ]] || die 64 "invalid base ref"
-  case "$base" in *..*|*@\{*|*/|*.lock|*//*) die 64 "invalid base ref" ;; esac
+  case "$base" in *..*|*@\{*|*/|*.lock|*//*|[Rr][Ee][Ff][Ss]|[Rr][Ee][Ff][Ss]/*) die 64 "invalid base ref" ;; esac
 fi
 
 creds="${CLAUDE_ASYNC_CREDS_FILE:-/run/claude-async/creds/token}"

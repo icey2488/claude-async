@@ -90,9 +90,9 @@ test("job-entry: a branch, a tag and an abbreviated SHA resolve locally in the c
   for (const r of [def, dev, tag, short]) assert.ok(!/fetch/.test(r.err), `no fetch for baseRef: ${r.err}`);
 });
 
-test("job-entry: refs/pull/N/head, a SHA not in the clone, and an unknown name exit 70 (never fetched from the fork network)", { skip: SKIP }, () => {
+test("job-entry: a SHA not in the clone and an unknown name exit 70 (never fetched from the fork network)", { skip: SKIP }, () => {
   const remote = makeRemote();
-  for (const ref of ["refs/pull/1/head", remote.fork, remote.fork.slice(0, 12), "nope", "refs/heads/main"]) {
+  for (const ref of [remote.fork, remote.fork.slice(0, 12), "nope"]) {
     const r = runEntry(remote, ref);
     assert.equal(r.status, 70, `${ref}: ${r.err}`);
     assert.match(r.err, /not found in owner\/repo|checkout of/);
@@ -179,3 +179,16 @@ test("gh wrapper: the real gh sees GH_TOKEN from the file for its own process on
   const cl = spawnSync("bash", [GH_WRAPPER, "z"], { encoding: "utf8", env: { ...env, CLAUDE_ASYNC_GH_BIN: argvCheck } });
   assert.ok(!cl.stdout.includes(TOKEN), cl.stdout);
 });
+
+// ------------------------------------------------------------ review round 3: C3 and token readers ---
+test("C3: job-entry refuses refs / refs/* (any case) with exit 64 before cloning", { skip: SKIP }, () => {
+  const remote = makeRemote();
+  for (const ref of ["refs/pull/1/head", "refs/heads/main", "REFS/heads/main", "Refs", "refs"]) {
+    const r = runEntry(remote, ref);
+    assert.equal(r.status, 64, `${ref}: ${r.err}`);
+    assert.match(r.err, /invalid base ref/);
+    assert.deepEqual(fs.readdirSync(r.ws), [], `${ref}: nothing was cloned`);
+  }
+  assert.equal(runEntry(remote, "refsfoo").status, 70, "a name that merely starts with refs is a normal (unknown) name");
+});
+
