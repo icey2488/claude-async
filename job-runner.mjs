@@ -32,6 +32,19 @@
  * (to escape the caller's Job Object -- see the win32 note in job-core.mjs), in which case the
  * pid spawn() hands back to job-core is the shell's, not ours; it reads this file instead.
  *
+ * Container jobs (spec.container present; see container.mjs and docs/container-jobs.md): `command`
+ * is the docker CLI and argv is a `docker run --rm --name claude-async-<jobId> ...` line, so the CLI
+ * runs inside the container while this runner keeps owning the child's stdout/stderr, heartbeat,
+ * exit.json, card close and Discord ping exactly as for a host job. Three additions, all inert for
+ * host jobs: (1) on SIGTERM/SIGINT/SIGBREAK/SIGHUP the runner `docker kill`s the container BY NAME
+ * (stopping the docker client alone leaves the container running) and then records the exit as
+ * usual; (2) finish() always runs a best-effort `docker kill <name>` too, for a docker client that
+ * died while its container kept going; (3) after the container exits, the repo's .git config and
+ * hooks are re-audited against the baseline job-core took at launch, and anything new is reported
+ * in exit.json (container.newGitFindings + a warning) and err.log. Code a job planted there would
+ * run on the HOST the next time git runs in that repo, so when there are findings the card hook's
+ * host-side `git rev-parse HEAD` is skipped too.
+ *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
  * on the same volume. This prevents checkJob from reading a truncated file between the
@@ -53,6 +66,7 @@ import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
+import { killContainer, auditRepoGitState } from "./container.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -77,6 +91,8 @@ try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
 catch { process.exit(2); }
 
 const { command, argv, cwd, out, err, exit } = spec;
+// Container jobs only (see the header): { name, dockerBin, repo, gitBaseline }. null for host jobs.
+const containerSpec = spec.container && typeof spec.container === "object" ? spec.container : null;
 
 const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
 
@@ -207,6 +223,19 @@ const BG_TASKS_TERMINATED_RE = /Background tasks still running after \d+s; termi
 // guarantee it does, which is why this is a best-effort warning, not a status change.
 const BASH_AUTO_BACKGROUND_KILLED_RE = /stopped after reaching its background time limit/;
 
+// Container jobs: the repo's .git config/hooks findings that were NOT there at launch (see the
+// header). [] for host jobs and when the audit itself fails.
+function newGitFindings() {
+  if (!containerSpec || !containerSpec.repo) return [];
+  try {
+    const before = new Set(Array.isArray(containerSpec.gitBaseline) ? containerSpec.gitBaseline : []);
+    return auditRepoGitState(containerSpec.repo).filter((f) => !before.has(f));
+  } catch (e) {
+    try { fs.writeSync(errFd, `\n[job-runner] container git audit failed: ${e.message}\n`); } catch {}
+    return [];
+  }
+}
+
 // Best-effort: a runner that cannot record must still finish normally.
 function recordExit() {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
@@ -227,6 +256,18 @@ function recordExit() {
       "killed for exceeding its background time limit; any result it was meant to produce may be " +
       "missing even though the job exited normally");
   }
+  let containerRecord;
+  if (containerSpec) {
+    const findings = newGitFindings();
+    containerRecord = { name: containerSpec.name, newGitFindings: findings };
+    if (findings.length) {
+      warnings.push(`the container job added git config keys or hooks to ${containerSpec.repo}/.git that would run on ` +
+        `the HOST the next time git runs there (${findings.slice(0, 10).join(", ")}); inspect and remove them before using the repo`);
+      try { fs.writeSync(errFd, `\n[job-runner] WARN: new .git findings after the container exited: ${findings.join(", ")}\n`); } catch {}
+    }
+    // 125 is docker run's own failure (daemon down, bad flag, mount refused), not the CLI's.
+    if (exitInfo.exitCode === 125) warnings.push("docker run itself failed (exit 125) before or while starting the container; see stderrTail");
+  }
   const record = {
     exitCode: exitInfo.exitCode,
     exitSignal: exitInfo.exitSignal,
@@ -239,6 +280,7 @@ function recordExit() {
     usageLimitSuspected: null,
     reportComplete: hasCompletenessMarker(stdoutTail, completeness.markerRegex),
     ...(warnings.length ? { warnings } : {}),
+    ...(containerRecord ? { container: containerRecord } : {}),
   };
   if (exitInfo.spawnError !== undefined) record.spawnError = exitInfo.spawnError;
   try { writeJsonAtomic(exitPath, record); }
@@ -257,6 +299,14 @@ async function finish(code) {
   // Wrapped so a throw here (e.g. the membership-query child process misbehaving on close)
   // cannot skip the exit_code / exit.json / card-close writes below.
   try { membershipQuerier.close(); } catch {}
+  // Container jobs: make sure nothing is left running (a no-op after a normal --rm exit).
+  if (containerSpec) {
+    try {
+      const k = killContainer({ dockerBin: containerSpec.dockerBin || command, name: containerSpec.name });
+      if (k.ok && k.killed) fs.writeSync(errFd, `\n[job-runner] container ${containerSpec.name} was still running after docker exited; killed it\n`);
+      else if (!k.ok) fs.writeSync(errFd, `\n[job-runner] WARN: docker kill ${containerSpec.name} failed: ${k.error}\n`);
+    } catch {}
+  }
   // Write exit.json BEFORE exit_code (and therefore before closeCard() too): exit_code is the
   // signal most external readers poll for "the job is done", so any reader that observes
   // exit_code must be able to rely on exit.json already existing on disk.
@@ -274,7 +324,10 @@ async function finish(code) {
     startedAt = m.startedAt || null;
     intent = m.intent || null;
   } catch {}
-  try { closeCard(cardId, code, cwd, startHead, exitRecord); } catch {}
+  // A container job that planted host-executing git config must not get host git run over it, so the
+  // delivery check (closeCard's `git rev-parse HEAD`) is skipped by passing no startHead.
+  const gitTainted = !!(exitRecord && exitRecord.container && exitRecord.container.newGitFindings.length);
+  try { closeCard(cardId, code, cwd, gitTainted ? null : startHead, exitRecord); } catch {}
   // Discord ping: strictly best-effort and bounded (see discord-notify.mjs). Runs AFTER exit.json
   // and exit_code are both on disk, and is awaited (its own timeout bounds the wait) so the
   // process does not exit mid-request -- but nothing here can change `code` or any file already
@@ -327,6 +380,29 @@ try {
   try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
   exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
   finish(127);
+}
+
+// Container jobs: a cancel (or any catchable termination of this runner) kills the container by
+// name; the docker client then exits on its own and the normal exit path records it. The fallback
+// timer finishes the job anyway if the client never exits. Windows TerminateProcess can't be
+// caught at all, which is why job-core.mjs's cancelJob() kills the container itself first and
+// checkJob() reaps the container of a runner that died.
+if (child && containerSpec) {
+  let stopping = false;
+  const stopContainer = (sig) => {
+    if (stopping) return;
+    stopping = true;
+    try { fs.writeSync(errFd, `\n[job-runner] ${sig} received; killing container ${containerSpec.name}\n`); } catch {}
+    const k = killContainer({ dockerBin: containerSpec.dockerBin || command, name: containerSpec.name });
+    if (!k.ok) { try { fs.writeSync(errFd, `\n[job-runner] WARN: docker kill failed: ${k.error}\n`); } catch {} }
+    setTimeout(() => {
+      if (!done) exitInfo = { exitCode: null, exitSignal: sig, exitReason: "signal" };
+      finish(1);
+    }, 30_000).unref();
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])]) {
+    process.on(sig, () => stopContainer(sig));
+  }
 }
 
 if (child) {

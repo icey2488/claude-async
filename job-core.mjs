@@ -25,6 +25,8 @@ import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
+import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
+         buildContainerCliArgv, buildDockerRunArgv, auditRepoGitState, killContainer } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -224,6 +226,13 @@ const SAFE_PERMISSIONS_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIO
 // (D:\claunker\hermes\logs\judge_provenance.jsonl) on this workstation -- inheriting the real
 // LOCALAPPDATA is not itself a live-chassis hazard, only HERMES_HOME pointing there directly is.
 const JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION !== "0";
+
+// Container jobs (design: docs/container-jobs.md; argv building and validation: container.mjs).
+// DEFAULT OFF: a job runs in a Docker container only when claude_start passes sandbox:"container",
+// or this is exactly "container" and the call doesn't pass sandbox:"host". Windows-admin jobs
+// (scheduled tasks, services, firewall) stay on the host. With it off, startJob() builds the same
+// argv, env and spec.json as before this mode existed.
+const SANDBOX_ENV_DEFAULT = process.env.CLAUDE_ASYNC_JOB_SANDBOX;
 
 // The hook's "command" field is handed to a shell (cmd.exe under Task Scheduler on win32), so a
 // path under "C:\Program Files\nodejs\node.exe" needs quoting for the space. Forward slashes
@@ -796,8 +805,12 @@ function launchPosix(p, extraEnv = {}) {
   return { pid: child.pid, pidSource: "runner", launchPath: "spawn" };
 }
 
-async function launch(p, command, argv, cwd, extraEnv = {}) {
-  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit }, { space: 0 });
+// launchExtra.container (container jobs only): the runner's container record (name, docker binary,
+// repo path, git-state baseline), written into spec.json. Host jobs pass nothing, so their
+// spec.json is unchanged.
+async function launch(p, command, argv, cwd, extraEnv = {}, launchExtra = {}) {
+  writeJsonAtomic(p.spec, { command, argv, cwd, out: p.out, err: p.err, exit: p.exit,
+                            ...(launchExtra.container ? { container: launchExtra.container } : {}) }, { space: 0 });
   return process.platform === "win32" ? launchWin32(p, extraEnv) : launchPosix(p, extraEnv);
 }
 
@@ -916,9 +929,11 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // error text), caps (see guard.mjs resolveCaps), depth (the CALLER's dispatch depth; default from
 // CLAUDE_ASYNC_DEPTH), now (Date, tests), claudeBin + launch (test seams: the preflight binary and
 // a replacement for launch() so tests never touch schtasks or spawn a runner), fsImpl (test seam
-// for the post-launch meta.json write, see writeNewMeta()).
+// for the post-launch meta.json write, see writeNewMeta()). Container-mode seams (tests only):
+// sandboxDefault (replaces CLAUDE_ASYNC_JOB_SANDBOX), containerConfig (replaces
+// loadContainerConfig()), checkImage (replaces the `docker image inspect` preflight).
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent }, opts = {}) {
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox }, opts = {}) {
   const hostname = os.hostname();
   const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
   const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
@@ -927,7 +942,21 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (!isSafeJobId(id)) return fail("invalid", `invalid jobId ${JSON.stringify(id)}`);
   const cwd = workFolder || DEFAULT_CWD;
 
-  const pf = preflight({ claudeBin: opts.claudeBin, cwd, hostLabel });
+  const sb = resolveSandbox(sandbox, opts.sandboxDefault !== undefined ? opts.sandboxDefault : SANDBOX_ENV_DEFAULT);
+  if (sb.error) return fail("invalid", sb.error);
+  // Container mode: validate the repo mount, secrets file, config, docker binary and image now,
+  // before anything is written (see container.mjs's planContainerJob()).
+  let containerPlan = null;
+  if (sb.mode === "container") {
+    const planned = planContainerJob({ jobId: id, workFolder: cwd, cfg: opts.containerConfig || loadContainerConfig(),
+                                       resolveBin: (b) => resolveBinary(b) });
+    if (planned.error) return fail("preflight", `preflight failed on ${hostLabel}: ${planned.error}`);
+    const img = (opts.checkImage || checkDockerImage)({ dockerBin: planned.plan.dockerBin, image: planned.plan.image });
+    if (img.error) return fail("preflight", `preflight failed on ${hostLabel}: ${img.error}`);
+    containerPlan = planned.plan;
+  }
+
+  const pf = preflight({ claudeBin: containerPlan ? containerPlan.dockerBin : opts.claudeBin, cwd, hostLabel });
   if (pf.error) return fail("preflight", pf.error);
 
   const d = opts.depth !== undefined ? parseDepth(opts.depth) : parseDepth(process.env[DEPTH_ENV]);
@@ -964,7 +993,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const liveHermesHome = process.env.HERMES_HOME || null;
   const hermesHomeIsolationEnabled = opts.hermesHomeIsolation !== undefined
     ? Boolean(opts.hermesHomeIsolation) : JOB_HERMES_HOME_ISOLATION_ENV_DEFAULT;
-  const jobHermesHome = hermesHomeIsolationEnabled ? path.join(p.d, "hermes_home") : null;
+  // Container jobs never see the host's HERMES_HOME (nothing from the host env reaches the
+  // container except container.mjs's allowlist), so there is nothing to isolate for them.
+  const jobHermesHome = hermesHomeIsolationEnabled && !containerPlan ? path.join(p.d, "hermes_home") : null;
   if (jobHermesHome) fs.mkdirSync(jobHermesHome, { recursive: true });
 
   const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
@@ -1056,8 +1087,25 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // ...process.env spread in launch(), same as every var this function doesn't touch).
   if (liveHermesHome) extraEnv.CLAUNKER_LIVE_HERMES_HOME = liveHermesHome;
   if (jobHermesHome) extraEnv.HERMES_HOME = jobHermesHome;
+  // Container mode: the runner spawns `docker run ...` instead of the CLI. The CLI argv inside the
+  // container is built by container.mjs (same prompt/model/effort, --dangerously-skip-permissions
+  // because the container is the boundary); the host argv built above is not used.
+  let launchCommand = opts.claudeBin || CLAUDE_BIN;
+  let launchArgv = argv;
+  const launchExtra = {};
+  if (containerPlan) {
+    const effortArgv = eff === "ultracode" ? ["--effort", "xhigh"] : FLAG_EFFORT.has(eff) ? ["--effort", eff] : [];
+    const cliArgv = buildContainerCliArgv({ prompt, model: resolvedModel, effortArgv,
+                                            settings: buildContainerSettings({ ultracode: eff === "ultracode" }) });
+    launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
+    launchCommand = containerPlan.dockerBin;
+    // gitBaseline: the repo's unsafe git config keys / hooks BEFORE the job, so the runner can
+    // report (and the card hook can avoid running host git over) anything the job adds.
+    launchExtra.container = { name: containerPlan.name, dockerBin: containerPlan.dockerBin,
+                              repo: containerPlan.workFolderReal, gitBaseline: auditRepoGitState(containerPlan.workFolderReal) };
+  }
   const { pid, pidSource, jobMembership, launchPath } =
-    await (opts.launch || launch)(p, opts.claudeBin || CLAUDE_BIN, argv, cwd, extraEnv);
+    await (opts.launch || launch)(p, launchCommand, launchArgv, cwd, extraEnv, launchExtra);
 
   const { cardId, startHead, error: cardError } = mintCard(id, cwd, resolvedModel, eff, prompt, intent);
   // Bounded the same way card-hook.mjs bounds it for the card body (boundIntent), so the Discord
@@ -1071,7 +1119,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null,
                  ...(persistedIntent ? { intent: persistedIntent } : {}),
-                 ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}) };
+                 ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
+                 ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
+                       image: containerPlan.image, dockerBin: containerPlan.dockerBin } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -1082,7 +1132,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
            ...(warnings.length ? { warnings } : {}) };
 }
 
-export function checkJob(id, tailBytes = 8000) {
+// opts.killContainer: test seam for the container reap below.
+export function checkJob(id, tailBytes = 8000, opts = {}) {
   const hostname = os.hostname();
   if (!isSafeJobId(id)) return { jobId: id, hostname, status: "unknown", error: "invalid jobId" };
   const p = jobPaths(id);
@@ -1159,6 +1210,19 @@ export function checkJob(id, tailBytes = 8000) {
     }
   }
 
+  // Container jobs: a runner that died or timed out may have left its container running (the docker
+  // client can die without stopping it). Kill it by name, once.
+  if ((state === "died" || state === "timed_out") && meta.sandbox === "container" && meta.container &&
+      !meta.containerReaped) {
+    const k = (opts.killContainer || killContainer)({ dockerBin: meta.container.dockerBin, name: meta.container.name });
+    if (k.ok) {
+      meta.containerReaped = true;
+      try { writeJsonAtomic(p.meta, meta); } catch {}
+    } else {
+      extra.containerReapError = k.error || "docker kill failed";
+    }
+  }
+
   const runnerJobMembership = readRunnerJobMembership(p);
 
   // reportComplete (exit.json, written by job-runner.mjs's recordExit()) measures only whether
@@ -1182,6 +1246,28 @@ export function checkJob(id, tailBytes = 8000) {
            ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
            ...(state === "died" ? { diedCause: classifyDiedCause(exitRecord) } : {}),
            stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
+}
+
+// Cancels a running container job by killing its container BY NAME (`docker kill
+// claude-async-<jobId>`). Killing the docker client process instead would leave the container
+// running. The runner is deliberately left alone: once the container dies, the docker client exits
+// with the container's status (137 after a SIGKILL) and the runner records exit.json, exit_code,
+// the card close and the Discord ping through its normal path. Host jobs are not cancellable here
+// (unchanged from before container mode). opts.killContainer: test seam.
+export function cancelJob(id, opts = {}) {
+  const hostname = os.hostname();
+  if (!isSafeJobId(id)) return { jobId: id, hostname, error: "invalid jobId" };
+  const p = jobPaths(id);
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(p.meta, "utf8")); } catch { return { jobId: id, hostname, error: "no such job" }; }
+  if (meta.sandbox !== "container" || !meta.container) {
+    return { jobId: id, hostname, error: "cancel is only supported for container jobs (sandbox: \"container\")" };
+  }
+  if (fs.existsSync(p.exit)) return { jobId: id, hostname, ok: true, alreadyFinished: true };
+  try { fs.appendFileSync(p.err, `\n[job-core] cancel requested at ${new Date().toISOString()}; killing container ${meta.container.name}\n`); } catch {}
+  const k = (opts.killContainer || killContainer)({ dockerBin: meta.container.dockerBin, name: meta.container.name });
+  if (!k.ok) return { jobId: id, hostname, error: `docker kill ${meta.container.name} failed: ${k.error}` };
+  return { jobId: id, hostname, ok: true, container: meta.container.name, killed: k.killed };
 }
 
 export function listJobs() {

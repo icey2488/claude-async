@@ -16,7 +16,7 @@
  */
 import { z } from "zod";
 import os from "node:os";
-import { startJob, checkJob, listJobs } from "./job-core.mjs";
+import { startJob, checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
 import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
@@ -35,8 +35,8 @@ export function defaultCtx() {
 export function startLocal(args, cfg, startOptions = {}) {
   const jobId = mintJobId({ host: cfg.localHost, descriptor: args.jobId, now: startOptions.now,
                             ...(startOptions.suffix ? { suffix: startOptions.suffix() } : {}) });
-  const { prompt, workFolder, model, effort, intent } = args;
-  return startJob({ prompt, workFolder, jobId, model, effort, intent },
+  const { prompt, workFolder, model, effort, intent, sandbox } = args;
+  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox },
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
@@ -77,9 +77,11 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
   const route = resolveRoute(args.host, ctx.cfg);
   if (route.error) return { error: route.error, host: args.host ?? null, hostname: os.hostname() };
   if (route.kind === "local") return startLocal(args, ctx.cfg, ctx.startOptions);
-  const { host, prompt, workFolder, jobId, model, effort, intent } = args;
+  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox } = args;
+  // sandbox is only sent when given, so a forwarded host-mode start's body is unchanged.
   const out = await forward(ctx, route, "POST", "/v1/start",
-                            { host, prompt, workFolder, jobId, model, effort, intent }, FORWARD_TIMEOUT_MS);
+                            { host, prompt, workFolder, jobId, model, effort, intent, ...(sandbox ? { sandbox } : {}) },
+                            FORWARD_TIMEOUT_MS);
   return { host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
 
@@ -99,6 +101,17 @@ export async function dispatchCheck(jobId, tailBytes = 8000, ctx = defaultCtx())
   const out = await forward(ctx, route, "GET",
     `/v1/check?jobId=${encodeURIComponent(jobId)}&tailBytes=${encodeURIComponent(tailBytes)}`, null, FORWARD_TIMEOUT_MS);
   return { jobId, host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
+}
+
+// Cancel is local-only for now: a container job is cancelled on the host that runs it. A prefixed
+// id for another host is refused with a pointer, not forwarded (host-api.mjs has no cancel route).
+export async function dispatchCancel(jobId, ctx = defaultCtx()) {
+  const { host } = parseHostPrefix(jobId);
+  if (host && host !== ctx.cfg.localHost) {
+    return { jobId, host, hostname: os.hostname(),
+             error: `job ${jobId} runs on host ${host}; claude_cancel only cancels jobs on this host (${ctx.cfg.localHost})` };
+  }
+  return { host: ctx.cfg.localHost ?? null, ...cancelJob(jobId) };
 }
 
 export async function dispatchJobs(ctx = defaultCtx()) {
@@ -178,6 +191,12 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
       effort: z.enum(["low", "medium", "high", "xhigh", "max", "ultracode"]).optional()
         .describe("Reasoning effort; default medium. \"max\" = highest reasoning; " +
                   "\"ultracode\" = xhigh plus standing dynamic-workflow orchestration (parallel subagents)."),
+      sandbox: z.enum(["host", "container"]).optional()
+        .describe("Where the job runs. \"host\" (the default unless the host sets CLAUDE_ASYNC_JOB_SANDBOX=container): " +
+                  "directly on the executing host, as before -- use it for Windows-admin work (scheduled tasks, " +
+                  "services, firewall). \"container\": in a Docker container with only workFolder (one git repo " +
+                  "under an allowed root) mounted, a full shell, and the bot GitHub account's token, so the job can " +
+                  "commit, push a branch and open a PR as the bot. See docs/container-jobs.md."),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 
@@ -218,6 +237,13 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
       tailBytes: z.number().int().positive().optional().describe("Bytes of stdout/stderr to return (default 8000)."),
     },
   }, async ({ jobId, tailBytes }) => ok(await dispatchCheck(jobId, tailBytes || 8000, getCtx())));
+
+  server.registerTool("claude_cancel", {
+    description: "Cancel a running CONTAINER job (sandbox: \"container\") on this host by killing its container " +
+                 "(docker kill claude-async-<jobId>). The job then finishes through its normal path (exit.json, " +
+                 "card, Discord ping) with a non-zero exit. Host jobs cannot be cancelled with this tool.",
+    inputSchema: { jobId: z.string() },
+  }, async ({ jobId }) => ok(await dispatchCancel(jobId, getCtx())));
 
   server.registerTool("claude_jobs", {
     description: "List background jobs on this host and every host in hosts.json, each row tagged with " +

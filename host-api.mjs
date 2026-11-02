@@ -3,7 +3,7 @@
  * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
  * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
- *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent? }
+ *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
  *   GET  /v1/jobs
  *
@@ -46,6 +46,7 @@ import { writeJsonAtomic } from "./atomic.mjs";
 export const DEFAULT_PORT = 7850;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultracode"]);
+const SANDBOXES = new Set(["host", "container"]);
 
 // 100.64.0.0/10 (RFC 6598 CGNAT space, which Tailscale assigns node addresses from): first octet
 // 100, top two bits of the second octet 01 -> second octet 64..127.
@@ -176,9 +177,13 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
         if (body.effort !== undefined && body.effort !== null && !EFFORTS.has(body.effort)) {
           return send(res, 400, { error: `invalid effort ${JSON.stringify(body.effort)}`, hostname });
         }
+        if (body.sandbox !== undefined && body.sandbox !== null && !SANDBOXES.has(body.sandbox)) {
+          return send(res, 400, { error: `invalid sandbox ${JSON.stringify(body.sandbox)}`, hostname });
+        }
         const out = await startLocal(
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
-            model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined },
+            model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,
+            sandbox: body.sandbox || undefined },
           cfg, { ...startOptions, depth: req.headers[DEPTH_HEADER] ?? "" });
         return send(res, out.error ? (STATUS_BY_CODE[out.errorCode] || 400) : 200, { ...out, hostname: out.hostname || hostname });
       }
