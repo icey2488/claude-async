@@ -144,10 +144,26 @@ Read this before you count on the container for anything.
     **Container mode refuses to start unless that bridge is token-locked**: `~/.claude-async/http.json`
     must hold a token hash (`node claude-async-http.mjs --new-token`), and whatever listens on the
     port must answer an unauthenticated MCP request with 401 (so an old bridge that was not restarted
-    also refuses). The bridge itself keeps working unauthenticated when no token file exists,
-    because its documented client (the app's Connectors UI) cannot, as far as I know, send a static
-    header; on claunker that means container mode requires either giving the bridge's clients the
-    token or stopping the bridge.
+    also refuses). That preflight probe is a one-time check, not a durable boundary, so **on a host
+    that allows container mode the bridge itself requires the token to start**: with
+    `CLAUDE_ASYNC_ALLOWED_SANDBOXES` including `container` (or `CLAUDE_ASYNC_JOB_SANDBOX=container`)
+    and no valid `tokenSha256` in its `http.json` (missing, malformed, unreadable, or a different
+    `CLAUDE_ASYNC_CONFIG_DIR` than the one the token was minted under), `claude-async-http.mjs`
+    refuses to start (exit 78, message naming `--new-token`). It can therefore never be restarted
+    into an unauthenticated state during a running container job. The explicit opt-out
+    `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` is logged and is rejected whenever container mode is
+    allowed. On a host-only policy a missing token keeps the pre-existing unauthenticated loopback
+    behaviour (with a warning), because the bridge's documented client (the app's Connectors UI)
+    cannot, as far as I know, send a static header; on claunker container mode therefore requires
+    either giving the bridge's clients the token or stopping the bridge. The bridge supervisor
+    (pm2 `ecosystem.config.cjs`, or the Task Scheduler entry) must run it with the same
+    `CLAUDE_ASYNC_CONFIG_DIR` (default `%USERPROFILE%\.claude-async`) and `CLAUDE_ASYNC_HTTP_PORT` as
+    the process that admits container jobs; the refusal message prints the path it read. If the
+    bridge serves TLS (`CLAUDE_ASYNC_TLS_CERT`/`_KEY`), the preflight probe uses https (certificate
+    not verified: it only wants the status code). The smoke test probes 7842 with
+    `Host: 127.0.0.1:7842` (any other Host gets 403 from the transport's DNS-rebinding filter, which
+    would make an open bridge look closed) and, when the port is closed, still requires `http.json`
+    to hold a 64-hex hash.
   - The host API on `7850` is bearer-token gated and binds only to the tailnet address. A job can
     reach it (WARN in the smoke test) but can't use it without the token, which is not in the
     container.
@@ -615,8 +631,10 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS` | **none** (required) | `owner/repo` entries; only repos the bot is a collaborator on |
 | `CLAUDE_ASYNC_CONTAINER_ENV_FILE` | **none** (required) | the host secrets file, outside the claude-async checkout |
 | `CLAUDE_ASYNC_CONTAINER_GIT_NAME` / `_GIT_EMAIL` | **none** (required) | the bot's commit identity |
-| `~/.claude-async/http.json` | absent | **required for container mode**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`) |
+| `~/.claude-async/http.json` | absent | **required for container mode**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`); the bridge refuses to start without it once container mode is allowed |
 | `CLAUDE_ASYNC_HTTP_PORT` | `7842` | the bridge port the lock check probes |
+| `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED` | unset | bridge only: explicit, logged opt-out to start without a token; rejected when container mode is allowed |
+| `CLAUDE_ASYNC_TLS_CERT` / `_KEY` | unset | bridge TLS; when set on the admitting process too, the lock probe uses https |
 | `CLAUDE_ASYNC_CONTAINER_IMAGE` | `claude-async-job:local` | built on claunker, never pulled; jobs run its inspected ID |
 | `CLAUDE_ASYNC_DOCKER_BIN` | `docker` | set the full path to `docker.exe` |
 | `CLAUDE_ASYNC_CONTAINER_CPUS` / `_MEMORY` / `_PIDS_LIMIT` | `4` / `8g` / `1024` | |
@@ -740,7 +758,11 @@ Do these in order on claunker. Each step says how to check it.
 7. **Lock the HTTP bridge**: `node claude-async-http.mjs --new-token`, then restart it
    (`pm2 restart claude-async-http`, or stop it if nothing uses it). Give the token to anything that
    still needs the bridge (`Authorization: Bearer <token>`). Check:
-   `curl -s -o NUL -w "%{http_code}" -X POST http://127.0.0.1:7842/mcp` prints `401`.
+   `curl -s -o NUL -w "%{http_code}" -X POST http://127.0.0.1:7842/mcp` prints `401`. Do this
+   **before** step 9: once `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes `container`, the bridge refuses
+   to start without the token (its log then says `refusing to start ... --new-token`), and its
+   supervisor must pass the same `CLAUDE_ASYNC_CONFIG_DIR`/`CLAUDE_ASYNC_HTTP_PORT` as the MCP server
+   process that admits jobs.
 8. **Build the image and run the smoke test**, from `D:\code\claude-async`:
 
    ```powershell

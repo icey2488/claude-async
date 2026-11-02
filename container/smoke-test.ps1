@@ -177,10 +177,23 @@ if ($res) {
       if ($v -eq "OPEN") { Warn "$where is reachable from a job container (host API; bearer-token gated)" } else { Pass "$where not reachable" }
       continue
     }
+    if ($t.port -eq 7842 -and $v -eq "CLOSED") {
+      # Nothing listening now, but the bridge may be started later (pm2, a reboot): it then enforces
+      # whatever http.json holds, so the hash must be there even while the port is closed.
+      $cfgDir = if ($env:CLAUDE_ASYNC_CONFIG_DIR) { $env:CLAUDE_ASYNC_CONFIG_DIR } else { Join-Path $env:USERPROFILE ".claude-async" }
+      $httpJson = Join-Path $cfgDir "http.json"
+      $hash = $null
+      try { $hash = (Get-Content -Raw -ErrorAction Stop $httpJson | ConvertFrom-Json).tokenSha256 } catch {}
+      if ($hash -and $hash -match '^[0-9a-fA-F]{64}$') { Pass "$where not reachable now, and $httpJson holds a tokenSha256 (a bridge started later is token-locked)" }
+      else { Fail "$where not reachable now, but $httpJson holds no 64-hex tokenSha256: a bridge started later would be unauthenticated (it refuses to start when container mode is allowed). Run 'node claude-async-http.mjs --new-token'." }
+      continue
+    }
     if ($v -eq "CLOSED") { Pass "$where not reachable"; continue }
     if ($t.port -eq 7842) {
       # Reachable is acceptable only if the bridge is token-locked: an unauthenticated MCP request must get 401.
-      $c = Invoke-InContainer @() "curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{""jsonrpc"":""2.0"",""id"":1,""method"":""tools/list""}' http://$($t.host):7842/mcp"
+      # Host: 127.0.0.1:7842 is what a job would send to get past the bridge's DNS-rebinding filter (any
+      # other Host gets 403 from an UNLOCKED bridge, which would make an open bridge look closed).
+      $c = Invoke-InContainer @() "curl -s -o /dev/null -w '%{http_code}' --max-time 5 -X POST -H 'Host: 127.0.0.1:7842' -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{""jsonrpc"":""2.0"",""id"":1,""method"":""tools/list""}' http://$($t.host):7842/mcp"
       if ($c.code -eq 0 -and $c.out.Trim() -eq "401") { Pass "$where is reachable but token-locked (401 without a token)" }
       else { Fail "$where is reachable and did NOT answer 401 (got '$($c.out.Trim())'): an unauthenticated MCP bridge lets a job start host jobs. Run 'node claude-async-http.mjs --new-token' and restart the bridge (or stop it)." }
       continue

@@ -460,6 +460,13 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
   `claude_cancel` retries; it turns `confirmed` once docker lists nothing.
 - **Tokens in logs:** `out.log`/`err.log` are raw and may hold the bot PAT or OAuth token if a job
   printed them; exit.json, `claude_check` and the Discord ping are redacted.
+- **The HTTP bridge won't start** (`claude-async-http: refusing to start: this host allows container
+  jobs ... holds no valid tokenSha256`, exit 78): once `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes
+  `container` (or `CLAUDE_ASYNC_JOB_SANDBOX=container`) the bridge requires its token hash at
+  startup, so it can never come back unauthenticated during a container job. Run `node
+  claude-async-http.mjs --new-token` under the same `CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes
+  (the message prints the `http.json` path it read), give the token to the bridge's clients, restart.
+  `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` only works on a host-only policy and is logged.
 - **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; revoke the bot PAT and the setup-token for
   a full cut-off. See the doc's "Rollback".
 

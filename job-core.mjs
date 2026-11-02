@@ -991,7 +991,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     // The loopback HTTP MCP bridge must be token-locked: a container reaches the host's 127.0.0.1
     // through host.docker.internal and could otherwise start an unsandboxed host job there.
     const pc = planned.plan.cfg;
-    const br = await (opts.checkHttpBridge || checkHttpBridgeLocked)({ port: pc.httpBridgePort, configFile: pc.httpBridgeConfig });
+    const br = await (opts.checkHttpBridge || checkHttpBridgeLocked)({ port: pc.httpBridgePort, configFile: pc.httpBridgeConfig, tls: pc.httpBridgeTls });
     if (br.error) return fail("preflight", `preflight failed on ${hostLabel}: ${br.error}`);
     // Run exactly the image just inspected (by ID, with --pull=never), not whatever the tag names later.
     containerPlan = { ...planned.plan, imageId: img.imageId };

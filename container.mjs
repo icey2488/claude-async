@@ -31,6 +31,7 @@
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -190,6 +191,8 @@ export function loadContainerConfig(env = process.env) {
     // it is token-locked; see checkHttpBridgeLocked().
     httpBridgePort: Number(env.CLAUDE_ASYNC_HTTP_PORT || DEFAULTS.httpBridgePort),
     httpBridgeConfig: httpBridgeConfigPath(env),
+    // the bridge serves TLS when both are set (claude-async-http.mjs); the probe must then use https
+    httpBridgeTls: Boolean(env.CLAUDE_ASYNC_TLS_CERT && env.CLAUDE_ASYNC_TLS_KEY),
   };
 }
 
@@ -661,8 +664,10 @@ export function readHttpBridgeTokenHash(file) {
   } catch { return null; }
 }
 
-export async function checkHttpBridgeLocked({ port, configFile, host = "127.0.0.1", timeoutMs = 3000,
-                                              request = http.request } = {}) {
+// tls: probe with https (the bridge has CLAUDE_ASYNC_TLS_CERT/KEY set). The probe only wants a status
+// code and sends nothing secret, so the (typically self-signed) loopback certificate is not verified.
+export async function checkHttpBridgeLocked({ port, configFile, host = "127.0.0.1", timeoutMs = 3000, tls = false,
+                                              request = tls ? https.request : http.request } = {}) {
   if (!readHttpBridgeTokenHash(configFile)) {
     return { error: `the loopback HTTP MCP bridge is not token-locked (${configFile} has no tokenSha256). A container ` +
       `can reach 127.0.0.1:${port} through host.docker.internal and start an unsandboxed host job there. Run ` +
@@ -674,7 +679,7 @@ export async function checkHttpBridgeLocked({ port, configFile, host = "127.0.0.
     const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
     let req;
     try {
-      req = request({ host, port, method: "POST", path: "/mcp", timeout: timeoutMs,
+      req = request({ host, port, method: "POST", path: "/mcp", timeout: timeoutMs, ...(tls ? { rejectUnauthorized: false } : {}),
                       headers: { "content-type": "application/json", accept: "application/json, text/event-stream",
                                  "content-length": Buffer.byteLength(body), host: `${host}:${port}` } }, (res) => {
         res.resume();
