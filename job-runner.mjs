@@ -75,9 +75,10 @@
  *       tokens live 60) it re-mints and rewrites the file IN PLACE (write at offset 0, truncate to
  *       the new length, fsync: the same inode the container has, never a rename, so the content
  *       change is what propagates through the bind mount), keeps the old token when a refresh
- *       fails (retrying on the next tick, logging once per distinct error), records a warning in
- *       exit.json when refresh keeps failing within 5 minutes of the token's expiry, and deletes the
- *       file and dir in finish(). A first mint that fails means the container is never started
+ *       fails and retries with bounded backoff (token-refresh.mjs: 30 s .. 5 min, at least once
+ *       more before expiry - 2 min; logging once per distinct error), records a warning in
+ *       exit.json when the token gets within 5 minutes of its expiry without a newer one (its own
+ *       timer, not only on another failure), and deletes the file and dir in finish(). A first mint that fails means the container is never started
  *       (exit 78, warning). The App's private key is read from its host path by github-app.mjs on
  *       every mint and is never written, logged or passed anywhere.
  *
@@ -107,6 +108,7 @@ import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG
          classifyClientExit } from "./container.mjs";
 import { createMinter } from "./github-app.mjs";
 import { acquireRunnerLock } from "./runner-lock.mjs";
+import { createTokenRefresher } from "./token-refresh.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -180,7 +182,7 @@ const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired
 // Container jobs: the GitHub App installation token on disk (see header item 8).
 const credsDir = containerSpec ? (containerSpec.credsDir || path.join(path.dirname(specPath), CREDS_DIR_NAME)) : null;
 const tokenPath = credsDir ? path.join(credsDir, CREDS_TOKEN_NAME) : null;
-const tokenState = { generations: 0, expiresAt: 0, lastError: null, lastLoggedError: null, startFailed: null, inFlight: false };
+const tokenState = { generations: 0, expiresAt: 0, lastError: null, lastLoggedError: null, startFailed: null, nearExpiry: null };
 const TOKEN_EXPIRY_WARN_MS = 5 * 60 * 1000;
 let tokenRefresh = null;
 function writeLaunchState(state, pid = null) {
@@ -390,41 +392,51 @@ function removeCredsDir() {
   }
 }
 let minter = null;
-// Mints a fresh installation token and rewrites the file. Returns true on success. On failure the
-// previous token stays in place (it is still valid until its expiry) and the next tick retries.
-async function refreshToken(why) {
-  if (tokenState.inFlight) return false;
-  tokenState.inFlight = true;
+const refreshMs = () => Math.max(50, Number(containerSpec && containerSpec.githubApp && containerSpec.githubApp.refreshMs) || 45 * 60_000);
+const logTokenFailure = (why, msg, retryInMs) => {
+  if (msg === tokenState.lastLoggedError) return;
+  tokenState.lastLoggedError = msg;
+  const leftMs = tokenState.expiresAt ? tokenState.expiresAt - Date.now() : 0;
+  try {
+    fs.writeSync(errFd, `\n[job-runner] WARN: GitHub App installation token refresh failed (${why}): ${msg}; ` +
+      (tokenState.generations ? `keeping the current token (expires in ${Math.max(0, Math.round(leftMs / 60000))} min), retrying in ${Math.round(retryInMs / 1000)} s with backoff` : "no token yet") + "\n");
+  } catch {}
+};
+const recordNearExpiry = () => {
+  if (tokenState.nearExpiry) return;
+  tokenState.nearExpiry = { at: new Date().toISOString(), generation: tokenState.generations, lastError: tokenState.lastError };
+  try { fs.writeSync(errFd, `\n[job-runner] WARN: the installation token is within ${TOKEN_EXPIRY_WARN_MS / 60000} minutes of expiry (or expired) and has not been refreshed` +
+    `${tokenState.lastError ? ` (last error: ${tokenState.lastError})` : ""}; git/gh calls in the container will start failing\n`); } catch {}
+};
+const acceptToken = (token, expiresAt) => {
+  addRedactValue(token);
+  writeTokenFile(token);
+  tokenState.generations++;
+  tokenState.expiresAt = expiresAt;
+  if (tokenState.lastError) { try { fs.writeSync(errFd, `\n[job-runner] GitHub App installation token refreshed after earlier failures (generation ${tokenState.generations})\n`); } catch {} }
+  tokenState.lastError = null; tokenState.lastLoggedError = null;
+};
+// The FIRST token, before `docker run`. Returns true on success. Nothing is written or logged once the
+// runner is finishing (a signal can land while the mint is in flight; review round 3, C1).
+async function mintInitialToken() {
   try {
     const { token, expiresAt } = await minter.mint();
-    addRedactValue(token);
-    writeTokenFile(token);
-    tokenState.generations++;
-    tokenState.expiresAt = expiresAt;
-    if (tokenState.lastError) { try { fs.writeSync(errFd, `\n[job-runner] GitHub App installation token refreshed after earlier failures (generation ${tokenState.generations})\n`); } catch {} }
-    tokenState.lastError = null; tokenState.lastLoggedError = null;
+    if (done) return false;
+    acceptToken(token, expiresAt);
     return true;
   } catch (e) {
-    const msg = redact(String(e && e.message || e));
-    tokenState.lastError = msg;
-    const leftMs = tokenState.expiresAt ? tokenState.expiresAt - Date.now() : 0;
-    if (msg !== tokenState.lastLoggedError) {
-      tokenState.lastLoggedError = msg;
-      try {
-        fs.writeSync(errFd, `\n[job-runner] WARN: GitHub App installation token refresh failed (${why}): ${msg}; ` +
-          (tokenState.generations ? `keeping the current token (expires in ${Math.max(0, Math.round(leftMs / 60000))} min), retrying every ${refreshMs()} ms` : "no token yet") + "\n");
-      } catch {}
-    }
-    if (tokenState.generations && leftMs < TOKEN_EXPIRY_WARN_MS && !tokenState.nearExpiryLogged) {
-      tokenState.nearExpiryLogged = true;
-      try { fs.writeSync(errFd, `\n[job-runner] WARN: the installation token is within ${TOKEN_EXPIRY_WARN_MS / 60000} minutes of expiry (or expired) and refresh keeps failing; git/gh calls in the container will start failing\n`); } catch {}
-    }
+    if (done) return false;
+    tokenState.lastError = redact(String(e && e.message || e));
+    logTokenFailure("initial", tokenState.lastError, 0);
     return false;
-  } finally { tokenState.inFlight = false; }
+  }
 }
-const refreshMs = () => Math.max(50, Number(containerSpec && containerSpec.githubApp && containerSpec.githubApp.refreshMs) || 45 * 60_000);
-// Before `docker run`: the creds dir, the minter, the first token, the refresh timer. Returns true
+// Before `docker run`: the creds dir, the minter, the first token, the refresh schedule. Returns true
 // when the container may start. On failure records the cause for exit.json (startFailed).
+// Renewal (review round 3, B5; token-refresh.mjs): every refreshMs after the last success; after a
+// failure, retries with bounded backoff (30 s .. 5 min, at least once more before expiresAt - 2 min);
+// a near-expiry warning on its own timer at expiresAt - 5 min. A mint that resolves after finish()
+// is ignored.
 async function prepareGitHubToken() {
   const ga = containerSpec.githubApp;
   if (!ga || !ga.appId || !ga.keyFile || !ga.installationId || !ga.repoName) {
@@ -433,11 +445,22 @@ async function prepareGitHubToken() {
   }
   try {
     ensureCredsDir();
-    minter = createMinter({ appId: ga.appId, keyFile: ga.keyFile, installationId: ga.installationId, repoName: ga.repoName, apiBase: ga.apiBase || undefined });
+    minter = createMinter({ appId: ga.appId, keyFile: ga.keyFile, installationId: ga.installationId, repoName: ga.repoName,
+                            repo: containerSpec.repo, apiBase: ga.apiBase || undefined });
   } catch (e) { tokenState.startFailed = redact(String(e && e.message || e)); return false; }
-  if (!(await refreshToken("initial"))) { tokenState.startFailed = tokenState.lastError; return false; }
-  tokenRefresh = setInterval(() => { if (!done) refreshToken("periodic").catch(() => {}); }, refreshMs());
-  tokenRefresh.unref();
+  if (!(await mintInitialToken())) { if (!done) tokenState.startFailed = tokenState.lastError; return false; }
+  tokenRefresh = createTokenRefresher({
+    refreshMs: refreshMs(),
+    mint: () => minter.mint(),
+    onSuccess: ({ token, expiresAt }) => { if (!done) acceptToken(token, expiresAt); },
+    onFailure: (e, { retryInMs }) => {
+      if (done) return;
+      tokenState.lastError = redact(String(e && e.message || e));
+      logTokenFailure("periodic", tokenState.lastError, retryInMs);
+    },
+    onNearExpiry: () => { if (!done) recordNearExpiry(); },
+  });
+  tokenRefresh.start({ expiresAt: tokenState.expiresAt });
   return true;
 }
 
@@ -487,11 +510,14 @@ function recordExit(cleanup = null) {
     if (tokenState.startFailed) {
       warnings.push(`could not mint the GitHub App installation token: ${tokenState.startFailed}; the container was not started ` +
         `(exit ${ENTRY_EXIT_CONFIG}). Check CLAUDE_ASYNC_GITHUB_APP_ID / _KEY_FILE and that the App is installed on ${containerSpec.repo}`);
-    } else if (tokenState.lastError && (!tokenState.expiresAt || tokenState.expiresAt - Date.now() < TOKEN_EXPIRY_WARN_MS)) {
+    } else if (tokenState.nearExpiry || (tokenState.lastError && (!tokenState.expiresAt || tokenState.expiresAt - Date.now() < TOKEN_EXPIRY_WARN_MS))) {
       const expired = tokenState.expiresAt && tokenState.expiresAt <= Date.now();
-      warnings.push(`the GitHub App installation token could not be refreshed (last error: ${tokenState.lastError}) and ` +
-        `${expired ? "had expired" : "was within 5 minutes of its expiry"} when the job ended (generations minted: ${tokenState.generations}); ` +
-        "git/gh calls late in the job may have failed with authentication errors");
+      const ne = tokenState.nearExpiry;
+      const lastError = tokenState.lastError || (ne && ne.lastError) || "none recorded";
+      warnings.push(`the GitHub App installation token could not be refreshed (last error: ${lastError}) and ` +
+        (ne ? `was within 5 minutes of its expiry at ${ne.at}${!tokenState.lastError ? "; a later refresh succeeded" : expired ? " and had expired when the job ended" : ""}`
+            : `${expired ? "had expired" : "was within 5 minutes of its expiry"} when the job ended`) +
+        ` (generations minted: ${tokenState.generations}); git/gh calls late in the job may have failed with authentication errors`);
     }
     if (exitInfo.exitCode === ENTRY_EXIT_CLONE) {
       warnings.push(`the container could not clone ${containerSpec.repo} (exit ${ENTRY_EXIT_CLONE} from the image's entrypoint); ` +
@@ -535,7 +561,7 @@ async function finish(code) {
   let cleanupRecord = null;
   if (containerSpec) {
     if (containerWatch) clearInterval(containerWatch);
-    if (tokenRefresh) clearInterval(tokenRefresh);
+    if (tokenRefresh) tokenRefresh.stop();
     if (child && child.exitCode === null && child.signalCode === null) { containerState.fallbackFired = true; killClient(child); }
     try {
       // Liveness first, listing second (review round 3, B2), in EVERY launch state: a surviving
