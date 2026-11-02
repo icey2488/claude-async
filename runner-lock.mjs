@@ -25,8 +25,12 @@
  * displaced owner keeps running too. That needs three runners for one job dir inside a few
  * microseconds AND a stale lock to start from; launches give one runner per job dir.
  *
+ * EPERM / EACCES / EBUSY from link, rename or read (Windows, a file another process holds open) mean
+ * "someone has it": the result is { acquired: false, reason: "busy" }, never an exception (Argon #4).
+ *
  * hooks: test seams called at the interleaving points ({ afterRead, afterRename }), so a test can
- * run a second contender at exactly that point. Production passes none.
+ * run a second contender at exactly that point; fsImpl: the fs module (tests inject errors). Production
+ * passes neither.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -42,21 +46,27 @@ export function parseLock(text) {
   return pid > 0 ? { pid, nonce: m[2] || null } : null;
 }
 
-const readOrNull = (p) => { try { return fs.readFileSync(p, "utf8"); } catch (e) { if (e.code === "ENOENT") return null; throw e; } };
+// Windows: link/rename/unlink against a file another process holds open can fail with these instead
+// of EEXIST (Argon #4). They mean "someone has it": treated as held, never thrown.
+const BUSY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+class Busy extends Error {}
 
 // Returns { acquired: true, content } or { acquired: false, holder, reason }. Throws only on an
 // unexpected filesystem error (the caller treats that as fatal, as before).
 //   isLive(pid): is that pid a live runner (job-core's pidAlive && isOurProcess)
-export function acquireRunnerLock(lockPath, { pid = process.pid, isLive, now = Date.now, hooks = {}, nonce = crypto.randomBytes(8).toString("hex") } = {}) {
+export function acquireRunnerLock(lockPath, { pid = process.pid, isLive, now = Date.now, hooks = {}, nonce = crypto.randomBytes(8).toString("hex"),
+                                              fsImpl = fs } = {}) {
   const content = `${pid}\n${nonce}\n`;
   const tmp = `${lockPath}.tmp-${pid}-${nonce}`;
-  fs.writeFileSync(tmp, content, { flag: "wx", mode: 0o644 });
-  const link = () => { try { fs.linkSync(tmp, lockPath); return true; } catch (e) { if (e.code === "EEXIST") return false; throw e; } };
+  const busy = (e) => { if (BUSY_CODES.has(e && e.code)) throw new Busy(e.code); throw e; };
+  const readOrNull = (p) => { try { return fsImpl.readFileSync(p, "utf8"); } catch (e) { if (e.code === "ENOENT") return null; return busy(e); } };
+  fsImpl.writeFileSync(tmp, content, { flag: "wx", mode: 0o644 });
+  const link = () => { try { fsImpl.linkSync(tmp, lockPath); return true; } catch (e) { if (e.code === "EEXIST") return false; return busy(e); } };
   try {
     for (let attempt = 0; attempt < 3; attempt++) {
       if (link()) return { acquired: true, content };
       let seen, st;
-      try { seen = readOrNull(lockPath); st = seen === null ? null : fs.statSync(lockPath); } catch { seen = null; }
+      try { seen = readOrNull(lockPath); st = seen === null ? null : fsImpl.statSync(lockPath); } catch (e) { if (e instanceof Busy) throw e; seen = null; }
       if (seen === null) continue;                               // vanished between link and read: try again
       const parsed = parseLock(seen);
       if (parsed && parsed.pid === pid && parsed.nonce === nonce) return { acquired: true, content };
@@ -68,25 +78,28 @@ export function acquireRunnerLock(lockPath, { pid = process.pid, isLive, now = D
       if (hooks.afterRead) hooks.afterRead();
       // Judged stale: take it out of the way under a name only we use, then verify it is what we judged.
       const aside = `${lockPath}.stale-${pid}-${nonce}`;
-      try { fs.renameSync(lockPath, aside); }
-      catch (e) { if (e.code === "ENOENT") continue; throw e; }   // someone else moved it first: look again
+      try { fsImpl.renameSync(lockPath, aside); }
+      catch (e) { if (e.code === "ENOENT") continue; busy(e); }   // someone else moved it first: look again
       if (hooks.afterRename) hooks.afterRename();
       const moved = readOrNull(aside);
       if (moved !== seen) {
         // Not the lock we judged stale: another runner replaced it in between. Put it back (link cannot
         // overwrite a lock taken meanwhile) and give up.
-        try { fs.linkSync(aside, lockPath); } catch {}
-        try { fs.unlinkSync(aside); } catch {}
+        try { fsImpl.linkSync(aside, lockPath); } catch {}
+        try { fsImpl.unlinkSync(aside); } catch {}
         const p2 = parseLock(moved || "");
         return { acquired: false, holder: p2 ? p2.pid : null, reason: "replaced" };
       }
-      try { fs.unlinkSync(aside); } catch {}
+      try { fsImpl.unlinkSync(aside); } catch {}
       if (link()) return { acquired: true, content, tookOverFrom: parsed ? parsed.pid : null };
       const p3 = parseLock(readOrNull(lockPath) || "");
       return { acquired: false, holder: p3 ? p3.pid : null, reason: "lost-race" };
     }
     return { acquired: false, holder: null, reason: "contended" };
+  } catch (e) {
+    if (e instanceof Busy) return { acquired: false, holder: null, reason: "busy", code: e.message };
+    throw e;
   } finally {
-    try { fs.unlinkSync(tmp); } catch {}
+    try { fsImpl.unlinkSync(tmp); } catch {}
   }
 }

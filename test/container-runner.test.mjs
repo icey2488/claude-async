@@ -661,3 +661,11 @@ test("B2: reconcile scans for surviving launch processes even when docker_launch
   const c2 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0, { findDockerClients: () => [] }));
   assert.equal(c2.containerCleanup, "confirmed");
 });
+
+test("Argon #4: a 0-byte runner.lock created just before the runner starts: exit 3, no docker run", { skip: SKIP }, () => {
+  const j = setup({});
+  fs.writeFileSync(path.join(j.dir, "runner.lock"), "");
+  const r = runSync(j);
+  assert.equal(r.status, 3, r.stderr);
+  assert.ok(!j.calls().some((a) => a[0] === "run"), "docker run never invoked");
+});

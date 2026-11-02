@@ -117,3 +117,20 @@ test("(c, e2e) two runners started at the same instant for one job dir: exactly 
     assert.deepEqual([...codes].sort(), [0, 3], `round ${round}: one runner finished, the other exited 3`);
   }
 });
+
+// Argon #4 addition: on Windows, link/rename/unlink against a lock another process holds open can
+// fail with EPERM/EACCES/EBUSY instead of EEXIST. That is "held" (exit 3), never an exception.
+test("Argon #4: EPERM / EACCES / EBUSY while linking or renaming the lock read as held, not as an exception", () => {
+  for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+    for (const op of ["linkSync", "renameSync"]) {
+      const d = lockDir(); const lock = path.join(d, "runner.lock");
+      if (op === "renameSync") fs.writeFileSync(lock, `${DEAD}\n0123456789abcdef\n`);
+      else fs.writeFileSync(lock, "4242\n0123456789abcdef\n");
+      const fsImpl = { ...fs, [op]: (...a) => { if (a.includes(lock)) { const e = new Error(code); e.code = code; throw e; } return fs[op](...a); } };
+      let r;
+      assert.doesNotThrow(() => { r = acquireRunnerLock(lock, { pid: 9000, isLive: liveSet(), fsImpl }); }, `${op} ${code}`);
+      assert.equal(r.acquired, false, `${op} ${code}`);
+      assert.equal(r.reason, "busy", `${op} ${code}`);
+    }
+  }
+});

@@ -126,7 +126,10 @@ if (pidWriteDelayMs > 0) {
 {
   const lockPath = path.join(path.dirname(specPath), "runner.lock");
   const note = (msg) => { try { fs.appendFileSync(path.join(path.dirname(specPath), "err.log"), `\n[job-runner] ${msg}\n`); } catch {} };
-  const r = acquireRunnerLock(lockPath, { isLive: (pid) => pidAlive(pid) && isOurProcess(pid) });
+  let r;
+  // Any failure to take the lock means "do not run": never an uncaught exception before errFd exists.
+  try { r = acquireRunnerLock(lockPath, { isLive: (pid) => pidAlive(pid) && isOurProcess(pid) }); }
+  catch (e) { r = { acquired: false, holder: null, reason: `error ${e && e.code || (e && e.message) || e}` }; }
   if (!r.acquired) {
     note(r.reason === "held"
       ? `another runner (pid ${r.holder}) owns this job dir (runner.lock); this runner (pid ${process.pid}) exits without starting anything`
