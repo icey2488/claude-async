@@ -1330,9 +1330,9 @@ function containerLaunchPending(p, runnerFinished) {
   return pid !== null && pidAlive(pid);
 }
 
+// A write-once flag (its existence is the signal): created with O_EXCL, an existing one is kept.
 function writeCancelIntent(p, why) {
-  if (fs.existsSync(p.cancel)) return;
-  try { fs.writeFileSync(p.cancel, `${new Date().toISOString()} ${why}\n`); } catch {}
+  try { fs.writeFileSync(p.cancel, `${new Date().toISOString()} ${why}\n`, { flag: "wx" }); } catch {}
 }
 
 // Removes whatever the job still owns and confirms if it can. Returns { confirmed, removed, reason }.
