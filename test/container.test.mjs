@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn as spawnAsync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "claude-async-container-test-"));
@@ -1173,10 +1173,10 @@ test("B1: container preflight writes the machine-wide container-mode marker befo
 const B3_ID = "claunker.scan-20261102-abcd1234";
 test("B3: the label matcher takes only the complete --label argument token", () => {
   const yes = [
-    `"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe" run --rm --name claude-async-${B3_ID} --label claude-async.job=${B3_ID} --init img`,
-    `com.docker.cli.exe run --rm --label claude-async.job=${B3_ID}`,
-    `docker run --label=claude-async.job=${B3_ID} --init`,
-    `docker run --label "claude-async.job=${B3_ID}" --init`,
+    `"C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe" run --rm --pull=never --name claude-async-${B3_ID} --label claude-async.job=${B3_ID} --init img`,
+    `com.docker.cli.exe run --rm --pull=never --label claude-async.job=${B3_ID}`,
+    `docker run --pull=never --label=claude-async.job=${B3_ID} --init`,
+    `docker run --pull=never --label "claude-async.job=${B3_ID}" --init`,
   ];
   for (const l of yes) assert.equal(core.processScanMatches(l, B3_ID), true, l);
   const no = [
@@ -1190,6 +1190,13 @@ test("B3: the label matcher takes only the complete --label argument token", () 
     // a label value that merely contains it
     `docker run --label other=claude-async.job=${B3_ID}`,
     `docker run --label claude-async.jobx=${B3_ID}`,
+    // job-core's / the runner's own listing and removal (Argon #1): never a launch
+    `docker ps -a --no-trunc --filter label=claude-async.job=${B3_ID} --format {{.ID}}`,
+    `docker ps -a --no-trunc --filter label=claude-async.job=${B3_ID} --label claude-async.job=${B3_ID}`,
+    `docker rm -f --label claude-async.job=${B3_ID}`,
+    `docker inspect --pull=never --label claude-async.job=${B3_ID}`,
+    // the label form but not our run (no --pull=never)
+    `docker run --rm --label claude-async.job=${B3_ID} img`,
   ];
   for (const l of no) assert.equal(core.processScanMatches(l, B3_ID), false, l);
 });
@@ -1197,6 +1204,7 @@ test("B3: the label matcher takes only the complete --label argument token", () 
 test("B3: the Windows scan script excludes its own $PID and PowerShell processes, and prints pid, name and command line", () => {
   const ps = core.buildWin32ProcessScanScript(B3_ID);
   assert.match(ps, /\$_\.ProcessId -ne \$PID/);
+  assert.match(ps, /Contains\('--pull=never'\)/, "Argon #1: only our docker run, never a docker ps --filter label=...");
   assert.match(ps, /powershell/i); assert.match(ps, /pwsh/i);
   assert.ok(ps.includes(`claude-async.job=${B3_ID}`));
   // findDockerClientsForJob on win32 (seamed spawnSync): only the real client survives the JS-side
@@ -1204,8 +1212,8 @@ test("B3: the Windows scan script excludes its own $PID and PowerShell processes
   const out = [
     `4242\tpowershell.exe\t${"powershell.exe -NoProfile -Command " + ps}`,
     `4343\tpwsh.exe\tpwsh -c "... --label claude-async.job=${B3_ID} ..."`,
-    `5000\tdocker.exe\tdocker.exe run --rm --label claude-async.job=${B3_ID} --init img`,
-    `5001\tcom.docker.cli.exe\tcom.docker.cli.exe run --rm --label claude-async.job=${B3_ID} --init img`,
+    `5000\tdocker.exe\tdocker.exe run --rm --pull=never --label claude-async.job=${B3_ID} --init img`,
+    `5001\tcom.docker.cli.exe\tcom.docker.cli.exe run --rm --pull=never --label claude-async.job=${B3_ID} --init img`,
     `5002\tdocker.exe\tdocker.exe run --rm --label claude-async.job=${B3_ID}9 --init img`,
   ].join("\r\n") + "\r\n";
   const calls = [];
@@ -1221,9 +1229,9 @@ test("B3: the Windows scan script excludes its own $PID and PowerShell processes
 test("B3: the POSIX scan matches the exact token and excludes the ps process itself", () => {
   const out = [
     `  100 ps -eo pid=,args= --label claude-async.job=${B3_ID}`,
-    `  200 docker run --rm --label claude-async.job=${B3_ID} --init img`,
+    `  200 docker run --rm --pull=never --label claude-async.job=${B3_ID} --init img`,
     `  300 docker run --rm --label claude-async.job=${B3_ID}0 --init img`,
-    `  400 node fake-docker.mjs __creator x --label claude-async.job=${B3_ID}`,
+    `  400 node fake-docker.mjs __creator x -- run --rm --pull=never --label claude-async.job=${B3_ID}`,
   ].join("\n");
   assert.deepEqual(core.findDockerClientsForJob(B3_ID, { spawnSync: () => ({ status: 0, stdout: out, pid: 100 }), platform: "linux" }), [200, 400]);
   // the real ps on this machine: no such job -> []
@@ -1240,4 +1248,19 @@ test("B2: classifyClientExit: only an exit after the container was seen running,
   assert.equal(k({ observedRunning: false, code: null, signal: "SIGTERM", platform: "darwin" }), "exited-uncertain");
   // win32: TerminateProcess shows up as an ordinary exit code, so without the observation nothing is conclusive
   for (const code of [0, 1, 125, 137]) assert.equal(k({ observedRunning: false, code, signal: null, platform: "win32" }), "exited-uncertain", String(code));
+});
+
+test("B3 / Argon #1: live processes: a `docker ps --filter label=...` and a `docker rm` are never launch clients; a `run --pull=never --label` one is", { skip: process.platform === "win32" }, async () => {
+  const id = `${B3_ID}-live-${crypto.randomBytes(3).toString("hex")}`;
+  const keep = "setTimeout(() => {}, 20000)";
+  const kids = [
+    spawnAsync(process.execPath, ["-e", keep, "--", "docker", "ps", "-a", "--no-trunc", "--filter", `label=claude-async.job=${id}`, "--format", "{{.ID}}"]),
+    spawnAsync(process.execPath, ["-e", keep, "--", "docker", "rm", "-f", "--label", `claude-async.job=${id}`]),
+    spawnAsync(process.execPath, ["-e", keep, "--", "docker", "run", "--rm", "--pull=never", "--label", `claude-async.job=${id}x`]),
+  ];
+  const client = spawnAsync(process.execPath, ["-e", keep, "--", "docker", "run", "--rm", "--pull=never", "--name", `claude-async-${id}`, "--label", `claude-async.job=${id}`, "img"]);
+  try {
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(core.findDockerClientsForJob(id), [client.pid], "only the run client");
+  } finally { for (const k of [...kids, client]) k.kill("SIGKILL"); }
 });

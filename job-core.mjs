@@ -1400,17 +1400,23 @@ const confirmHoldMs = () => Number(process.env.CLAUDE_ASYNC_CONTAINER_CONFIRM_HO
 // this one's can match; and the scanner excludes itself ($PID and PowerShell processes on win32, the
 // ps child's pid on POSIX) and the calling node process.
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Also (Argon #1) only a `docker run` of ours: the `run` subcommand and `--pull=never` must both be
+// whole tokens, so job-core's and the runner's own `docker ps --filter label=...` and `docker rm`
+// (or an inspect) can never count as a launch still in progress.
 export function processScanMatches(cmdline, jobId) {
+  const line = String(cmdline || "");
   const label = escapeRe(`${CONTAINER_JOB_LABEL}=${jobId}`);
-  return new RegExp(`(?:^|\\s)--label(?:=|\\s+)(["']?)${label}\\1(?=\\s|$)`).test(String(cmdline || ""));
+  return /(?:^|\s)["']?run["']?(?=\s)/.test(line) && /(?:^|\s)["']?--pull=never["']?(?=\s|$)/.test(line) &&
+    new RegExp(`(?:^|\\s)--label(?:=|\\s+)(["']?)${label}\\1(?=\\s|$)`).test(line);
 }
 export function buildWin32ProcessScanScript(jobId) {
   const needle = `${CONTAINER_JOB_LABEL}=${jobId}`.replace(/'/g, "''");
   // Prefilter by substring in PowerShell (cheap), print "<pid>\t<name>\t<command line>"; the exact
   // token match runs in JS (processScanMatches). $PID is this PowerShell; powershell/pwsh are excluded
   // by name as well (a scanner started by another check of the same job).
-  return `$n = '${needle}'; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ` +
-    "$_.Name -notmatch '^(powershell|pwsh)(\\.exe)?$' -and $_.CommandLine -and $_.CommandLine.Contains($n) } | " +
+  return `$n = '${needle}'; Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.ProcessId -ne ${process.pid} -and ` +
+    "$_.Name -notmatch '^(powershell|pwsh)(\\.exe)?$' -and $_.CommandLine -and $_.CommandLine.Contains($n) -and " +
+    "$_.CommandLine.Contains('--pull=never') } | " +
     "ForEach-Object { \"$($_.ProcessId)`t$($_.Name)`t$($_.CommandLine -replace '[\\r\\n]', ' ')\" }";
 }
 export function findDockerClientsForJob(jobId, { spawnSync: run = spawnSync, platform = process.platform } = {}) {
