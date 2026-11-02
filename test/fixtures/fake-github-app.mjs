@@ -74,6 +74,7 @@ function serve(dir) {
 
 export async function startFakeGitHub(dir, { publicKey }) {
   fs.mkdirSync(dir, { recursive: true });
+  for (const f of ["port", "calls.jsonl", "tokens", "fail-mint", "expires-ms"]) fs.rmSync(path.join(dir, f), { force: true }); // a stale state dir from an earlier run
   fs.writeFileSync(path.join(dir, "public.pem"), publicKey.export({ type: "spki", format: "pem" }));
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), dir], { stdio: "ignore" });
   const portFile = path.join(dir, "port");
