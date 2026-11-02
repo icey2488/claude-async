@@ -214,13 +214,15 @@ test("buildContainerEnv: extraEnv secrets are dropped, and the name guard throws
   assert.throws(() => Object.defineProperty(c.FORWARDED_ENV_KEYS, 0, { value: "GH_TOKEN" }));
 });
 
-test("phase 2 egress proxy: proxy env is added only when configured", () => {
+test("phase 2 egress proxy: proxy env is added only when configured, and the host gateway is not", () => {
   const fx = fixture();
   const names = (argv) => allValuesAfter(argv, "-e").map((e) => e.split("=")[0]);
   assert.ok(!names(sampleArgv(fx).argv).includes("HTTPS_PROXY"));
+  assert.equal(valueAfter(sampleArgv(fx).argv, "--add-host"), "host.docker.internal:host-gateway", "phase 1 reaches host Ollama");
   const { argv } = sampleArgv(fx, { cfg: { egressProxy: "http://egress-proxy:3128", network: "claude-jobs" } });
   assert.ok(allValuesAfter(argv, "-e").includes("HTTPS_PROXY=http://egress-proxy:3128"));
   assert.equal(valueAfter(argv, "--network"), "claude-jobs");
+  assert.ok(!argv.includes("--add-host"), "phase 2: no route to the host except through the proxy");
 });
 
 test("CLI argv inside the container: prompt last after \"--\", model bound with \"=\", inline empty MCP", () => {
@@ -350,6 +352,14 @@ test("checkEnvFile: refuses unknown keys (ANTHROPIC_API_KEY), bare keys, empties
     ["GH_TOKEN=a\r\nCLAUDE_CODE_OAUTH_TOKEN=b\r\n", /CRLF/],
     ["\ufeffGH_TOKEN=a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /BOM/],
     ["GH_TOKEN=a\n", /missing CLAUDE_CODE_OAUTH_TOKEN/],
+    // docker --env-file keeps these literally, so the token inside the container would be wrong
+    ['GH_TOKEN="ghp_a"\nCLAUDE_CODE_OAUTH_TOKEN=b\n', /GH_TOKEN contains a quote/],
+    ["GH_TOKEN='ghp_a'\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains a quote/],
+    ["GH_TOKEN=ghp_a # bot\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains whitespace/],
+    ["GH_TOKEN= ghp_a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN has leading or trailing whitespace/],
+    ["GH_TOKEN=ghp_a \nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN has leading or trailing whitespace/],
+    ["GH_TOKEN=ghp\ta\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains whitespace/],
+    ["GH_TOKEN=ghp\u0007a\nCLAUDE_CODE_OAUTH_TOKEN=b\n", /GH_TOKEN contains a control character/],
   ];
   for (const [body, re] of cases) {
     fs.writeFileSync(fx.envFile, body);

@@ -253,8 +253,16 @@ function defaultRealpath(p) {
   return stripLongPathPrefix(fs.realpathSync.native(p));
 }
 
+// Docker's --env-file parser keeps everything after the first "=" literally: quotes, a trailing
+// " # comment", surrounding spaces. Neither token ever contains whitespace or quotes, so any of
+// those means the file is wrong (the job would fail auth with a confusing error at run time).
 function badEnvValue(v) {
-  return v.trim() === "" ? "is empty" : null;
+  if (v === "") return "is empty";
+  if (/^\s|\s$/.test(v)) return "has leading or trailing whitespace";
+  if (/["'`]/.test(v)) return "contains a quote character (docker --env-file does not strip quotes)";
+  if (/\s/.test(v)) return "contains whitespace (a trailing # comment is not stripped by docker either)";
+  if (CONTROL_RE.test(v)) return "contains a control character";
+  return null;
 }
 
 // Parses the env file's text. Returns { entries: [[key, value]] } or { error } (error text never
@@ -482,9 +490,11 @@ export function buildDockerRunArgv({ plan, cliArgv, extraEnv = {} }) {
     "--security-opt", "no-new-privileges", "--cap-drop", "ALL",
     "--cpus", cpus, "--memory", cfg.memory, "--memory-swap", cfg.memory, "--pids-limit", cfg.pidsLimit,
     "--network", cfg.network,
-    "--add-host", "host.docker.internal:host-gateway",
-    "--env-file", plan.envFile,
   ];
+  // Phase 1 reaches host Ollama through the host gateway. Phase 2 (egress proxy on an internal
+  // network) has no route to the host except through the proxy, so the gateway name is not added.
+  if (!cfg.egressProxy) argv.push("--add-host", "host.docker.internal:host-gateway");
+  argv.push("--env-file", plan.envFile);
   for (const [k, v] of buildContainerEnv({ extraEnv, cfg, jobId, repo: plan.repo, baseRef: plan.baseRef })) argv.push("-e", `${k}=${v}`);
   argv.push(
     "--mount", `type=bind,source=${mounts.claudeMd},target=${CONTAINER_CLAUDE_MD},readonly`,
