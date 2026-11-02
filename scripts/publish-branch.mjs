@@ -14,6 +14,10 @@
  *      default branch, not main/master, strict name pattern), a clean tree, and the origin remote
  *      (github.com, owner in the allowed-owner list -- fetch AND every push URL, after git's own
  *      insteadOf/pushInsteadOf expansion, so repo config can't redirect the push).
+ *      Repo-local (and worktree) git config must use only allowlisted keys, because local config can
+ *      run commands or capture credentials during status/push (credential.helper, core.fsmonitor,
+ *      core.sshCommand, filter.*, include.*, http.*...). Every git call also runs with
+ *      core.fsmonitor=false and core.hooksPath pointed at a nonexistent random dir, so repo hooks never run.
  *   2. Pushes exactly `HEAD:refs/heads/<branch>` to origin with --set-upstream. Never --force,
  *      --force-with-lease, --mirror, --all, --tags, --delete, or --no-verify (assertSafePushArgv()
  *      re-checks the final argv before it runs).
@@ -43,6 +47,7 @@
  *                           whatever they name is what runs the push.
  */
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +64,7 @@ export const EXIT = Object.freeze({
   UPSTREAM_REFUSED: 14,// --upstream malformed or not origin's fork parent
   INPUT_REFUSED: 15,   // title or body file failed validation
   AUDIT_FAILED: 16,    // audit log not writable -- refuse rather than publish unaudited
+  CONFIG_REFUSED: 17,  // repo-local git config has a key outside the safe allowlist
   PUSH_FAILED: 20,     // git push itself failed (auth, non-fast-forward, network)
   TOOL_FAILED: 21,     // a read-only git/gh query needed for validation failed
   INTERNAL: 30,        // unexpected exception
@@ -182,6 +188,44 @@ export function validateTitle(title) {
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f]/.test(title)) return "title contains control characters or newlines";
   return null;
+}
+
+// Repo-local / worktree config keys a publish will tolerate (matched case-insensitively against
+// `git config --list --name-only --show-scope`). Anything else refuses the publish: local config
+// can execute commands or receive credentials during `git status` / `git push` (credential.helper,
+// core.fsmonitor, core.hooksPath, core.sshCommand, core.gitProxy, filter.*.clean/smudge,
+// include.path/includeIf, http.*.proxy/sslVerify, ...). url.*.insteadOf/pushInsteadOf are allowed
+// here only because the expanded-URL check below already pins where they can point.
+export const SAFE_LOCAL_CONFIG_KEYS = Object.freeze([
+  /^core\.(repositoryformatversion|filemode|bare|logallrefupdates|symlinks|ignorecase|precomposeunicode|autocrlf|eol|safecrlf|longpaths|checkstat|trustctime)$/i,
+  /^remote\..+\.(url|pushurl|fetch|tagopt|prune|gh-resolved)$/i,
+  /^branch\..+\.(remote|merge|rebase|pushremote|description|gh-merge-base|vscode-merge-base)$/i,
+  /^url\..+\.(insteadof|pushinsteadof)$/i,
+  /^user\.(name|email)$/i,
+  /^(pull\.rebase|pull\.ff|fetch\.prune|push\.autosetupremote|push\.default|init\.defaultbranch|commit\.gpgsign|gc\.auto)$/i,
+  /^extensions\.(worktreeconfig|objectformat|refstorage)$/i,
+]);
+
+// Takes `git config --list --name-only --show-scope` output; returns the local/worktree keys that
+// are not on the allowlist (empty array = fine). Global/system/command scopes are the user's own.
+export function findUnsafeConfig(listOutput) {
+  const bad = [];
+  for (const raw of String(listOutput).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const tab = line.indexOf("\t");
+    const scope = tab > 0 ? line.slice(0, tab) : "";
+    const key = tab > 0 ? line.slice(tab + 1) : line;
+    if (scope !== "local" && scope !== "worktree") continue;
+    if (!SAFE_LOCAL_CONFIG_KEYS.some((re) => re.test(key))) bad.push(`${scope}:${key}`);
+  }
+  return bad;
+}
+
+// Global options prepended to every git call: no fsmonitor command, and hooks resolved from a
+// directory that does not exist (random per run), so a planted .git/hooks/pre-push never runs.
+export function hardenedGitPrefix(noHooksDir) {
+  return ["-c", "core.fsmonitor=false", "-c", `core.hooksPath=${noHooksDir}`];
 }
 
 const FORBIDDEN_PUSH_FLAGS = ["--force", "-f", "--force-with-lease", "--force-if-includes", "--mirror",
@@ -315,7 +359,9 @@ export async function publish(argv, { env = process.env, platform = process.plat
       throw new Refusal(EXIT.REPO_REFUSED, `repo ${repoReal} is outside the allowed roots (${roots.join(", ")})`);
     }
     let top = null;
-    const git = (a, o = {}) => run(gitCmd, ["-C", top || repoReal, ...a], { env: cenv, ...o });
+    const noHooksDir = path.join(tmpDir, `publish-nohooks-${crypto.randomUUID()}`); // never created
+    const gitPrefix = hardenedGitPrefix(noHooksDir);
+    const git = (a, o = {}) => run(gitCmd, [...gitPrefix, "-C", top || repoReal, ...a], { env: cenv, ...o });
     const tl = await git(["rev-parse", "--show-toplevel"]);
     if (!tl.ok) throw new Refusal(EXIT.REPO_REFUSED, `not a git work tree: ${repoReal}`);
     top = realpathOrNull(firstLine(tl.stdout));
@@ -323,6 +369,14 @@ export async function publish(argv, { env = process.env, platform = process.plat
       throw new Refusal(EXIT.REPO_REFUSED, `repo top-level ${firstLine(tl.stdout)} is outside the allowed roots`);
     }
     result.repo = top;
+
+    // --- repo-local config (before anything that could run a filter, e.g. git status) --------
+    const cfg = await git(["config", "--list", "--name-only", "--show-scope"]);
+    if (!cfg.ok) throw new Refusal(EXIT.TOOL_FAILED, `git config --list --show-scope failed (git 2.26+ required): ${tail(cfg.stderr)}`);
+    const unsafe = findUnsafeConfig(cfg.stdout);
+    if (unsafe.length) {
+      throw new Refusal(EXIT.CONFIG_REFUSED, `repo-local git config has keys outside the publish allowlist: ${unsafe.slice(0, 10).join(", ")}; remove them or publish by hand`);
+    }
 
     // --- branch --------------------------------------------------------------------------
     const sym = await git(["symbolic-ref", "--quiet", "HEAD"]);
@@ -447,7 +501,7 @@ export async function publish(argv, { env = process.env, platform = process.plat
         ...(upstream ? [{ bin: "gh", argv: ["repo", "view", `${origin.owner}/${origin.repo}`, "--json", "parent"] },
                         { bin: "gh", argv: ["repo", "view", prRepo, "--json", "defaultBranchRef"] }] : []),
         ...(!upstream && !defaultBranch ? [{ bin: "gh", argv: ["repo", "view", prRepo, "--json", "defaultBranchRef"] }] : []),
-        { bin: "git", argv: ["-C", top, ...pushArgv] },
+        { bin: "git", argv: [...gitPrefix, "-C", top, ...pushArgv] },
         { bin: "gh", argv: ["pr", "list", `--repo=${prRepo}`, `--head=${branch}`, "--state=open", "--json=url,headRepositoryOwner"] },
         { bin: "gh", argv: createArgv(base, bodyReal ? "<private temp copy of the validated body file>" : null) },
       ];

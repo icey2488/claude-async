@@ -421,7 +421,10 @@ test("dry run: validates, prints the exact argv, pushes nothing, never calls gh"
   assert.ok(!readJsonl(GIT_LOG).some((a) => a.includes("push")), "dry run must not invoke git push");
   assert.ok(!bareHasBranch(bare, "feat/thing"));
   const push = result.plannedCommands.find((c) => c.bin === "git");
-  assert.deepEqual(push.argv, ["-C", fs.realpathSync.native(dir), ...pb.buildPushArgv("feat/thing")]);
+  const tailArgv = ["-C", fs.realpathSync.native(dir), ...pb.buildPushArgv("feat/thing")];
+  assert.deepEqual(push.argv.slice(-tailArgv.length), tailArgv);
+  assert.deepEqual(push.argv.slice(0, 2), ["-c", "core.fsmonitor=false"]);
+  assert.match(push.argv[3], /^core\.hooksPath=.*publish-nohooks-/);
   assert.ok(result.plannedCommands.some((c) => c.bin === "gh" && c.argv[1] === "create"));
   for (const c of result.plannedCommands) for (const a of c.argv) assert.ok(!/^(--force|--mirror$|--all$|--tags$|--no-verify$)/.test(a), a);
   assert.equal(readJsonl(AUDIT).at(-1).action, "dry-run");
@@ -479,4 +482,59 @@ test("CLI: the trust seam is unreachable, so a locally-rewritten origin is refus
   assert.ok(!bareHasBranch(bare, "feat/thing"));
   const dry = cli(["--repo", dir, "--dry-run"]);
   assert.equal(dry.status, pb.EXIT.REMOTE_REFUSED);
+});
+
+test("findUnsafeConfig: only local/worktree keys outside the allowlist are flagged", () => {
+  const out = [
+    "system\tcredential.helper", "global\tcredential.helper", "global\tcore.sshcommand", "command\tcore.fsmonitor",
+    "local\tcore.repositoryformatversion", "local\tremote.origin.url", "local\tremote.origin.fetch",
+    "local\turl./tmp/b.git.insteadof", "local\tbranch.feat/x.remote", "local\tuser.email",
+    "local\tcredential.helper", "local\tcore.fsmonitor", "local\tcore.hookspath", "local\tcore.sshcommand",
+    "local\tfilter.lfs.clean", "local\tinclude.path", "local\thttp.proxy", "worktree\tcore.gitproxy",
+    "local\tremote.origin.receivepack", "local\tremote.origin.mirror",
+  ].join("\n");
+  assert.deepEqual(pb.findUnsafeConfig(out), [
+    "local:credential.helper", "local:core.fsmonitor", "local:core.hookspath", "local:core.sshcommand",
+    "local:filter.lfs.clean", "local:include.path", "local:http.proxy", "worktree:core.gitproxy",
+    "local:remote.origin.receivepack", "local:remote.origin.mirror",
+  ]);
+  assert.deepEqual(pb.findUnsafeConfig(""), []);
+});
+
+test("refuses repo-local config that could run commands or capture credentials, before git status or push", async () => {
+  const cases = [
+    ["credential.helper", "!node -e 0"],
+    ["core.fsmonitor", "node -e 0"],
+    ["core.hooksPath", "hooks"],
+    ["core.sshCommand", "ssh -v"],
+    ["filter.x.clean", "cat"],
+    ["include.path", "../evil.cfg"],
+    ["http.proxy", "http://127.0.0.1:9"],
+  ];
+  for (const [key, value] of cases) {
+    const { dir, bare } = makeRepo();
+    tgit(dir, "config", key, value);
+    const { result, exitCode } = await pub(["--repo", dir, "--title", "T"], { bare });
+    assert.equal(exitCode, pb.EXIT.CONFIG_REFUSED, `${key}: ${JSON.stringify(result)}`);
+    assert.match(result.errors[0], new RegExp(key.split(".")[0], "i"));
+    assert.ok(!bareHasBranch(bare, "feat/thing"), `${key}: nothing may be pushed`);
+    const gitCalls = readJsonl(GIT_LOG);
+    assert.ok(!gitCalls.some((a) => a.includes("status") || a.includes("push")), `${key}: refused before status/push`);
+    assert.equal(readJsonl(AUDIT).at(-1).result, "refused");
+  }
+});
+
+test("a planted pre-push hook never runs, and fsmonitor is forced off on every git call", async () => {
+  const { dir, bare } = makeRepo();
+  const marker = path.join(TMP, `hook-ran-${Date.now()}`);
+  const hook = path.join(dir, ".git", "hooks", "pre-push");
+  fs.writeFileSync(hook, `#!/bin/sh\necho ran > "${marker.replace(/\\/g, "/")}"\nexit 0\n`, { mode: 0o755 });
+  const { result, exitCode } = await pub(["--repo", dir, "--title", "T"], { bare });
+  assert.equal(exitCode, 0, JSON.stringify(result));
+  assert.ok(bareHasBranch(bare, "feat/thing"));
+  assert.ok(!fs.existsSync(marker), "pre-push hook must not run");
+  for (const a of readJsonl(GIT_LOG)) {
+    assert.deepEqual(a.slice(0, 2), ["-c", "core.fsmonitor=false"], JSON.stringify(a));
+    assert.match(a[3], /^core\.hooksPath=/);
+  }
 });

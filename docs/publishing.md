@@ -24,6 +24,16 @@ argument can be read as a command. In order, it:
    Both must be inside an allowed root: `D:\code` on win32 by default, or `PUBLISH_ALLOWED_ROOTS`
    (separated by `;` on Windows, `:` on POSIX). Because the check uses the realpath, a symlink or
    junction inside the root that points outside it is refused. If no root exists, it refuses.
+   **Repo-local config.** Before anything that could run a filter (such as `git status`), every key in
+   the repo's local and worktree git config (`git config --list --name-only --show-scope`) must be on
+   a small allowlist: basic `core.*` settings, `remote.*.url/pushurl/fetch`, `branch.*` tracking,
+   `url.*.insteadOf/pushInsteadOf` (pinned by the expanded-URL check below), `user.name/email`, and a
+   few harmless toggles. Anything else is refused with exit 17. This matters because local config
+   can run commands or receive credentials during status or push: a local `credential.helper` is
+   handed your GitHub credential when git stores it after a successful push, and `core.fsmonitor`,
+   `core.sshCommand`, `core.gitProxy`, `filter.*`, `include.*` and `http.*` can all execute code or
+   redirect traffic. Every git call also runs with `-c core.fsmonitor=false` and `core.hooksPath`
+   set to a random nonexistent directory, so a planted `.git/hooks/pre-push` never runs.
 2. **Branch.** Refuses a detached HEAD, `main`, `master`, and the default branch from
    `refs/remotes/origin/HEAD`. If that ref is missing, it asks gh for the default branch before
    pushing. The branch name must match
@@ -49,7 +59,7 @@ argument can be read as a command. In order, it:
    `gh repo view <origin> --json parent` reports that origin is a fork of exactly that repo. The PR
    then targets upstream's default branch with `--head <origin-owner>:<branch>`.
 7. **Push.** It runs exactly one push:
-   `git -C <repo> push --set-upstream --porcelain --no-follow-tags --recurse-submodules=no origin HEAD:refs/heads/<branch>`.
+   `git -c core.fsmonitor=false -c core.hooksPath=<none> -C <repo> push --set-upstream --porcelain --no-follow-tags --recurse-submodules=no origin HEAD:refs/heads/<branch>`.
    `assertSafePushArgv()` re-checks this argv before it runs. Any `--force*`, `-f`, `--mirror`,
    `--all`, `--tags`, `--delete`, `--no-verify`, `+`-refspec, second refspec, or remote other than
    origin throws. The child environment gets `GIT_TERMINAL_PROMPT=0` and `GH_PROMPT_DISABLED=1`, and
@@ -88,6 +98,7 @@ Stdout is always exactly one JSON object:
 | 14 | `--upstream` malformed, equal to origin, or not origin's fork parent |
 | 15 | title or body file failed validation |
 | 16 | audit log not writable (the script refuses to publish unaudited) |
+| 17 | repo-local or worktree git config has a key outside the allowlist |
 | 20 | `git push` itself failed (auth, non-fast-forward, network) |
 | 21 | a gh query needed for validation failed |
 | 30 | internal error |
