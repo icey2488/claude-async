@@ -707,6 +707,19 @@ export function cleanupJobContainers({ dockerBin, jobId, spawnSync = nodeSpawnSy
            ...(errors.length ? { errors } : {}) };
 }
 
+// Windows ACL of a job's creds dir (review round 3): job-runner.mjs runs
+//   icacls <dir> /inheritance:r /grant:r <DOMAIN\user>:(OI)(CI)F *S-1-5-18:(OI)(CI)F
+// right after creating it, so the token file inside inherits exactly the job's own account and
+// SYSTEM (S-1-5-18, by SID so a localized Windows still matches), not the profile's inherited ACL.
+// Docker Desktop's file sharing runs as the same user or as SYSTEM. Throws when the account name is
+// unknown or unusable (the runner then refuses to start the container).
+export function buildCredsDirIcaclsArgv(dir, env = process.env) {
+  const user = env.USERNAME;
+  if (!user || /[:\\/"*?<>|\r\n]/.test(user)) throw new Error(`cannot restrict the creds dir ACL: USERNAME ${JSON.stringify(user ?? null)} is missing or unusable`);
+  const domain = env.USERDOMAIN && !/[:\\/"*?<>|\r\n]/.test(env.USERDOMAIN) ? `${env.USERDOMAIN}\\` : "";
+  return [dir, "/inheritance:r", "/grant:r", `${domain}${user}:(OI)(CI)F`, "*S-1-5-18:(OI)(CI)F"];
+}
+
 // How conclusive a docker client's exit is (review round 3, B2), for the runner's docker_launch state:
 //   "exited"           the launch is over: the runner saw the job's container listed while the client
 //                      ran (creation had completed), or, on POSIX, the client ended with an exit status

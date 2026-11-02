@@ -94,7 +94,7 @@
  * window. Uses Atomics.wait for a synchronous block since the pid write happens before any async
  * machinery (heartbeat, child spawn) is set up. Production never sets this env var.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -106,7 +106,7 @@ import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
 import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
          redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER, listJobContainers,
-         classifyClientExit } from "./container.mjs";
+         classifyClientExit, buildCredsDirIcaclsArgv } from "./container.mjs";
 import { createMinter } from "./github-app.mjs";
 import { acquireRunnerLock } from "./runner-lock.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
@@ -368,6 +368,15 @@ function ensureCredsDir() {
   fs.mkdirSync(credsDir, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(credsDir, 0o700); } catch {}
   chownToContainer(credsDir);
+  // win32 (review round 3): mode bits mean nothing there; replace the inherited profile ACL with the
+  // job's own account and SYSTEM only (container.mjs buildCredsDirIcaclsArgv). A failure refuses the
+  // start (the caller records it as startFailed): no token is written into a dir we could not lock.
+  if (process.platform === "win32") {
+    const r = spawnSync("icacls", buildCredsDirIcaclsArgv(credsDir), { encoding: "utf8", timeout: 15_000, windowsHide: true });
+    if (r.error || r.status !== 0) {
+      throw new Error(`could not restrict the ACL of ${credsDir} with icacls (${r.error ? r.error.code || r.error.message : `exit ${r.status}: ${String(r.stderr || r.stdout || "").trim().slice(0, 200)}`})`);
+    }
+  }
 }
 // Atomic publication (review round 3): each generation goes to a private temp file in the creds dir
 // (0600, handed to the container's uid, fsynced) and is renamed over `token`. The container holds the

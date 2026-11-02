@@ -18,6 +18,7 @@
  * file takes effect at the next refresh without restarting anything).
  */
 import crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { isInside } from "./scripts/publish-branch.mjs";
@@ -73,11 +74,54 @@ function stripLongPathPrefix(r) {
 }
 const defaultRealpath = (p) => stripLongPathPrefix(fs.realpathSync.native(p));
 
-// Checks the key file's existence, kind, size, shape (a PEM private key) and, on POSIX, that only
-// the owner can read it (mode & 077 == 0). On win32 the mode bits carry nothing; the ACL expectation
-// (owner + SYSTEM only, set with icacls in the rollout) is documented, not checked. Never returns
-// the key material. forbidInside: roots the file must not be in (the checkout, the mount sources).
-export function checkAppKeyFile(keyFile, { platform = process.platform, forbidInside = [], realpath = defaultRealpath, fsImpl = fs } = {}) {
+// Windows ACL check of the key file (review round 3). `icacls <file>` prints the path followed by one
+// "<principal>:<rights>" entry per line, then a blank line and a summary. Returns [{ principal,
+// rights }] or null when the output is not that shape (the caller then refuses: conservative).
+const BROAD_PRINCIPALS = new Set(["everyone", "users", "builtin\\users", "authenticated users", "nt authority\\authenticated users",
+  "anonymous logon", "nt authority\\anonymous logon", "*s-1-1-0", "*s-1-5-32-545", "*s-1-5-11", "*s-1-5-7"]);
+export function parseIcaclsAces(stdout, file) {
+  const lines = String(stdout || "").split(/\r?\n/);
+  const aces = [];
+  let i = 0;
+  for (; i < lines.length; i++) {
+    let l = lines[i];
+    if (!l.trim()) break;
+    if (i === 0) {
+      const at = l.toLowerCase().indexOf(String(file).toLowerCase());
+      if (at !== 0) return null;
+      l = l.slice(String(file).length);
+    }
+    const m = /^\s*(.+?):((?:\([A-Za-z,]+\))+)\s*$/.exec(l);
+    if (!m) return null;
+    aces.push({ principal: m[1].trim(), rights: m[2] });
+  }
+  const summary = lines.slice(i).join("\n");
+  if (!aces.length || !/Successfully processed 1 files/i.test(summary)) return null;
+  return aces;
+}
+const defaultIcacls = (file) => spawnSync("icacls", [file], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+function checkWin32KeyAcl(real, icacls) {
+  const fixHint = `run: icacls "${real}" /inheritance:r /grant:r "%USERNAME%:F" "SYSTEM:F" (docs/container-jobs.md rollout step 6)`;
+  let r;
+  try { r = icacls(real); } catch (e) { r = { error: e }; }
+  if (!r || r.error) return `could not check the ACL of the GitHub App key file ${real}: icacls failed to run (${(r && r.error && (r.error.code || r.error.message)) || "no result"}); refusing to use a key whose ACL cannot be checked`;
+  if (r.status !== 0) return `could not check the ACL of the GitHub App key file ${real}: icacls exited ${r.status} (${String(r.stderr || r.stdout || "").trim().slice(0, 200)}); refusing to use a key whose ACL cannot be checked`;
+  const aces = parseIcaclsAces(r.stdout, real);
+  if (!aces) return `the ACL of the GitHub App key file ${real} could not be parsed from icacls output; refusing to use it. Check it by hand and ${fixHint}`;
+  const broad = aces.filter((a) => BROAD_PRINCIPALS.has(a.principal.toLowerCase()) && !/\(DENY\)/i.test(a.rights));
+  if (broad.length) {
+    return `the GitHub App key file ${real} grants ${broad.map((a) => `${a.principal} ${a.rights}`).join(", ")} access (icacls); only your account and SYSTEM may read it. ` +
+      `Anything that can read the key can act as the App on every repo it is installed on; ${fixHint}`;
+  }
+  return null;
+}
+
+// Checks the key file's existence, kind, size, shape (a PEM private key) and that only the owner can
+// read it: on POSIX mode & 077 == 0; on win32 (review round 3) its ACL through icacls, refusing any
+// entry that grants Everyone, Users, Authenticated Users or BUILTIN\Users access, and refusing when
+// icacls is missing or its output cannot be parsed. Never returns the key material. forbidInside:
+// roots the file must not be in (the checkout, the mount sources). icacls: test seam.
+export function checkAppKeyFile(keyFile, { platform = process.platform, forbidInside = [], realpath = defaultRealpath, fsImpl = fs, icacls = defaultIcacls } = {}) {
   if (!keyFile) return { error: "CLAUDE_ASYNC_GITHUB_APP_KEY_FILE is not set (the GitHub App's private key .pem); container jobs cannot authenticate to GitHub without it" };
   let real;
   try { real = realpath(keyFile); } catch { return { error: `GitHub App key file ${keyFile} does not exist (CLAUDE_ASYNC_GITHUB_APP_KEY_FILE); generate a private key under the App's settings and save it there` }; }
@@ -100,6 +144,10 @@ export function checkAppKeyFile(keyFile, { platform = process.platform, forbidIn
   catch (e) { return { error: `GitHub App key file ${real} is not readable (${e.code || "error"})` }; }
   if (!/^-----BEGIN (RSA )?PRIVATE KEY-----/.test(head.replace(/^﻿/, ""))) {
     return { error: `GitHub App key file ${real} is not a PEM private key (expected a -----BEGIN RSA PRIVATE KEY----- file as GitHub generates it)` };
+  }
+  if (platform === "win32") {
+    const aclError = checkWin32KeyAcl(real, icacls);
+    if (aclError) return { error: aclError };
   }
   return { real, readable: true };
 }

@@ -1264,3 +1264,12 @@ test("B3 / Argon #1: live processes: a `docker ps --filter label=...` and a `doc
     assert.deepEqual(core.findDockerClientsForJob(id), [client.pid], "only the run client");
   } finally { for (const k of [...kids, client]) k.kill("SIGKILL"); }
 });
+
+// ------------------------------------------------------------ review round 3: Windows ACLs ---
+test("R3: buildCredsDirIcaclsArgv removes inheritance and grants only the user and SYSTEM (by SID)", () => {
+  assert.deepEqual(c.buildCredsDirIcaclsArgv("C:\\Users\\Raide\\.claude-async-jobs\\j1\\creds", { USERNAME: "Raide", USERDOMAIN: "CLAUNKER" }),
+    ["C:\\Users\\Raide\\.claude-async-jobs\\j1\\creds", "/inheritance:r", "/grant:r", "CLAUNKER\\Raide:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
+  assert.deepEqual(c.buildCredsDirIcaclsArgv("D:\\x", { USERNAME: "Raide" }), ["D:\\x", "/inheritance:r", "/grant:r", "Raide:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
+  assert.throws(() => c.buildCredsDirIcaclsArgv("D:\\x", {}), /USERNAME/);
+  assert.throws(() => c.buildCredsDirIcaclsArgv("D:\\x", { USERNAME: "a:b" }), /USERNAME/);
+});

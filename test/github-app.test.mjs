@@ -91,8 +91,11 @@ test("checkAppKeyFile: exists, regular, PEM private key; refuses group/world-rea
       const r = ga.checkAppKeyFile(keyFile(mode));
       assert.match(r.error || "", /readable by group or others.*chmod 600/, `mode ${mode.toString(8)}`);
     }
-    // the mode check is skipped on win32 (ACLs; documented), even for a file that is 0644 here
-    assert.ok(!ga.checkAppKeyFile(keyFile(0o644), { platform: "win32" }).error);
+    // the mode check is skipped on win32, where the ACL is checked instead (icacls, round 3): with an
+    // owner-and-SYSTEM ACL a file that is 0644 here passes
+    const kf644 = keyFile(0o644);
+    const okAcl = () => ({ status: 0, stdout: `${kf644} NT AUTHORITY\\SYSTEM:(F)\r\n${" ".repeat(kf644.length)} CLAUNKER\\Raide:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n` });
+    assert.ok(!ga.checkAppKeyFile(kf644, { platform: "win32", icacls: okAcl }).error);
   }
   // never the key material in the result
   const f = keyFile(0o600);
@@ -313,4 +316,30 @@ test("R3: mintInstallationToken refuses a token whose repositories are not exact
   // the error never carries the token
   const e = await mint([{ full_name: "x/y" }]).catch((x) => x);
   assert.ok(!e.message.includes("CCCC"));
+});
+
+// ------------------------------------------------------------ review round 3: Windows ACLs ---
+// On win32 the PEM's ACL is checked with icacls: any ACE that grants Everyone, Users, Authenticated
+// Users or BUILTIN\Users anything is refused; icacls missing, failing or unparsable is refused too.
+const aclOut = (file, aces) => `${file} ${aces[0]}\r\n${aces.slice(1).map((a) => `${" ".repeat(file.length)} ${a}`).join("\r\n")}\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n`;
+test("R3: parseIcaclsAces / win32 key-file ACL check", () => {
+  const f = keyFile(0o600);
+  const run = (aces) => () => ({ status: 0, stdout: aclOut(f, aces) });
+  const good = ["NT AUTHORITY\\SYSTEM:(F)", "CLAUNKER\\Raide:(F)"];
+  assert.deepEqual(ga.parseIcaclsAces(aclOut(f, good), f), [{ principal: "NT AUTHORITY\\SYSTEM", rights: "(F)" }, { principal: "CLAUNKER\\Raide", rights: "(F)" }]);
+  assert.ok(!ga.checkAppKeyFile(f, { platform: "win32", icacls: run(good) }).error);
+  for (const bad of ["Everyone:(R)", "BUILTIN\\Users:(I)(RX)", "NT AUTHORITY\\Authenticated Users:(I)(M)", "Users:(R)", "*S-1-1-0:(R)", "*S-1-5-32-545:(RX)"]) {
+    const r = ga.checkAppKeyFile(f, { platform: "win32", icacls: run([...good, bad]) });
+    assert.match(r.error || "", /grants .* access|icacls/, bad);
+    assert.match(r.error, /inheritance:r/, "says how to fix it");
+  }
+  // a DENY entry for Everyone grants nothing: allowed
+  assert.ok(!ga.checkAppKeyFile(f, { platform: "win32", icacls: run([...good, "Everyone:(DENY)(R)"]) }).error);
+  // icacls missing, failing, or output that cannot be parsed: refused
+  assert.match(ga.checkAppKeyFile(f, { platform: "win32", icacls: () => ({ error: Object.assign(new Error("spawn icacls ENOENT"), { code: "ENOENT" }) }) }).error, /icacls/);
+  assert.match(ga.checkAppKeyFile(f, { platform: "win32", icacls: () => ({ status: 5, stdout: "", stderr: "Access is denied." }) }).error, /icacls/);
+  assert.match(ga.checkAppKeyFile(f, { platform: "win32", icacls: () => ({ status: 0, stdout: "something else entirely\r\n" }) }).error, /could not be parsed/);
+  assert.match(ga.checkAppKeyFile(f, { platform: "win32", icacls: () => ({ status: 0, stdout: "Successfully processed 0 files; Failed processing 1 files\r\n" }) }).error, /could not be parsed/);
+  // POSIX never runs icacls
+  if (POSIX) assert.ok(!ga.checkAppKeyFile(f, { icacls: () => { throw new Error("must not run"); } }).error);
 });
