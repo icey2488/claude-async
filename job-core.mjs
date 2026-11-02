@@ -27,7 +27,7 @@ import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentSt
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues,
-         redactSecrets, checkHttpBridgeLocked, CONTAINER_JOB_LABEL } from "./container.mjs";
+         redactSecrets, readRedactedTail, checkHttpBridgeLocked, CONTAINER_JOB_LABEL } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -1300,18 +1300,24 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
 
   // Container jobs: out.log/err.log on disk stay raw (a job can print its own environment), but what
   // claude_check returns -- to a chat session, or over /v1/check to another host -- is redacted:
-  // the env file's two values, plus GitHub/Anthropic token shapes. Host jobs are unchanged.
-  let stdout = readTail(p.out, tailBytes), stderr = readTail(p.err, tailBytes), exitOut = exitRecord;
+  // the env file's two values (and their base64 forms), plus GitHub/Anthropic token shapes. The
+  // redaction happens on a wider window BEFORE the caller's tailBytes cut (readRedactedTail), since
+  // tailBytes is caller-controlled and a cut inside a token would otherwise return its suffix in the
+  // clear. Host jobs are unchanged.
+  let stdout, stderr, exitOut = exitRecord;
   if (meta.sandbox === "container") {
     const values = readEnvFileSecretValues(meta.container && meta.container.envFile);
-    stdout = redactSecrets(stdout, values);
-    stderr = redactSecrets(stderr, values);
+    stdout = readRedactedTail(p.out, tailBytes, values);
+    stderr = readRedactedTail(p.err, tailBytes, values);
     if (exitRecord && typeof exitRecord === "object") {
       exitOut = { ...exitRecord };
       for (const k of ["stdoutTail", "stderrTail"]) {
         if (Array.isArray(exitOut[k])) exitOut[k] = exitOut[k].map((l) => redactSecrets(String(l), values));
       }
     }
+  } else {
+    stdout = readTail(p.out, tailBytes);
+    stderr = readTail(p.err, tailBytes);
   }
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),

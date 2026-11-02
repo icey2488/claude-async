@@ -392,12 +392,16 @@ test("checkEnvFile / planContainerJob: a secrets file inside the claude-async ch
 
 test("readEnvFileSecretValues: the values, in memory, for redaction only; [] for a bad or missing file", () => {
   const fx = fixture();
-  assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), [SECRET_GH, SECRET_OAUTH]);
+  // the raw values first, then their base64 forms (round 2, A3); 6 entries, none under 8 chars
+  const v1 = c.readEnvFileSecretValues(fx.envFile);
+  assert.deepEqual(v1.slice(0, 2), [SECRET_GH, SECRET_OAUTH]);
+  assert.equal(v1.length, 6);
+  assert.ok(v1.every((v) => typeof v === "string" && v.length >= 8));
   assert.deepEqual(c.readEnvFileSecretValues(null), []);
   assert.deepEqual(c.readEnvFileSecretValues(path.join(fx.base, "missing.env")), []);
   // CRLF/BOM files still yield their values (redaction must not depend on the file being perfect)
   fs.writeFileSync(fx.envFile, `\ufeffGH_TOKEN=${SECRET_GH}\r\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\r\n`);
-  assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), [SECRET_GH, SECRET_OAUTH]);
+  assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), v1);
 });
 
 test("redactSecrets: exact env-file values and GitHub/Anthropic token shapes become [REDACTED]", () => {
@@ -918,4 +922,68 @@ test("A1: countActiveJobs counts a container job while its cleanup is unconfirme
   // once a check confirms the dead one, it stops counting
   core.checkJob(deadNoRecord.id, 0, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }), findDockerClients: () => [] });
   assert.equal(core.countActiveJobs(Date.now()).count, before + 1);
+});
+
+// ------------------------------------------------------------ review round 2, finding A3 ---
+
+const SUBSTRINGS = (secret, n = 8) => { const out = []; for (let i = 0; i + n <= secret.length; i++) out.push(secret.slice(i, i + n)); return out; };
+const leaks = (text, secret) => SUBSTRINGS(secret).filter((s) => text.includes(s));
+
+test("A3: redactSecrets has no word-boundary gap (TOKEN_ghp_..., foo_sk-ant-...) and knows the base64 forms git prints", () => {
+  const gh = `ghp_${"A".repeat(36)}`;
+  assert.equal(c.redactSecrets(`TOKEN_${gh}`, []), "TOKEN_[REDACTED]");
+  assert.equal(c.redactSecrets(`x9${gh}`, []), "x9[REDACTED]");
+  assert.equal(c.redactSecrets(`foo_sk-ant-oat01-${"B".repeat(20)}`, []), "foo_[REDACTED]");
+  assert.equal(c.redactSecrets(`GITHUB_PAT=github_pat_${"C".repeat(30)}`, []), "GITHUB_PAT=[REDACTED]");
+  // GIT_TRACE_CURL / GIT_CURL_VERBOSE print "Authorization: Basic base64(x-access-token:<token>)"
+  const fx = fixture();
+  const values = c.readEnvFileSecretValues(fx.envFile);
+  const basic = Buffer.from(`x-access-token:${SECRET_GH}`).toString("base64");
+  const raw64 = Buffer.from(SECRET_GH).toString("base64");
+  const oauth64 = Buffer.from(SECRET_OAUTH).toString("base64");
+  for (const enc of [basic, raw64, oauth64]) {
+    assert.ok(values.includes(enc.replace(/=+$/, "")), `readEnvFileSecretValues includes ${enc.slice(0, 12)}...`);
+    const out = c.redactSecrets(`Authorization: Basic ${enc}`, values);
+    assert.equal(leaks(out, enc.replace(/=+$/, "")).length, 0, out);
+    assert.match(out, /Basic \[REDACTED\]=*$/);
+  }
+  assert.ok(values.includes(SECRET_GH) && values.includes(SECRET_OAUTH), "the raw values are still first");
+});
+
+// tailBytes is caller-controlled (claude_check, GET /v1/check). Whatever window is asked for, no
+// reconstructable piece of a secret printed at the end of the log may come back.
+test("A3: checkJob redacts before the caller-visible truncation, for every tailBytes offset inside a token", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  fs.writeFileSync(path.join(d, "exit.json"), JSON.stringify({ exitCode: 0, container: { cleanup: { confirmed: true } } }));
+  fs.writeFileSync(path.join(d, "exit_code"), "0");
+  const shape = `ghp_${"Z".repeat(36)}`;
+  const secrets = [SECRET_GH, SECRET_OAUTH, shape, `github_pat_${"Y".repeat(40)}`];
+  for (const [label, prefix] of [["small file", "first line\n"], ["large file", `${"x".repeat(100_000)}\n`], ["no newline before", "x".repeat(100_000)]]) {
+    for (const secret of secrets) {
+      fs.writeFileSync(path.join(d, "out.log"), `${prefix}${secret}\n`);
+      fs.writeFileSync(path.join(d, "err.log"), `${prefix}${secret}`); // no trailing newline either
+      for (let tailBytes = 1; tailBytes <= secret.length + 6; tailBytes++) {
+        const r = core.checkJob(id, tailBytes);
+        const all = JSON.stringify(r);
+        assert.equal(leaks(all, secret).length, 0, `${label}: tailBytes=${tailBytes} leaks ${leaks(all, secret)[0]} of ${secret.slice(0, 6)}... stdout=${JSON.stringify(r.stdout)}`);
+      }
+    }
+  }
+  // and a normal, larger window still carries the redacted line and nothing of the secret
+  fs.writeFileSync(path.join(d, "out.log"), `hello\ntoken ${SECRET_GH}\n`);
+  const r = core.checkJob(id, 8000);
+  assert.match(r.stdout, /token \[REDACTED\]/);
+  assert.equal(leaks(JSON.stringify(r), SECRET_GH).length, 0);
+});
+
+test("A3: host jobs' tails are byte-identical to before (no window change, no redaction)", async () => {
+  const fx = fixture();
+  const hostId = jid("hosttail");
+  await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: hostId },
+    { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
+  const body = `${"a".repeat(50)}\nghp_${"Q".repeat(36)}\n`;
+  fs.writeFileSync(path.join(core.JOB_ROOT, hostId, "out.log"), body);
+  assert.equal(core.checkJob(hostId, 20).stdout, `…(${body.length - 20} earlier bytes omitted)\n${body.slice(-20)}`);
+  assert.equal(core.checkJob(hostId, 8000).stdout, body);
 });

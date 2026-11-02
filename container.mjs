@@ -338,17 +338,25 @@ export function readEnvFileSecretValues(envFile, { realpath = defaultRealpath } 
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
   const parsed = parseEnvFileText(text.replace(/\r/g, ""), rd.real);
   if (parsed.error) return [];
-  return parsed.entries.map(([, v]) => v).filter((v) => v.length >= 8);
+  const raw = parsed.entries.map(([, v]) => v).filter((v) => v.length >= 8);
+  // Plus the encodings git itself prints: GIT_TRACE_CURL / GIT_CURL_VERBOSE log the Basic header the
+  // credential helper produces, base64("x-access-token:<GH_TOKEN>"), and a job can base64 a value
+  // in one line. Trailing "=" padding is stripped so a prefix match still covers the padded form.
+  const b64 = (v) => Buffer.from(v, "utf8").toString("base64").replace(/=+$/, "");
+  const encoded = raw.flatMap((v) => [b64(`x-access-token:${v}`), b64(v)]);
+  return [...raw, ...encoded.filter((v) => v.length >= 8 && !raw.includes(v))];
 }
 
 // --------------------------------------------------------------------------------- redaction ---
 
 // Token shapes redacted even when the env file can't be read: GitHub classic/OAuth/app/user/refresh
-// tokens and fine-grained PATs, and Anthropic keys/OAuth tokens (sk-ant-...).
+// tokens and fine-grained PATs, and Anthropic keys/OAuth tokens (sk-ant-...). No leading \b: in JS
+// "_" and alphanumerics are word characters, so \b would skip TOKEN_ghp_... and x9ghp_... entirely.
+// A false positive costs a few redacted letters; a false negative costs a credential.
 export const SECRET_PATTERNS = Object.freeze([
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bsk-ant-[A-Za-z0-9_-]{8,}/g,
+  /gh[pousr]_[A-Za-z0-9]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /sk-ant-[A-Za-z0-9_-]{8,}/g,
 ]);
 export const REDACTED = "[REDACTED]";
 
@@ -358,6 +366,36 @@ export function redactSecrets(text, values = []) {
   for (const v of values) if (typeof v === "string" && v.length >= 8) out = out.split(v).join(REDACTED);
   for (const re of SECRET_PATTERNS) out = out.replace(re, REDACTED);
   return out;
+}
+
+// The tail of a log file for a caller-visible window of `tailBytes`, redacted BEFORE the window is
+// cut, so a window that starts in the middle of a token can't return a reconstructable suffix
+// (round-2 finding A3). Reads tailBytes plus a margin (at least REDACT_TAIL_MARGIN, and at least
+// twice the longest known value), redacts that, drops the possibly partial first line of a window
+// that did not start at byte 0 (or, when no newline falls in the margin, the whole margin, which is
+// longer than any secret we know), and only then keeps the last tailBytes characters. Host jobs
+// never come through here (their tails are unchanged).
+export const REDACT_TAIL_MARGIN = 512;
+export function readRedactedTail(file, tailBytes, values = []) {
+  if (!(tailBytes > 0)) return "";
+  let fd;
+  try {
+    const size = fs.statSync(file).size;
+    const longest = values.reduce((m, v) => Math.max(m, typeof v === "string" ? v.length : 0), 0);
+    const margin = Math.max(REDACT_TAIL_MARGIN, 2 * longest + 64);
+    const start = Math.max(0, size - (tailBytes + margin));
+    fd = fs.openSync(file, "r");
+    const buf = Buffer.alloc(size - start);
+    if (buf.length) fs.readSync(fd, buf, 0, buf.length, start);
+    let text = redactSecrets(buf.toString("utf8"), values);
+    if (start > 0) {
+      const nl = text.indexOf("\n");
+      text = nl !== -1 && nl < margin ? text.slice(nl + 1) : text.slice(margin);
+    }
+    if (text.length > tailBytes) return `…(earlier output omitted)\n${text.slice(-tailBytes)}`;
+    return start > 0 ? `…(earlier output omitted)\n${text}` : text;
+  } catch { return ""; }
+  finally { if (fd !== undefined) { try { fs.closeSync(fd); } catch {} } }
 }
 
 // --------------------------------------------------------------------------- host paths ---

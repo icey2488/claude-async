@@ -422,3 +422,23 @@ test("A4: a wall-clock stop that needed the fallback kill still records containe
   assert.equal(rec.container.maxRuntimeExceeded, true);
   assert.equal(core.checkJob(j.jobId, 0, { cleanupContainers: () => ({ ok: true, absent: true, removed: 0, remaining: [] }), findDockerClients: () => [] }).status, "timed_out");
 });
+
+// ------------------------------------------------------------ review round 2, finding A3 ---
+// The runner's exit.json tails come from a fixed 64 KiB window. When that window boundary lands
+// inside a token, the partial token must not reach exit.json (the runner drops the partial first
+// line of a window that did not start at byte 0; redaction then sees only whole lines).
+test("A3: the runner's 64 KiB tail window never emits a token suffix when the boundary cuts a token", { skip: SKIP }, () => {
+  const WINDOW = 64 * 1024, FAKE_OUT = "container stdout\n".length;
+  for (const k of [1, 20, 39]) {
+    const j = setup({});
+    const A = 100;
+    // final size S = A + 1 + 41 + B + 1 + FAKE_OUT; the window starts at S - WINDOW = A + k, inside the token
+    const B = WINDOW - (1 + 41 + 1 + FAKE_OUT) + k;
+    fs.writeFileSync(path.join(j.dir, "out.log"), `${"x".repeat(A)}\n${SECRET_GH}\n${"y".repeat(B)}\n`);
+    runSync(j);
+    const size = fs.statSync(path.join(j.dir, "out.log")).size;
+    assert.equal(size - WINDOW, A + k, "the window boundary is inside the token");
+    const rec = JSON.stringify(j.exitRecord());
+    for (let i = 0; i + 8 <= SECRET_GH.length; i++) assert.ok(!rec.includes(SECRET_GH.slice(i, i + 8)), `k=${k}: exit.json carries ${SECRET_GH.slice(i, i + 8)}`);
+  }
+});

@@ -215,8 +215,11 @@ const TAIL_BYTES = 64 * 1024;
 // read window starts after byte 0 (file bigger than TAIL_BYTES), the first line of the read
 // chunk is discarded: it is very likely a partial line (and, for multibyte UTF-8 content,
 // possibly a partial/split character too), since the cut point lands mid-line rather than on a
-// line boundary. Any failure (missing file, read error, decode error, ...) yields [] -- this is
-// best-effort diagnostic data, never allowed to break exit recording.
+// line boundary. For container jobs this is also what keeps redaction sound at the window
+// boundary: a token never spans a newline, so a window that starts inside a token drops that
+// token's remainder with the partial line, and redact() then only ever sees whole lines (tested in
+// test/container-runner.test.mjs, round-2 A3). Any failure (missing file, read error, decode
+// error, ...) yields [] -- this is best-effort diagnostic data, never allowed to break exit recording.
 // Container jobs: how many lines of stdout extractPrUrl() looks at.
 const PR_SCAN_LINES = 400;
 

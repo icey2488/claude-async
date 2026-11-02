@@ -268,8 +268,15 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 - **Output redaction.** A job can print its own environment (or read `/proc/*/environ`).
   `out.log`/`err.log` in the job dir keep exactly what the job printed. Everything that **leaves the
   runner** is redacted with the env file's two values (read into memory once by
-  `readEnvFileSecretValues()`, never written) plus the GitHub (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`,
-  `github_pat_`) and Anthropic (`sk-ant-`) token shapes:
+  `readEnvFileSecretValues()`, never written), their base64 forms (`base64("x-access-token:<GH_TOKEN>")`
+  is the Basic header `GIT_TRACE_CURL`/`GIT_CURL_VERBOSE` print, plus `base64(<value>)`), plus the
+  GitHub (`ghp_`, `gho_`, `ghs_`, `ghu_`, `ghr_`, `github_pat_`) and Anthropic (`sk-ant-`) token
+  shapes with no word-boundary anchor (so `TOKEN_ghp_...` is caught too). Redaction always runs on
+  whole lines or on a window wider than the caller sees: `claude_check`'s `tailBytes` is
+  caller-controlled, so `readRedactedTail()` reads `tailBytes` plus a margin (at least 512 bytes and
+  twice the longest value), redacts that, drops the partial first line, and only then cuts to
+  `tailBytes`; the runner's 64 KiB exit-tail window drops its partial first line before redacting.
+  A window that would start inside a token can therefore never return the token's suffix.
   - `exit.json`'s `stdoutTail`/`stderrTail` (the runner redacts before writing);
   - the Discord ping: its headline is the first meaningful stdout line, and every candidate line is
     redacted before one is picked;
