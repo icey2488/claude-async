@@ -437,6 +437,17 @@ this:
 
 ## Container jobs (`feat/container-jobs`, 2026-11-01)
 
+**Behaviour change (review round 3): the HTTP bridge on `127.0.0.1:7842` now refuses to start without
+a bearer token, on every host, whether or not container mode is used.** If you use 7842 without a
+token today, `claude-async-http.mjs` will exit 78 at its next restart with `refusing to start: a
+bearer token is required`. Fix: `node claude-async-http.mjs --new-token` (under the same
+`CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes), give the printed token to the bridge's clients as
+`Authorization: Bearer <token>`, restart. The explicit opt-out `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1`
+starts it open with a WARNING, but only on a machine that has never run a container job: the first
+container preflight writes `%USERPROFILE%\.claude-async\container-mode`, the code never removes it,
+and while it exists the opt-out is refused (whatever the bridge's own env or config dir says).
+Delete that file only by hand, after container mode is off.
+
 Opt-in per job with `claude_start`'s `sandbox: "container"` plus `repo: "owner/repo"`, and only on a
 host whose `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes `container`; host jobs are untouched. The
 container clones the repo itself; no host folder is mounted read-write. Design, threat model,
@@ -460,29 +471,42 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
   out `baseRef`; 137 is a removed container (`claude_cancel`, the wall-clock limit, OOM at
   `--memory`, or the runner's own stop on SIGTERM).
 - **GitHub token refresh:** the runner re-mints the one-hour installation token every 45 minutes
-  (`CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`) and rewrites `<job dir>\creds\token` in place. A refresh
-  failure is a `WARN: GitHub App installation token refresh failed` line in `err.log` (once per
-  distinct error; the old token stays until it expires) and, if it keeps failing within 5 minutes
-  of expiry, a warning in `exit.json`; git/gh calls late in such a job may have failed with auth
-  errors. The `creds` folder is deleted when the job ends; one left behind means the runner died
-  hard (delete it by hand; the token in it expires within the hour anyway).
+  (`CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`) and republishes `<job dir>\creds\token` (temp file, then
+  rename). A refresh failure is a `WARN: GitHub App installation token refresh failed ... retrying
+  in N s with backoff` line in `err.log` (once per distinct error; the old token stays until it
+  expires); retries come at 30 s, 1, 2, 4, then every 5 minutes, and at least once more 2 minutes
+  before expiry. If the token gets within 5 minutes of expiry without a newer one, `err.log` and
+  `exit.json` say so at that moment; git/gh calls in such a job may have failed with auth errors.
+  The `creds` folder is deleted when the job ends, and `claude_check` deletes it for a runner that
+  died. A token file the image's helper finds torn or malformed is retried for 2 s and then refused
+  (`not a single valid installation token` on the job's stderr).
+- **Windows ACLs are checked:** preflight refuses the App key if `icacls` shows a grant to
+  Everyone/Users/Authenticated Users (or cannot be parsed); fix with `icacls <pem> /inheritance:r
+  /grant:r "%USERNAME%:F" "SYSTEM:F"`. The runner locks each job's `creds` folder to its own account
+  and SYSTEM and refuses to start the container if `icacls` fails there.
 - **Cancel = `claude_cancel`.** It writes `cancel_requested` in the job dir, then removes the job's
   containers by label. Killing the runner or `docker.exe` with `taskkill /F` does NOT stop the
   container; `claude_check` cleans up when it classifies the job `died`/`timed_out`. By hand:
   `docker ps -a --filter label=claude-async.job=<jobId>` and `docker rm -f <id>`.
 - **`containerCleanup: "unconfirmed"`** on a finished job means something with the job's label may
-  still exist (usually the daemon was unreachable at the end). Every `claude_check` or
-  `claude_cancel` retries; it turns `confirmed` once docker lists nothing.
+  still exist (usually the daemon was unreachable at the end), or the docker client ended before the
+  runner saw its container (`docker_launch` = `exited-uncertain`, e.g. `docker.exe` killed from
+  outside: its `com.docker.cli.exe` or the daemon may still create the container). Every
+  `claude_check` or `claude_cancel` retries; it turns `confirmed` once no process carries the job's
+  `docker run` argv, the 2-minute hold after a kill or uncertain exit has passed, and docker lists
+  nothing. Until then the job holds a concurrency slot.
+- **`exit 3` in a job's err.log with `runner.lock`:** a second runner for the same job dir found the
+  lock held (or still being written) and exited without running anything. Harmless; the first runner
+  owns the job.
 - **Tokens in logs:** `out.log`/`err.log` are raw and may hold the installation token or the OAuth
   token if a job printed them; exit.json, `claude_check` and the Discord ping are redacted (every
   token generation the runner minted, plus token shapes).
-- **The HTTP bridge won't start** (`claude-async-http: refusing to start: this host allows container
-  jobs ... holds no valid tokenSha256`, exit 78): once `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes
-  `container` (or `CLAUDE_ASYNC_JOB_SANDBOX=container`) the bridge requires its token hash at
-  startup, so it can never come back unauthenticated during a container job. Run `node
+- **The HTTP bridge won't start** (`claude-async-http: refusing to start: ... holds no valid
+  tokenSha256`, exit 78): see the behaviour change at the top of this section. Run `node
   claude-async-http.mjs --new-token` under the same `CLAUDE_ASYNC_CONFIG_DIR` the supervisor passes
   (the message prints the `http.json` path it read), give the token to the bridge's clients, restart.
-  `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` only works on a host-only policy and is logged.
+  `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` is refused when the bridge's policy allows container
+  mode or `%USERPROFILE%\.claude-async\container-mode` exists, and is logged loudly otherwise.
 - **Rollback:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host`; uninstall the GitHub App from the repo(s)
   (outstanding tokens die within the hour), delete its private key, and revoke the setup-token for a
   full cut-off. See the doc's "Rollback".

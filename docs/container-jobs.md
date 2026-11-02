@@ -24,12 +24,14 @@ environment and `spec.json` are unchanged (a test asserts the literal host argv)
 | GitHub App: JWT, installation lookup, token minting, App identity, key-file checks | `github-app.mjs` |
 | launch integration (`sandbox`/`repo`/`baseRef`, preflight incl. the App, `cancelJob`, cleanup state) | `job-core.mjs` |
 | runner: token file mint/refresh/delete, cancel intent, cleanup on every stop, wall-clock limit, redaction, PR URL | `job-runner.mjs` |
+| runner exclusivity (`runner.lock`) | `runner-lock.mjs` |
+| installation token renewal schedule (backoff, near-expiry timer) | `token-refresh.mjs` |
 | `claude_start` params, `claude_cancel`, `POST /v1/start`, `POST /v1/cancel` | `dispatch.mjs`, `host-api.mjs` |
-| HTTP bridge token lock | `http-bridge.mjs`, `claude-async-http.mjs` |
+| HTTP bridge token lock (required by default), the machine-wide container-mode marker | `http-bridge.mjs`, `claude-async-http.mjs`, `container.mjs` |
 | job image, its entrypoint (the clone), the git credential helper and the gh wrapper | `container/Dockerfile`, `container/job-entry.sh`, `container/git-credential.sh`, `container/gh-wrapper.sh` |
 | rules mounted read-only into every job | `container/CLAUDE.md` |
 | image build + checks on claunker; a by-hand mint of one installation token | `container/smoke-test.ps1`, `container/probe.sh`, `tools/mint-app-token.mjs` |
-| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/github-app.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs`, `test/job-entry.test.mjs` |
+| tests | `test/container.test.mjs`, `test/container-runner.test.mjs`, `test/github-app.test.mjs`, `test/container-dispatch.test.mjs`, `test/http-bridge-auth.test.mjs`, `test/job-entry.test.mjs`, `test/runner-lock.test.mjs`, `test/token-refresh.test.mjs` |
 
 ## Why
 
@@ -164,21 +166,31 @@ Read this before you count on the container for anything.
     **Container mode refuses to start unless that bridge is token-locked**: `~/.claude-async/http.json`
     must hold a token hash (`node claude-async-http.mjs --new-token`), and whatever listens on the
     port must answer an unauthenticated MCP request with 401 (so an old bridge that was not restarted
-    also refuses). That preflight probe is a one-time check, not a durable boundary, so **on a host
-    that allows container mode the bridge itself requires the token to start**: with
-    `CLAUDE_ASYNC_ALLOWED_SANDBOXES` including `container` (or `CLAUDE_ASYNC_JOB_SANDBOX=container`)
-    and no valid `tokenSha256` in its `http.json` (missing, malformed, unreadable, or a different
-    `CLAUDE_ASYNC_CONFIG_DIR` than the one the token was minted under), `claude-async-http.mjs`
-    refuses to start (exit 78, message naming `--new-token`). It can therefore never be restarted
-    into an unauthenticated state during a running container job. The explicit opt-out
-    `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` is logged and is rejected whenever container mode is
-    allowed. On a host-only policy a missing token keeps the pre-existing unauthenticated loopback
-    behaviour (with a warning), because the bridge's documented client (the app's Connectors UI)
-    cannot, as far as I know, send a static header; on claunker container mode therefore requires
-    either giving the bridge's clients the token or stopping the bridge. The bridge supervisor
-    (pm2 `ecosystem.config.cjs`, or the Task Scheduler entry) must run it with the same
-    `CLAUDE_ASYNC_CONFIG_DIR` (default `%USERPROFILE%\.claude-async`) and `CLAUDE_ASYNC_HTTP_PORT` as
-    the process that admits container jobs; the refusal message prints the path it read. If the
+    also refuses). That preflight probe is a one-time check, not a durable boundary, so **the bridge
+    itself requires the token to start, by default, on every host** (review round 3, B1; this is a
+    behaviour change for anyone who used 7842 without a token). With no valid `tokenSha256` in its
+    `http.json` (missing, malformed, unreadable, or a different `CLAUDE_ASYNC_CONFIG_DIR` than the
+    one the token was minted under) `claude-async-http.mjs` refuses to start (exit 78, message naming
+    `--new-token` and the path it read). Round 2 made this depend on the bridge's own
+    `CLAUDE_ASYNC_ALLOWED_SANDBOXES`; the round-3 review showed why that is not enough: a bridge
+    launched with another config dir, or without the sandbox variables, while a different process
+    runs containers would have started open. The only way to run without a token is the explicit
+    opt-out `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1`, which prints a WARNING on stdout and stderr
+    and is **refused** (a) when the bridge's own policy allows container mode, and (b) whenever the
+    **machine-wide container-mode marker** exists: `%USERPROFILE%\.claude-async\container-mode`
+    (`~/.claude-async/container-mode` on POSIX; `os.homedir()`, deliberately **not** under
+    `CLAUDE_ASYNC_CONFIG_DIR`). Container preflight (`startJob`) writes that marker atomically (temp
+    file + link, never replaced) before any container can launch, refuses the job if it cannot, and
+    nothing in the code ever removes it. Removing it is a deliberate owner action, only after
+    container mode is turned off (see "Rollback"). What the marker does not cover: a bridge running
+    under a different Windows account (another `%USERPROFILE%`) than the one that ran container jobs;
+    with the token required by default that bridge still refuses without its own `http.json`. The
+    bridge's documented client (the app's Connectors UI) cannot, as far as I know, send a static
+    header, so on claunker container mode requires either giving the bridge's clients the token or
+    stopping the bridge. The bridge supervisor (pm2 `ecosystem.config.cjs`, or the Task Scheduler
+    entry) must run it with the same `CLAUDE_ASYNC_CONFIG_DIR` (default `%USERPROFILE%\.claude-async`)
+    and `CLAUDE_ASYNC_HTTP_PORT` as the process that admits container jobs; the refusal message prints
+    the path it read. `smoke-http.mjs` sends `CLAUDE_ASYNC_SMOKE_TOKEN` as the bearer token. If the
     bridge serves TLS (`CLAUDE_ASYNC_TLS_CERT`/`_KEY`), the preflight probe uses https (certificate
     not verified: it only wants the status code). The smoke test probes 7842 with
     `Host: 127.0.0.1:7842` (any other Host gets 403 from the transport's DNS-rebinding filter, which
@@ -368,7 +380,9 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
 - **Who can read the raw logs.** The job dirs live in `%USERPROFILE%\.claude-async-jobs` and inherit
   the profile's ACL: Erick's account, SYSTEM and the local Administrators group. Anything running as
   Erick (including host-mode jobs) can read them, and, while a job runs, its `creds\token`. Treat
-  them as holding the tokens.
+  them as holding the tokens. Since round 3 the runner replaces the inherited ACL of `creds\` on
+  Windows (`icacls <dir> /inheritance:r /grant:r <DOMAIN\user>:(OI)(CI)F *S-1-5-18:(OI)(CI)F`: the
+  job's own account and SYSTEM only) and refuses to start the container if that fails.
 - **Why not Docker secrets?** Docker secrets (`/run/secrets/...`) are a Swarm/Compose feature, and a
   mounted secrets file would be readable by the same job user anyway. Claude Code reads its token
   from the environment, so the env file is simplest for it; the GitHub token is a file because it
@@ -386,49 +400,75 @@ variable (fixed at `docker run`) but a file the host keeps current:
   and writes it to `creds\token` (mode 0600). On a Linux host where the runner is root, both are
   chowned to the container's uid 1000, since a 0600 root-owned file is unreadable to the job;
   through Docker Desktop's Windows file sharing the host mode bits are not what the container sees,
-  and the directory's ACL (owner + SYSTEM, inherited from the job dir, see "Who can read the raw
-  logs") is the protection on the host side. If that first mint fails, **no container is started**:
+  and the directory's ACL is the protection on the host side: since round 3 the runner sets it
+  explicitly with `icacls` (inheritance removed; the job's account and SYSTEM only; see "Who can
+  read the raw logs"). If that first mint fails, **no container is started**:
   the job ends with exit 78 and an `exit.json` warning naming the cause (`could not mint the GitHub
   App installation token: ...`).
 - **The mount** is the *directory*, read-only, at `/run/claude-async/creds`, so the job cannot change
-  what the next git call will present, and so the file the container sees is the same inode the
-  host rewrites.
-- **Every `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS`** (default 45 minutes; 1 to 55 minutes allowed) while
-  the container runs, the runner mints again and rewrites the file **in place**: open the existing
-  file, write the new token at offset 0, truncate to its length, `fsync`, close. Never a rename.
-  Why in place: the container holds the directory as a bind mount, and what has to reach it is new
-  content in the same file. A rename inside the directory would also be visible on a Linux bind
-  mount (the mount is the directory, not the file), so the choice is not forced on Linux; it is
-  made because claunker's mounts go through Docker Desktop's Windows file sharing, where in-place
-  content changes are the one propagation path the smoke test measures (section 5b), and one
-  measured mechanism beats two. Writing at offset 0 before truncating means a reader never sees an
-  empty file (tokens of one App have the same length; a reader racing the write could see a mix of
-  the two for a moment, which costs one failed git call, retried by the job).
-- **On a refresh failure** the runner logs once per distinct error, keeps the old token (still valid
-  until its expiry) and retries on the next tick. If refresh keeps failing and the token is within
-  5 minutes of expiry, or already expired, `exit.json` gets a warning
-  (`the GitHub App installation token could not be refreshed ... within 5 minutes of its expiry`),
-  because git/gh calls late in the job may have failed.
+  what the next git call will present, and so a file renamed into the directory on the host is what
+  the container sees next.
+- **Publication is atomic (round 3).** Each generation is written to a private temp file inside
+  `creds\` (0600, the container's uid on a root Linux host, fsync) and renamed over `creds\token`. A
+  reader sees the old complete file or the new complete file, never a mix. Round 2 rewrote the file
+  in place (write at offset 0, truncate), which the round-3 review correctly called torn: a shorter
+  token leaves the old suffix until the truncate. Measured here with a real Linux engine and a
+  hardened container reading the whole file in a tight loop: 31010 renames of alternating lengths
+  against 124793 reads gave **0** invalid reads; the old in-place rewrite gave **10537** invalid reads
+  of 125518 (old suffixes and NUL bytes). The earlier reason to avoid a rename ("a bind mount of a
+  single file pins the inode") does not apply, because the mount is the directory. The in-place
+  rewrite remains only as a logged fallback when the rename fails (Windows can refuse `MoveFileEx`
+  on a file another process holds open). **Docker Desktop's file sharing is not measured here**:
+  `container\smoke-test.ps1` section 5b measures both the rename (FAIL if not visible within 5 s) and
+  a same-length in-place rewrite (WARN), since WSL2's file sharing could in principle serve a cached
+  copy when only the content changes and `st_size` does not (Argon's question).
+- **The readers validate (round 3).** `git-credential.sh` and `gh-wrapper.sh` read only the first line
+  (`IFS= read -r`), require the file to be exactly one line matching `^ghs_[A-Za-z0-9]{36,}$`, and
+  otherwise retry every 100 ms, 20 times, then refuse (the helper answers nothing, so git fails with
+  its own auth error; the gh wrapper exits 1). A missing file behaves as before.
+- **Renewal.** Every `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS` (default 45 minutes; 1 to 55 minutes
+  allowed) after the last success the runner mints again and republishes the file
+  (`token-refresh.mjs`). **On a failure** it keeps the old token (still valid until its expiry), logs
+  once per distinct error, and retries with bounded backoff: 30 s, 1 min, 2 min, 4 min, then every
+  5 min (never longer than the refresh interval), always at least once more no later than 2 minutes
+  before the token expires, and returns to the normal schedule on success. Before round 3 a failure
+  waited for the next 45-minute tick, so one transient failure at minute 45 meant no valid token from
+  minute 60 to 90. **The near-expiry warning has its own timer** at expiry minus 5 minutes: if no
+  newer token exists by then and renewal is failing or overdue, `err.log` gets a WARN line at that
+  moment and `exit.json` gets a warning (`the GitHub App installation token could not be refreshed
+  ... was within 5 minutes of its expiry at <time>`, plus "a later refresh succeeded" if one did),
+  because git/gh calls in that window may have failed. Tested on a fake clock at the production
+  intervals (`test/token-refresh.test.mjs`).
+- **Signals during the first mint (round 3, C1).** The runner's SIGTERM/SIGINT/SIGHUP(/SIGBREAK)
+  handlers are registered before the first mint, so a signal while it waits on GitHub finishes the
+  job normally: no container, `creds\` removed, `exit.json` (`exitReason: "signal"`) and `exit_code`
+  written. A mint that answers after the runner started finishing writes nothing and logs nothing.
 - **On finish** (any exit: normal, cancel, wall-clock limit, signal, runner error) the file and the
   directory are deleted, after the container is removed. A container that somehow survived loses
-  its credential rather than keeping one on disk.
+  its credential rather than keeping one on disk. **A runner that died** never gets there, so
+  `claude_check` deletes `creds\` of any terminal container job (died, timed out or finished), after
+  reading the token for redaction first.
 - **Every minted generation** is added to the runner's redaction set as it is minted, with its
   base64 forms (previous section).
 - **The key** (`CLAUDE_ASYNC_GITHUB_APP_KEY_FILE`) is read by the runner at each mint and by job-core
   at preflight, never written anywhere, never put in argv, `spec.json`, `meta.json` or a log; the
   runner's spec carries its **path**. It must be readable only by its owner: on POSIX a group- or
-  world-readable key is refused (`chmod 600`); on Windows the mode bits carry nothing, so the ACL
-  expectation (Erick's account and SYSTEM only, set with `icacls` in the rollout) is documented and
-  not checked. It may not be inside the claude-async checkout, a mount source, or the env file.
-- **Verified** with a real Docker engine on Linux (the runner, `startJob()`'s argv, the rebuilt
-  image, a fake `api.github.com` and a fake https `github.com`): the file is 0600/uid 1000 inside,
-  the mount is read-only, the clone authenticated with generation 1 through the helper, and a
-  `git ls-remote` seven seconds later authenticated with generation 4 after three in-place rewrites,
-  with no restart of anything. **Not verified: propagation of an in-place rewrite through a Docker
-  Desktop bind mount on Windows.** `container\smoke-test.ps1` section 5b measures it (a container
-  tails a mounted file, the host rewrites it in place, the new content must appear within 5 s) and
-  FAILS when it does not. Do not enable container mode until that line passes; a job longer than an
-  hour would otherwise lose GitHub access mid-run.
+  world-readable key is refused (`chmod 600`); **on Windows (round 3) its ACL is checked** with
+  `icacls <key>` at preflight and at every mint: any entry granting Everyone, Users, BUILTIN\Users,
+  Authenticated Users or Anonymous Logon access (by name or well-known SID; DENY entries ignored) is
+  refused, and so is a missing or failing `icacls` or output that does not parse (conservative). The
+  check reads names in English; a localized Windows that prints translated names is covered only by
+  the SID forms icacls prints for unresolvable accounts, so set the ACL as in rollout step 6. It may
+  not be inside the claude-async checkout, a mount source, or the env file.
+- **Verified** with a real Docker engine on Linux (the runner, `startJob()`'s argv, the image, a fake
+  `api.github.com` and a fake https `github.com`): the file is 0600/uid 1000 inside, the mount is
+  read-only, the clone authenticated through the helper, and a later `git ls-remote` authenticated
+  with a later generation, with no restart of anything (round 2: in place, generation 4; round 3:
+  by rename, with the round-3 helper and gh wrapper mounted over the r3 image's, generation 7).
+  **Not verified: propagation through a Docker Desktop bind mount on Windows.**
+  `container\smoke-test.ps1` section 5b measures it and FAILS when a renamed file does not appear
+  within 5 s. Do not enable container mode until that line passes; a job longer than an hour would
+  otherwise lose GitHub access mid-run.
 
 ## Claude Code authentication inside the container
 
@@ -572,10 +612,20 @@ hand and prints them.
 2. Build the App JWT: RS256, `iat` 60 s in the past, `exp` 9 minutes ahead, `iss` = App ID.
 3. `GET /repos/<owner>/<repo>/installation` (preflight): the installation id, or a refusal naming the
    repo ("not installed on ...; install the app on that repository") on 404, or "app id and key do
-   not match" on 401.
-4. `GET /app` and `GET /users/<slug>[bot]` (preflight): the commit identity.
+   not match" on 401. Since round 3 also refused, before any job dir exists: an answer for an
+   installation on **another account** (GitHub follows rename/transfer redirects, so an old
+   `owner/name` can resolve elsewhere), a **suspended** installation (`suspended_at` set), and an
+   installation whose `permissions` lack `contents: write` or `pull_requests: write`.
+4. `GET /app` (with the JWT) and `GET /users/<slug>[bot]` (preflight): the commit identity. The
+   second call is **unauthenticated** (no `Authorization` header): it is a public endpoint and
+   GitHub does not take an App JWT outside the `/app` endpoints. Its result is cached for the life
+   of the process (unauthenticated calls share GitHub's 60/hour per-IP limit).
 5. `POST /app/installations/<id>/access_tokens` with the one repo and the three permissions (runner,
-   before `docker run` and every 45 minutes): the token the container gets as a file.
+   before `docker run` and every 45 minutes): the token the container gets as a file. Since round 3
+   the response's `repositories` must be exactly one entry whose `full_name` is the job's
+   `owner/repo` (case-insensitive); anything else, or no `repositories` at all, is refused (fail
+   closed), so a short name that selects another repository of the same installation after a
+   rename/transfer never yields a usable token.
 
 ### Server-side backstops
 
@@ -754,14 +804,29 @@ limited per container; the clone and everything else live in the writable layer 
   only when, in this order, (1) no launch can still be pending and (2) docker then lists nothing
   with the label. "No launch pending" is decided from the runner's **launch state file**
   `docker_launch`, written `pending` *before* `docker run` is spawned, `spawned` (with the client's
-  pid, also in `docker_client.pid`) right after, `exited` when the client ended on its own, or
-  `killed` when a stop fallback had to kill it. A launch is still pending while the recorded client
-  pid is alive (even after `exit_code` exists), while the runner is alive, while any process whose
-  command line carries the job's `--label claude-async.job=<id>` exists (a process scan, which also
-  finds a client whose pid was never recorded because the runner died between the spawn and the pid
-  write, and on Windows the `com.docker.cli.exe` child that `docker.exe` hands its work to), and for
-  `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` (2 min) after a client was killed, because its create
-  request may still be in flight daemon-side. Liveness first, listing second: a client that creates
+  pid, also in `docker_client.pid`) right after, `exited` when the client ended after its launch
+  demonstrably completed, `exited-uncertain` when it ended in a way that proves nothing, or `killed`
+  when a stop fallback had to kill it. **Round 3 (B2):** a client exit the runner did not cause is
+  not proof that nothing more will be created (on Windows `taskkill /F` of `docker.exe` leaves its
+  `com.docker.cli.exe` descendant, and the daemon may still serve the create). So the runner looks
+  for the job's container (throttled, every `CLAUDE_ASYNC_CONTAINER_OBSERVE_MS`, 1 s, until seen once)
+  while the client runs, and the exit is `exited` only if it saw the container listed, or on POSIX if
+  the client ended with an exit status of its own (an external kill shows up as a signal there); on
+  Windows, where `TerminateProcess` looks like an ordinary exit code, an exit without that
+  observation is always `exited-uncertain`. A launch is still pending while the recorded client
+  pid is alive (even after `exit_code` exists), while the runner is alive, while any process carrying
+  the job's launch argv exists (a process scan, which also finds a client whose pid was never
+  recorded because the runner died between the spawn and the pid write, and on Windows the
+  `com.docker.cli.exe` child that `docker.exe` hands its work to; **the scan runs in every launch
+  state, `exited` included, and in the runner's `finish()` too, before the listing**), and for
+  `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` (2 min) after a client was killed **or exited uncertainly**, because
+  its create request may still be in flight daemon-side. The scan (round 3, B3 and Argon #1) matches
+  only the complete argument `--label claude-async.job=<id>` (or `--label=...`, optionally quoted)
+  on a command line that also has the `run` subcommand and `--pull=never` as whole tokens, so it
+  never matches its own PowerShell (which also excludes `$PID` and powershell/pwsh by name), the
+  `docker ps --filter label=...` or `docker rm` that checks run, or a job whose id merely starts
+  with this one's. Before this, the Windows scan found itself every time and could hold a job's
+  slot forever. Liveness first, listing second: a client that creates
   its container and exits between the two observations is then seen by the listing. The runner
   records its result in `exit.json.container.cleanup.confirmed`; job-core records a later
   confirmation in `meta.json.containerCleanup`. `claude_check` shows
@@ -862,9 +927,10 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_GITHUB_APP_REFRESH_MS` | `2700000` (45 min) | how often the runner re-mints the installation token (60000 to 3300000) |
 | `CLAUDE_ASYNC_GITHUB_API_BASE` | `https://api.github.com` | the API origin; tests (a loopback fake) or GHES only |
 | `CLAUDE_ASYNC_CONTAINER_GIT_NAME` / `_GIT_EMAIL` | derived from the App | optional overrides of the commit identity (`<slug>[bot]`, `<id>+<slug>[bot]@users.noreply.github.com`); rarely needed |
-| `~/.claude-async/http.json` | absent | **required for container mode**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`); the bridge refuses to start without it once container mode is allowed |
+| `~/.claude-async/http.json` | absent | **required**: the HTTP bridge's token hash (`node claude-async-http.mjs --new-token`); since round 3 the bridge refuses to start without it unless the opt-out below applies |
+| `~/.claude-async/container-mode` (marker) | absent | written by the first container preflight, never removed by the code; fixed under the user's home (not `CLAUDE_ASYNC_CONFIG_DIR`); while it exists the bridge never starts unauthenticated |
 | `CLAUDE_ASYNC_HTTP_PORT` | `7842` | the bridge port the lock check probes |
-| `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED` | unset | bridge only: explicit, logged opt-out to start without a token; rejected when container mode is allowed |
+| `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED` | unset | bridge only: `1` is the explicit, loudly logged opt-out to start without a token; refused when the bridge's policy allows container mode or the container-mode marker exists |
 | `CLAUDE_ASYNC_TLS_CERT` / `_KEY` | unset | bridge TLS; when set on the admitting process too, the lock probe uses https |
 | `CLAUDE_ASYNC_CONTAINER_IMAGE` | `claude-async-job:local` | built on claunker, never pulled; jobs run its inspected ID |
 | `CLAUDE_ASYNC_DOCKER_BIN` | `docker` | set the full path to `docker.exe` |
@@ -876,7 +942,8 @@ All set on the bridge process (ecosystem.config.cjs `env`, or the Claude Desktop
 | `CLAUDE_ASYNC_CONTAINER_CLAUDE_MD` | `container/CLAUDE.md` | |
 | `CLAUDE_ASYNC_CONTAINER_STOP_WAIT_MS` | `30000` | runner: how long to wait for the client after a signal, cancel or the wall-clock limit before killing it |
 | `CLAUDE_ASYNC_CONTAINER_RM_RETRY_MS` | `5000` | runner: minimum gap between removal retries during a stop |
-| `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` | `120000` | job-core: how long after a killed docker client an empty listing does not yet confirm cleanup |
+| `CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS` | `120000` | job-core: how long after a killed, or uncertainly exited, docker client an empty listing does not yet confirm cleanup |
+| `CLAUDE_ASYNC_CONTAINER_OBSERVE_MS` | `1000` | runner: how often it looks for the job's container while the client runs, until seen once (decides `exited` vs `exited-uncertain`) |
 
 Removed in review round 1: `CLAUDE_ASYNC_CONTAINER_ALLOWED_ROOTS`, `_DENIED_ROOTS` and
 `_GIT_AUTOCRLF` (no host folder is mounted any more). Changed with the GitHub App: `GH_TOKEN` is
@@ -1010,16 +1077,21 @@ Do these in order on claunker. Each step says how to check it.
    Check: `(Get-Content $file | ForEach-Object { ($_ -split '=')[0] })` prints exactly
    `CLAUDE_CODE_OAUTH_TOKEN`; `icacls $pem` lists only your account and SYSTEM;
    `Get-Content $pem -First 1` is `-----BEGIN RSA PRIVATE KEY-----`. (On a Linux host the key must
-   be `chmod 600`; preflight refuses a group- or world-readable key there. Windows ACLs are not
-   checked by the code, so this step is the control.)
-7. **Lock the HTTP bridge**: `node claude-async-http.mjs --new-token`, then restart it
-   (`pm2 restart claude-async-http`, or stop it if nothing uses it). Give the token to anything that
-   still needs the bridge (`Authorization: Bearer <token>`). Check:
-   `curl -s -o NUL -w "%{http_code}" -X POST http://127.0.0.1:7842/mcp` prints `401`. Do this
-   **before** step 9: once `CLAUDE_ASYNC_ALLOWED_SANDBOXES` includes `container`, the bridge refuses
-   to start without the token (its log then says `refusing to start ... --new-token`), and its
+   be `chmod 600`; preflight refuses a group- or world-readable key there. On Windows, since round
+   3, preflight runs `icacls` on the key and refuses it if any entry grants Everyone, Users or
+   Authenticated Users access, or if the output cannot be parsed, so a mistake in this step shows up
+   as a preflight refusal naming the fix.)
+7. **Lock the HTTP bridge** (do this as soon as this branch is deployed, before anything else: since
+   round 3 **the bridge refuses to start without a token on every host**, container mode or not). Run
+   `node claude-async-http.mjs --new-token`, then restart it (`pm2 restart claude-async-http`, or stop
+   it if nothing uses it). Give the token to anything that still needs the bridge
+   (`Authorization: Bearer <token>`; `smoke-http.mjs` takes it in `CLAUDE_ASYNC_SMOKE_TOKEN`). Check:
+   `curl -s -o NUL -w "%{http_code}" -X POST http://127.0.0.1:7842/mcp` prints `401`. Without a
+   token its log says `refusing to start ... a bearer token is required ... --new-token`. Its
    supervisor must pass the same `CLAUDE_ASYNC_CONFIG_DIR`/`CLAUDE_ASYNC_HTTP_PORT` as the MCP server
-   process that admits jobs.
+   process that admits jobs. `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` still starts it open (with a
+   warning) only until the first container job has passed preflight on this machine: that writes
+   `%USERPROFILE%\.claude-async\container-mode`, and from then on the opt-out is refused.
 8. **Build the image and run the smoke test**, from `D:\code\claude-async`:
 
    ```powershell
@@ -1030,10 +1102,11 @@ Do these in order on claunker. Each step says how to check it.
      -LanTargets "<hermes-host>:<port>","<ha-host>:8123"
    ```
 
-   Every line must be PASS or WARN. Read the loopback-forwarding line (it is measured), the **token
-   propagation** line (section 5b: an in-place rewrite of a bind-mounted file must reach a running
-   container within 5 s, or jobs longer than an hour lose GitHub access; a FAIL there means stop)
-   and every WARN. A FAIL on 7842/2375/2376 means stop. Section 6 mints one real installation token
+   Every line must be PASS or WARN. Read the loopback-forwarding line (it is measured), the two
+   **token propagation** lines (section 5b: a same-length file renamed into the mounted creds
+   directory must reach a running container within 5 s, or jobs longer than an hour lose GitHub
+   access, a FAIL there means stop; the in-place line is the runner's fallback and is a WARN if it
+   does not propagate) and every WARN. A FAIL on 7842/2375/2376 means stop. Section 6 mints one real installation token
    through `tools\mint-app-token.mjs` and shows the App's slug, bot id and installation. Then pin
    the base image digest
    (`docker image inspect node:24-bookworm-slim --format "{{index .RepoDigests 0}}"` into
@@ -1075,7 +1148,12 @@ Do these in order on claunker. Each step says how to check it.
 ### Rollback
 
 - **Stop using it:** set `CLAUDE_ASYNC_ALLOWED_SANDBOXES=host` (or unset it) and restart the bridge.
-  Every container start is then refused before anything is written.
+  Every container start is then refused before anything is written. The container-mode marker
+  (`%USERPROFILE%\.claude-async\container-mode`) stays, so the HTTP bridge keeps refusing to run
+  without its token. Deleting the marker is a deliberate owner action, and only makes sense once
+  container mode is off, no container job is left (`docker ps -a --filter label=claude-async.job`
+  is empty) and you really want `CLAUDE_ASYNC_HTTP_ALLOW_UNAUTHENTICATED=1` back; the code never
+  removes it.
 - **Cut off the credentials:**
   - GitHub App: **uninstall the App from the repo(s)** (the App's page, Install App, the gear next
     to `icey2488`, Uninstall, or per repo under "Only select repositories"). New mints fail from
@@ -1111,7 +1189,7 @@ Do these in order on claunker. Each step says how to check it.
   writable is mounted. The two read-only mounts are files in the claude-async checkout.
 - **Duplicate runners, name reuse?** Cleanup acts only on containers carrying this job's
   `claude-async.job` label, by immutable ID. A duplicate start is refused by the job-dir check, and
-  since round 2 the runner itself takes `runner.lock` with O_EXCL (see "Review round 2").
+  since round 2 the runner itself takes `runner.lock` (made atomic in round 3; see "Review round 3").
 - **Repo-local Claude settings, `apiKeyHelper`?** Ignored (`--setting-sources user`), verified.
 - **Wall-clock limit?** Yes now: 4h default, runner-enforced.
 - **Phase 1 risk.** Phase 1 is an accepted credential-theft risk for a limited pilot (one scratch repo
@@ -1131,12 +1209,12 @@ on the test-only base, real Docker engine on Linux, Claude Code 2.1.309 against 
 - **What prevents duplicate runner execution for the same job dir?** Before round 2: only the
   launch side (the job dir is created once with a non-recursive `mkdir`, `startJob` refuses a
   duplicate id, and the Windows task launcher withdraws its ticket before falling back to the
-  breakaway path, so one launch yields one runner). The runner itself had no exclusivity. Now
-  `job-runner.mjs` creates `runner.lock` with O_EXCL as its first act, holding its pid; a second
-  runner for the same spec exits 3 before touching docker, the logs or `exit.json`, and logs
-  `another runner (pid N) owns this job dir`. A lock whose pid is dead (or, on Windows, reused by a
-  non-node process) is stale and taken over. Test: two runners on one spec give exactly one
-  `docker run`; a stale lock is taken over. This applies to host jobs too (one more file in the job
+  breakaway path, so one launch yields one runner). The runner itself had no exclusivity. Round 2
+  added `runner.lock` (O_EXCL, then the pid); round 3 found that not exclusive and replaced it (see
+  "Review round 3: questions"): a second runner for the same spec exits 3 before touching docker,
+  the logs or `exit.json`, and logs `another runner (pid N) owns this job dir`. A lock whose pid is
+  dead (or, on Windows, reused by a non-node process) is stale and taken over. Test: two runners on
+  one spec give exactly one `docker run`; a stale lock is taken over. This applies to host jobs too (one more file in the job
   dir; argv, env and spec.json are unchanged).
 - **Are job-directory ACLs enforced in code?** No. `%USERPROFILE%\.claude-async-jobs` is created
   with `fs.mkdirSync` and inherits the profile's ACL (Erick, SYSTEM, Administrators). Nothing in
@@ -1152,10 +1230,10 @@ on the test-only base, real Docker engine on Linux, Claude Code 2.1.309 against 
   agent could simply write `settings.json`; that image must not be used.
 - **Does the bridge supervisor use the same config dir and port as the admitting process?** On
   claunker both come from `ecosystem.config.cjs` (pm2) or the Task Scheduler entry, which is also
-  where `CLAUDE_ASYNC_ALLOWED_SANDBOXES` lives; the bridge now refuses to start when that policy
-  allows container mode and its own `http.json` (under its own `CLAUDE_ASYNC_CONFIG_DIR`) has no
-  hash, and prints the path it read, so a mismatch shows up as a refusal at the next restart
-  rather than as an open port. Not verified on claunker from here.
+  where `CLAUDE_ASYNC_ALLOWED_SANDBOXES` lives. Since round 3 the bridge refuses to start whenever
+  its own `http.json` (under its own `CLAUDE_ASYNC_CONFIG_DIR`) has no hash, whatever its policy, and
+  prints the path it read, so a mismatch shows up as a refusal at the next restart rather than as an
+  open port. Not verified on claunker from here.
 - **Verified setup-token revocation?** Still unverified. No per-token revoke procedure for
   `claude setup-token` tokens could be confirmed from here (no CLI command, docs not fetchable).
   Treat a leaked token as live until it expires; see Rollback and the objection above.
@@ -1192,14 +1270,69 @@ on the test-only base, real Docker engine on Linux, Claude Code 2.1.309 against 
   to create a bot account at all. Container jobs now act as a GitHub App owned by `icey2488`,
   installed only on the allowed repos; the host mints a one-hour installation token scoped to the
   job's one repo (`contents: write`, `pull_requests: write`, `metadata: read`) before `docker run`,
-  delivers it as a read-only mounted file, refreshes it in place every 45 minutes and deletes it on
+  delivers it as a read-only mounted file, republishes it every 45 minutes and deletes it on
   finish (see "Identity: the GitHub App" and "Token delivery and refresh"). The blast radius of a
   leaked GitHub token is one repo's branches and PRs for at most an hour; it cannot create repos or
   gists even through phase 2's `github.com`/`api.github.com` allowlist. Still open on this path:
-  whether an in-place rewrite propagates through a Docker Desktop bind mount (the smoke test
-  measures it; a FAIL blocks rollout).
+  whether a rename inside the mounted directory propagates through a Docker Desktop bind mount (the
+  smoke test measures it; a FAIL blocks rollout).
 - **Setup-token revocation (Astra): still open.** Until a revoke path is verified, the one-year
   OAuth token is the part of a compromise that cannot be undone quickly. Unchanged by round 3.
+
+## Review round 3: questions
+
+Two reviews (the round-3 review, findings B1 to B5 plus four questions, and Argon's round 3,
+findings 1 to 6 plus one question). What changed, and what the code and these docs can answer:
+
+| finding | what was wrong | now |
+|---|---|---|
+| B1 (high) | the bridge's own environment decided whether it could start unauthenticated | token required by default; the opt-out is refused while the machine-wide marker exists ("Host loopback services") |
+| B2 (high) | an externally killed docker client was recorded as a finished launch and confirmed on an empty listing | `exited` only when the launch was seen to complete; `exited-uncertain` otherwise; the process scan runs in every state and in `finish()` ("Lifecycle") |
+| B3 / Argon 1 (medium / high) | the Windows scan matched its own PowerShell; every scan matched `docker ps --filter label=` | exact `--label` token on a `run --pull=never` command line; `$PID`, powershell/pwsh and the ps child excluded |
+| B4 / Argon 4 (medium) | `runner.lock` was empty until written; stale takeover could unlink a fresh lock | `runner-lock.mjs`: link-published lock, verified-rename takeover, young empty lock = held, EPERM/EACCES/EBUSY = held |
+| B5 (medium) | a refresh failure waited 45 minutes; the expiry warning ran only on another failure | backoff retries, a last attempt before expiry - 2 min, an independent warning timer (`token-refresh.mjs`) |
+| Argon 2 (high) | the App JWT was sent to `GET /users/<slug>[bot]`; installation state and token repo were not checked | unauthenticated, cached lookup; redirected, suspended or under-permissioned installations and mismatched tokens refused |
+| Argon 3 / C1 (medium) | a late mint could write after finish; a signal during the first mint skipped `finish()`; a dead runner's `creds\` stayed | `done` checks and stop(); signal handlers before the mint; `claude_check` deletes `creds\` of terminal jobs |
+| Argon 5 / C2 (low) | the smoke test choked on `#` lines in the env file and deleted the caller's App variables | comment lines skipped; variables saved and restored |
+| Argon 6 / C3 (nit) | the entrypoint accepted `refs/...` and read the whole token file | `refs`/`refs/*` exit 64 before cloning; readers take the first line and validate it |
+
+Questions:
+
+- **Does real GitHub accept an App JWT on `GET /users/<slug>[bot]`?** Not relied on any more. That
+  endpoint is public, and as far as I know GitHub rejects an App JWT on non-`/app` endpoints, so the
+  lookup is now sent with **no** `Authorization` header and cached; the fake `api.github.com` now
+  answers 401 to any credential on that path, so the tests prove the request is unauthenticated.
+  This is the remaining **unverified real-GitHub call**, together with the response shapes below
+  (`account.login`, `suspended_at`, `permissions` on the installation; `repositories[].full_name` on
+  the token). `tools\mint-app-token.mjs` on claunker (rollout step 3) exercises all of them once; if
+  real GitHub omitted `repositories` from the token response, every mint would be refused (fail
+  closed) and that command would say so.
+- **Rename/transfer redirects?** The installation lookup follows GitHub's redirect, so the code now
+  compares the installation's `account.login` with the requested owner and refuses a mismatch at
+  preflight, and the minted token must list exactly the requested `owner/repo` as its one
+  repository. Tested with the fake (installation on another account; token for
+  `other-owner/<name>`): both refused, the latter before any container starts (exit 78). Not
+  tested against a real renamed repository. The case "the destination installation also contains
+  the original short name" is exactly what the `full_name` check catches.
+- **Atomic token visibility?** Now atomic by construction on Linux (rename inside the mounted
+  directory), measured with concurrent whole-file readers and alternating lengths (0 invalid reads,
+  against 10537 for the old in-place rewrite), and the readers refuse anything that is not one valid
+  line, with retries. On Docker Desktop it is **measured by the smoke test, not here**: section 5b
+  reports whether a renamed file and a same-length in-place rewrite each reach a running container.
+- **Effective Windows ACLs on the PEM and the job credential dirs?** Now enforced in code: the PEM
+  is refused unless `icacls` shows no grant to Everyone/Users/Authenticated Users/BUILTIN\Users
+  (unparsable output refused), and `creds\` gets `/inheritance:r` with the job's account and SYSTEM
+  only. Which account that is under Task Scheduler is still for claunker to show: the runner uses
+  `%USERDOMAIN%\%USERNAME%` of its own process. The icacls calls themselves have not run here (no
+  Windows); the parser and the argv are unit-tested.
+- **Argon Q1, WSL2 caching of same-length in-place rewrites:** moot for the normal path (each
+  generation is a new file, renamed in); the in-place fallback is measured by the smoke test with
+  same-length content and reported as its own line.
+
+Residual, documented rather than fixed: `runner.lock`'s put-back after a failed takeover check needs
+the lock name to be free; a third runner that links its own lock in that instant keeps it and the
+displaced owner keeps running. That needs three runners for one job dir within microseconds plus a
+stale lock to start from; one launch yields one runner.
 
 ## Verified here vs assumed
 
@@ -1238,13 +1371,28 @@ Verified in this sandbox (Linux, a real Docker engine, a test-only base image):
   request bodies, the error paths, the key-file permission check, the runner's modes/inode/refresh/
   failure/delete paths, the credential helper via `git credential fill`, and the gh wrapper.
 
+- round 3, with the real engine: a hardened container reading the token file through the read-only
+  directory mount while the host republished it: 0 invalid reads of 124793 with rename, 10537 of
+  125518 with the old in-place rewrite; the real runner and `startJob()` argv with rename publication
+  and the round-3 credential helper and gh wrapper (mounted over the r3 image's): clone with
+  generation 2, `git ls-remote` with generation 7, cleanup confirmed, no container left; and a
+  docker client SIGKILLed from outside 300 ms after it started: `docker_launch` =
+  `exited-uncertain`, the daemon created the container anyway (the runner's `finish()` removed it),
+  exit.json recorded cleanup NOT confirmed, `claude_check` stayed unconfirmed for the hold and then
+  confirmed with nothing left.
+
 Not verified here:
 
 - Docker Desktop on Windows, the real `node:24-bookworm-slim` base, host Ollama, and whether
   `host.docker.internal` reaches the Windows host's `127.0.0.1` (the smoke test measures it);
-- **whether an in-place rewrite of the token file propagates through a Docker Desktop bind mount**
-  (Linux bind mounts do; the smoke test's section 5b measures it and fails if it does not);
-- the real GitHub App endpoints (installation lookup, `access_tokens`, `/app`, `/users/<slug>[bot]`)
+- **whether a file renamed into the mounted creds directory, and a same-length in-place rewrite,
+  propagate through a Docker Desktop bind mount** (Linux bind mounts do; the smoke test's section 5b
+  measures both and fails if the rename does not);
+- every Windows-only path added in round 3: the PowerShell process scan, `icacls` on the key and on
+  `creds\`, `MoveFileEx` of the token file over an open file (the in-place fallback covers it),
+  EPERM/EACCES/EBUSY on `runner.lock`;
+- the real GitHub App endpoints (installation lookup with `account`/`suspended_at`/`permissions`,
+  `access_tokens` with `repositories`, `/app`, the unauthenticated `/users/<slug>[bot]`)
   and that GitHub links `<id>+<slug>[bot]@users.noreply.github.com` commits to the App: the request
   and response shapes follow GitHub's REST documentation from memory and were exercised only against
   the fake; `tools\mint-app-token.mjs` on claunker is the first real call;
