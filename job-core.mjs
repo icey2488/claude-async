@@ -26,7 +26,8 @@ import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
          DEPTH_ENV } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
-         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers } from "./container.mjs";
+         buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues,
+         redactSecrets } from "./container.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -1122,8 +1123,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
     launchCommand = containerPlan.dockerBin;
     // jobId: the claude-async.job label every cleanup lists by; maxRuntimeMs: the runner's wall-clock limit.
+    // envFile: a PATH (the runner reads the values into memory only, to redact what it sends out).
     launchExtra.container = { name: containerPlan.name, jobId: id, dockerBin: containerPlan.dockerBin, repo: containerPlan.repo,
-                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs };
+                              maxRuntimeMs: containerPlan.cfg.maxRuntimeMs, envFile: containerPlan.envFile };
   }
   const { pid, pidSource, jobMembership, launchPath } =
     await (opts.launch || launch)(p, launchCommand, launchArgv, launchCwd, extraEnv, launchExtra);
@@ -1147,7 +1149,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
                        image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
-                       jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null } } : {}) };
+                       jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null,
+                       envFile: containerPlan.envFile } } : {}) };
   const metaError = writeNewMeta(p, meta, opts.fsImpl);
   const warnings = [...(reserved.warnings || []),
     ...(metaError ? [`meta.json could not be written: ${metaError}; the job IS running as pid ${pid}; claude_check will not find it`] : [])];
@@ -1273,11 +1276,26 @@ export function checkJob(id, tailBytes = 8000, opts = {}) {
   // already closed the card and cleaned up through its normal path.
   if (exitCode !== null && exitRecord && exitRecord.exitReason === "container_max_runtime") state = "timed_out";
 
+  // Container jobs: out.log/err.log on disk stay raw (a job can print its own environment), but what
+  // claude_check returns -- to a chat session, or over /v1/check to another host -- is redacted:
+  // the env file's two values, plus GitHub/Anthropic token shapes. Host jobs are unchanged.
+  let stdout = readTail(p.out, tailBytes), stderr = readTail(p.err, tailBytes), exitOut = exitRecord;
+  if (meta.sandbox === "container") {
+    const values = readEnvFileSecretValues(meta.container && meta.container.envFile);
+    stdout = redactSecrets(stdout, values);
+    stderr = redactSecrets(stderr, values);
+    if (exitRecord && typeof exitRecord === "object") {
+      exitOut = { ...exitRecord };
+      for (const k of ["stdoutTail", "stderrTail"]) {
+        if (Array.isArray(exitOut[k])) exitOut[k] = exitOut[k].map((l) => redactSecrets(String(l), values));
+      }
+    }
+  }
   return { ...meta, hostname, status: state, exitCode, finishedAt, ...extra,
            ...(runnerJobMembership ? { runnerJobMembership } : {}),
-           ...(exitRecord !== undefined ? { exit: exitRecord } : {}),
+           ...(exitRecord !== undefined ? { exit: exitOut } : {}),
            ...(state === "died" ? { diedCause: classifyDiedCause(exitRecord) } : {}),
-           stdout: readTail(p.out, tailBytes), stderr: readTail(p.err, tailBytes) };
+           stdout, stderr };
 }
 
 // ------------------------------------------------------------------ container cleanup state ---

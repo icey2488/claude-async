@@ -56,6 +56,9 @@
  *       checkJob()/cancelJob() keep retrying an unconfirmed cleanup.
  *   (6) exit.json's container record also carries the repo, the PR URL the job reported on stdout
  *       for that repo (prUrl), and a warning when the entrypoint could not clone it (exit 70).
+ *   (7) Redaction: the env file's two values are read into memory once (never written anywhere),
+ *       and exit.json's stdout/stderr tails and the Discord ping's headline are redacted with them
+ *       plus GitHub/Anthropic token shapes. out.log/err.log on disk stay raw.
  *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
@@ -78,7 +81,8 @@ import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
-import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, DEFAULT_MAX_RUNTIME_MS } from "./container.mjs";
+import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
+         redactSecrets } from "./container.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -111,6 +115,9 @@ const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
 const cancelPath = path.join(path.dirname(specPath), "cancel_requested");
 const dockerPidPath = path.join(path.dirname(specPath), "docker_client.pid");
 const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null };
+// Container jobs: the secret values to redact from anything that leaves this runner. In memory only.
+const redactValues = containerSpec ? readEnvFileSecretValues(containerSpec.envFile) : [];
+const redact = (text) => (containerSpec ? redactSecrets(text, redactValues) : text);
 
 // 2026-09-09 runner-termination investigation: self-reported Job Object membership, refreshed on
 // every heartbeat, so a job's death can be correlated against "was this runner actually free of
@@ -260,8 +267,8 @@ function removeJobContainers(why) {
 // cleanup record from finish() ({ confirmed, removed, error? }).
 function recordExit(cleanup = null) {
   const exitPath = path.join(path.dirname(specPath), "exit.json");
-  const stdoutTail = readTail(out);
-  const stderrTail = readTail(err);
+  const stdoutTail = readTail(out).map(redact);
+  const stderrTail = readTail(err).map(redact);
   let completeness;
   try { completeness = loadCompletenessConfig(); } catch { completeness = { markerRegex: undefined }; }
   // Only overrides a plain "exit" (the CLI ran and exited on its own, which is what printing its
@@ -392,6 +399,7 @@ async function finish(code) {
       stdoutLines: (exitRecord && exitRecord.stdoutTail) || [],
       outLogPath: out,
       reportComplete: exitRecord ? exitRecord.reportComplete : true,
+      ...(containerSpec ? { redact } : {}),
       logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
     });
   } catch {}

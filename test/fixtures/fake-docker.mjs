@@ -3,7 +3,7 @@
 // $FAKE_DOCKER_LOG ({ argv }). Container state lives in "$FAKE_DOCKER_LOG.state.json"
 // ({ id, label, state }), so separate invocations (run / ps / rm) see the same "daemon":
 //   run ...   -> after $FAKE_DOCKER_CREATE_DELAY_MS (default 0) creates the container (state file,
-//                state "running"), prints "container stdout" / "container stderr" (+ $FAKE_DOCKER_STDOUT),
+//                state "running"), prints $FAKE_DOCKER_STDOUT (first), "container stdout" / "container stderr",
 //                then runs for $FAKE_DOCKER_RUN_MS (default 0) and exits $FAKE_DOCKER_RUN_EXIT
 //                (default 0), removing the container (--rm) -- unless $FAKE_DOCKER_LEAVE_RUNNING=1,
 //                which models a client that exits while its container keeps running. If the
@@ -46,8 +46,8 @@ if (argv[0] === "run") {
   const createDelay = Number(process.env.FAKE_DOCKER_CREATE_DELAY_MS) || 0;
   if (createDelay) await sleep(createDelay);
   fs.writeFileSync(stateFile, JSON.stringify({ id, label, state: "running" }));
-  process.stdout.write("container stdout\n");
   if (process.env.FAKE_DOCKER_STDOUT) process.stdout.write(process.env.FAKE_DOCKER_STDOUT + "\n");
+  process.stdout.write("container stdout\n");
   process.stderr.write("container stderr\n");
   const runMs = Number(process.env.FAKE_DOCKER_RUN_MS) || 0;
   const code = Number(process.env.FAKE_DOCKER_RUN_EXIT) || 0;

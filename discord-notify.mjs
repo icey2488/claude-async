@@ -395,13 +395,15 @@ function sanitizeForLog(msg, webhookUrl) {
  * exit.json's own stdoutTail) when outLogPath is absent/unreadable or has no qualifying line in
  * its head window -- see chooseHeadlineLines().
  *
+ * redact: optional (line) => line, applied to every headline candidate (container jobs).
+ *
  * reportComplete: whether the job's stdout carried the DELEGATION-METRICS final-report marker
  * (job-runner.mjs computes this once, via hasCompletenessMarker(), and both writes it to
  * exit.json and passes it in here, so the completeness check and the field claude_check surfaces
  * always agree). Only changes the marker on an exit-0 "exit" job, and only when
  * completeness.enforce (notify.json, default true) is also on -- see markerFor().
  */
-export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, reportComplete, logLine, fetchImpl = fetch }) {
+export async function notifyJobFinished({ jobId, intent, host, exitCode, exitReason, startedAt, endedAt, stdoutLines, outLogPath, includeHeadlineOverride, reportComplete, logLine, redact, fetchImpl = fetch }) {
   let config;
   try { config = loadNotifyConfig(); } catch { return; }
   if (!config) return;
@@ -426,8 +428,11 @@ export async function notifyJobFinished({ jobId, intent, host, exitCode, exitRea
   const marker = markerFor(exitReason, exitCode, { reportComplete, enforce: completeness.enforce });
   const includeHeadline = includeHeadlineOverride !== undefined ? includeHeadlineOverride : config.includeHeadline;
   const durationMs = startedAt && endedAt ? (endedAt.getTime() - new Date(startedAt).getTime()) : NaN;
-  const headLines = includeHeadline && outLogPath ? readHead(outLogPath) : [];
-  const headline = includeHeadline ? boundHeadline(chooseHeadlineLines(headLines, stdoutLines)) : null;
+  // redact (container jobs, from job-runner.mjs): applied to every candidate line before the headline
+  // is picked, so a token printed on stdout can't become the ping's text. Absent for host jobs.
+  const scrub = typeof redact === "function" ? (lines) => (Array.isArray(lines) ? lines.map((l) => redact(String(l))) : lines) : (lines) => lines;
+  const headLines = includeHeadline && outLogPath ? scrub(readHead(outLogPath)) : [];
+  const headline = includeHeadline ? boundHeadline(chooseHeadlineLines(headLines, scrub(stdoutLines))) : null;
   const title = intent ? escapeDiscordText(intent) : jobId;
   const incompleteReason = marker === "[INCOMPLETE]" ? INCOMPLETE_REASON : null;
   const content = buildDiscordContent({ marker, host, jobId: title, exitCode, durationMs, headline, incompleteReason });

@@ -23,9 +23,10 @@
  * today's argv, env and spec byte-for-byte.
  *
  * This module builds and validates argv and config, and runs the small docker housekeeping
- * commands (image inspect, list/remove this job's containers). It never runs `docker run` itself (job-runner.mjs does) and
- * never reads secret VALUES: the env file is passed to docker by path (--env-file), and
- * checkEnvFile() reads it only to verify key names and format, returning names, never values.
+ * commands (image inspect, list/remove this job's containers). It never runs `docker run` itself
+ * (job-runner.mjs does). Secret VALUES are read in exactly one place, readEnvFileSecretValues(),
+ * and only so the runner and checkJob() can redact them from what leaves the host; checkEnvFile()
+ * returns key names only. Docker reads the env file itself (--env-file).
  */
 import { spawnSync as nodeSpawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -310,6 +311,39 @@ export function checkEnvFile(envFile, { forbidInside = [], platform = process.pl
   const missing = ENV_FILE_REQUIRED_KEYS.filter((k) => !keys.includes(k));
   if (missing.length) return { error: `container env file ${rd.real} is missing ${missing.join(", ")}` };
   return { keys, real: rd.real };
+}
+
+// The ONE function that returns secret values: the runner and checkJob() use them, in memory only,
+// to redact job output before it leaves the host (exit.json tails, the Discord ping, claude_check).
+// Returns [] on any problem (redaction then falls back to the token-shape patterns alone).
+export function readEnvFileSecretValues(envFile, { realpath = defaultRealpath } = {}) {
+  if (!envFile) return [];
+  const rd = readEnvFileBytes(envFile, realpath);
+  if (rd.error) return [];
+  let text = rd.buf.toString("utf8");
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const parsed = parseEnvFileText(text.replace(/\r/g, ""), rd.real);
+  if (parsed.error) return [];
+  return parsed.entries.map(([, v]) => v).filter((v) => v.length >= 8);
+}
+
+// --------------------------------------------------------------------------------- redaction ---
+
+// Token shapes redacted even when the env file can't be read: GitHub classic/OAuth/app/user/refresh
+// tokens and fine-grained PATs, and Anthropic keys/OAuth tokens (sk-ant-...).
+export const SECRET_PATTERNS = Object.freeze([
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bsk-ant-[A-Za-z0-9_-]{8,}/g,
+]);
+export const REDACTED = "[REDACTED]";
+
+export function redactSecrets(text, values = []) {
+  if (typeof text !== "string" || text === "") return text;
+  let out = text;
+  for (const v of values) if (typeof v === "string" && v.length >= 8) out = out.split(v).join(REDACTED);
+  for (const re of SECRET_PATTERNS) out = out.replace(re, REDACTED);
+  return out;
 }
 
 // --------------------------------------------------------------------------- host paths ---

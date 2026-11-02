@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import http from "node:http";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -36,6 +37,8 @@ function makeDockerShim(dir) {
 
 let seq = 0;
 const REPO = "icey2488/container-job-scratch";
+const SECRET_GH = "ghp_RUNNERSECRET000000000000000000000000";
+const SECRET_OAUTH = "sk-ant-oat01-RUNNERSECRET";
 function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
   const jobId = `cjob-${process.pid}-${++seq}`;
   const dir = path.join(core.JOB_ROOT, jobId);
@@ -47,7 +50,8 @@ function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
                  argv: ["run", "--rm", "--pull=never", "--name", name, "--label", `claude-async.job=${jobId}`, "img",
                         "/usr/local/bin/claude-async-job-entry", REPO, "", "--", "claude", "-p", "--", "x"],
                  cwd: dir, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
-                 container: { name, jobId, dockerBin: docker, repo: REPO, maxRuntimeMs } };
+                 container: { name, jobId, dockerBin: docker, repo: REPO, maxRuntimeMs, envFile: path.join(dir, "secrets.env") } };
+  fs.writeFileSync(spec.container.envFile, `GH_TOKEN=${SECRET_GH}\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
   fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId, pid: 1, startedAt: new Date().toISOString(),
     sandbox: "container", container: { name, jobId, dockerBin: docker, repo: REPO }, ...meta }));
@@ -250,4 +254,29 @@ test("container job: the card close never runs host git, even with a startHead i
   runSync(j);
   assert.equal(j.exitRecord().exitCode, 0);
   assert.ok(!fs.existsSync(log), `host git ran for a container job: ${fs.existsSync(log) ? fs.readFileSync(log, "utf8") : ""}`);
+});
+
+// Argon #6: a job that prints its tokens. out.log keeps them (documented); nothing that leaves the
+// runner does: exit.json tails, and the Discord ping's headline (sent here to a local server).
+test("redaction: printed tokens never reach exit.json or the Discord ping", { skip: SKIP }, async () => {
+  const got = [];
+  const server = http.createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { got.push(b); res.end("ok"); }); });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  try {
+    const cfgDir = path.join(TMP, `notify-${seq + 1}`);
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, "notify.json"), JSON.stringify({ discord: {
+      webhookUrl: `http://127.0.0.1:${server.address().port}/hook`, includeHeadline: true } }));
+    const leak = `LEAK ${SECRET_GH} ${SECRET_OAUTH} gho_${"k".repeat(36)}`;
+    const j = setup({ CLAUDE_ASYNC_CONFIG_DIR: cfgDir, FAKE_DOCKER_STDOUT: `${leak}\nDELEGATION-METRICS: zero calls` });
+    const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+    await exited(child);
+    const rec = JSON.stringify(j.exitRecord());
+    for (const v of [SECRET_GH, SECRET_OAUTH, "gho_kkk"]) assert.ok(!rec.includes(v), `exit.json leaks ${v}`);
+    assert.match(rec, /LEAK \[REDACTED\]/);
+    assert.equal(got.length, 1, "the ping was sent");
+    for (const v of [SECRET_GH, SECRET_OAUTH, "gho_kkk"]) assert.ok(!got[0].includes(v), `ping leaks ${v}: ${got[0]}`);
+    assert.match(got[0], /REDACTED/, "the headline was the leaking line, redacted");
+    assert.match(fs.readFileSync(path.join(j.dir, "out.log"), "utf8"), new RegExp(SECRET_GH), "out.log on disk stays raw");
+  } finally { await new Promise((r) => server.close(r)); }
 });

@@ -373,6 +373,29 @@ test("checkEnvFile / planContainerJob: a secrets file inside the claude-async ch
   } finally { fs.rmSync(inCheckout, { force: true }); }
 });
 
+test("readEnvFileSecretValues: the values, in memory, for redaction only; [] for a bad or missing file", () => {
+  const fx = fixture();
+  assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), [SECRET_GH, SECRET_OAUTH]);
+  assert.deepEqual(c.readEnvFileSecretValues(null), []);
+  assert.deepEqual(c.readEnvFileSecretValues(path.join(fx.base, "missing.env")), []);
+  // CRLF/BOM files still yield their values (redaction must not depend on the file being perfect)
+  fs.writeFileSync(fx.envFile, `\ufeffGH_TOKEN=${SECRET_GH}\r\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\r\n`);
+  assert.deepEqual(c.readEnvFileSecretValues(fx.envFile), [SECRET_GH, SECRET_OAUTH]);
+});
+
+test("redactSecrets: exact env-file values and GitHub/Anthropic token shapes become [REDACTED]", () => {
+  const text = `a ${SECRET_GH} b ${SECRET_OAUTH} c ghp_${"A".repeat(36)} d github_pat_${"1".repeat(30)} ` +
+               `e gho_${"b".repeat(36)} f ghs_${"c".repeat(36)} g sk-ant-api03-${"x".repeat(20)} h unrelated-text`;
+  const out = c.redactSecrets(text, [SECRET_GH, SECRET_OAUTH]);
+  for (const leak of [SECRET_GH, SECRET_OAUTH, "ghp_AAAA", "github_pat_111", "gho_bbb", "ghs_ccc", "sk-ant-api03"]) {
+    assert.ok(!out.includes(leak), `${leak} redacted: ${out}`);
+  }
+  assert.match(out, /h unrelated-text$/);
+  assert.equal(c.redactSecrets("custom-secret-value-123 x", ["custom-secret-value-123"]), "[REDACTED] x");
+  assert.equal(c.redactSecrets("short", ["ab"]), "short", "values under 8 chars are not used as patterns");
+  assert.equal(c.redactSecrets("", ["x"]), "");
+});
+
 // -------------------------------------------------------------------------------- config ---
 
 test("validateContainerConfig: refuses host/none networks, bad limits, missing bot identity", () => {
@@ -590,7 +613,8 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.equal(r.workFolder, null, "no host folder");
   assert.equal(r.startHead, null, "no host git HEAD for a container job");
   assert.equal(r.hermesHome, undefined, "no per-job HERMES_HOME dir for container jobs");
-  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "jobId", "maxRuntimeMs", "name", "repo"]);
+  assert.deepEqual(Object.keys(launchExtra.container).sort(), ["dockerBin", "envFile", "jobId", "maxRuntimeMs", "name", "repo"]);
+  assert.equal(launchExtra.container.envFile, fs.realpathSync.native(fx.envFile), "a path, never a value");
   // the image runs by the ID preflight inspected (ctrOpts' checkImage), recorded in meta too
   const imageId = `sha256:${"ab".repeat(32)}`;
   assert.ok(argv.includes(imageId) && !argv.includes(fx.cfg.image));
@@ -767,4 +791,27 @@ test("checkJob: a running container job is never cleaned up, and countActiveJobs
   assert.ok(opts.length >= 1);
   assert.ok(opts.every((o) => o && o.containerCleanup === false), "the cap count asks for no container cleanup");
   assert.ok(!fs.existsSync(path.join(dead.d, "cancel_requested")), "no reap from the cap count");
+});
+
+test("checkJob: a container job's stdout/stderr tails and exit.json tails are redacted (out.log stays raw)", async () => {
+  const fx = fixture();
+  const { id, d } = await startCtr(fx);
+  const meta = JSON.parse(fs.readFileSync(path.join(d, "meta.json"), "utf8"));
+  assert.equal(meta.container.envFile, fs.realpathSync.native(fx.envFile), "the env file PATH is recorded (never a value)");
+  fs.appendFileSync(path.join(d, "out.log"), `token ${SECRET_GH} and ghp_${"Z".repeat(36)}\n`);
+  fs.appendFileSync(path.join(d, "err.log"), `oauth ${SECRET_OAUTH}\n`);
+  fs.writeFileSync(path.join(d, "exit.json"), JSON.stringify({ exitCode: 0, stdoutTail: [`x ${SECRET_GH}`], stderrTail: [SECRET_OAUTH],
+    container: { cleanup: { confirmed: true } } }));
+  fs.writeFileSync(path.join(d, "exit_code"), "0");
+  const r = core.checkJob(id, 8000);
+  const all = JSON.stringify(r);
+  assert.ok(!all.includes(SECRET_GH) && !all.includes(SECRET_OAUTH) && !all.includes("ghp_ZZZ"), all);
+  assert.match(r.stdout, /token \[REDACTED\]/);
+  assert.match(fs.readFileSync(path.join(d, "out.log"), "utf8"), new RegExp(SECRET_GH), "the file on disk is not rewritten");
+  // host jobs: tails are returned exactly as before
+  const hostId = jid("hostredact");
+  await core.startJob({ prompt: "p", workFolder: fx.hostDir, jobId: hostId },
+    { claudeBin: process.execPath, caps: CAPS, launch: fakeLaunch([]), hermesHomeIsolation: false });
+  fs.appendFileSync(path.join(core.JOB_ROOT, hostId, "out.log"), `ghp_${"Q".repeat(36)}\n`);
+  assert.match(core.checkJob(hostId, 8000).stdout, /ghp_QQQ/, "host-mode output is untouched");
 });
