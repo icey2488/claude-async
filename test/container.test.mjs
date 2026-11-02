@@ -1229,3 +1229,15 @@ test("B3: the POSIX scan matches the exact token and excludes the ps process its
   // the real ps on this machine: no such job -> []
   if (process.platform !== "win32") assert.deepEqual(core.findDockerClientsForJob(`${B3_ID}-nothing-runs-this`), []);
 });
+
+// ------------------------------------------------------------ review round 3, finding B2 ---
+test("B2: classifyClientExit: only an exit after the container was seen running, or a POSIX exit status of the client's own, is conclusive", () => {
+  const k = c.classifyClientExit;
+  assert.equal(k({ observedRunning: true, code: null, signal: "SIGKILL", platform: "win32" }), "exited");
+  assert.equal(k({ observedRunning: true, code: 1, signal: null, platform: "win32" }), "exited");
+  assert.equal(k({ observedRunning: false, code: 0, signal: null, platform: "linux" }), "exited", "POSIX: an exit status is the client's own");
+  assert.equal(k({ observedRunning: false, code: null, signal: "SIGKILL", platform: "linux" }), "exited-uncertain", "killed by someone else");
+  assert.equal(k({ observedRunning: false, code: null, signal: "SIGTERM", platform: "darwin" }), "exited-uncertain");
+  // win32: TerminateProcess shows up as an ordinary exit code, so without the observation nothing is conclusive
+  for (const code of [0, 1, 125, 137]) assert.equal(k({ observedRunning: false, code, signal: null, platform: "win32" }), "exited-uncertain", String(code));
+});

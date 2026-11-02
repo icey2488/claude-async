@@ -611,3 +611,53 @@ test("runner lock: a second runner for the same job dir exits without running do
   assert.equal(k.exitRecord().exitCode, 0);
   assert.match(fs.readFileSync(path.join(k.dir, "err.log"), "utf8"), /stale runner\.lock/);
 });
+
+// ------------------------------------------------------------ review round 3, finding B2 ---
+// An EXTERNALLY killed docker client (Windows: docker.exe terminated while its com.docker.cli.exe
+// descendant still prepares the container) is not a completed launch: the runner did not see the
+// container run, so the exit is "exited-uncertain", the process scan for surviving launch processes
+// runs before any confirmation (in finish() and in reconcile), and the confirm hold applies.
+test("B2: client killed externally while a detached creator still prepares the container: unconfirmed and slot held until the creator ran and its container was removed", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_DETACHED_CREATOR_MS: "3000", FAKE_DOCKER_CREATOR_LINGER_MS: "1500", FAKE_DOCKER_RUN_MS: "60000" });
+  const runner = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  j.patchMeta({ pid: runner.pid });
+  const pidFile = path.join(j.dir, "docker_client.pid");
+  assert.ok(await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, "utf8")) > 0), "docker client spawned");
+  // someone else kills ONLY the client; the runner stays alive and sees the exit
+  await new Promise((r) => setTimeout(r, 300));
+  process.kill(Number(fs.readFileSync(pidFile, "utf8")), "SIGKILL");
+  assert.equal(await exited(runner), 0, "the runner finished normally");
+  const rec = j.exitRecord();
+  assert.equal(rec.container.cleanup.confirmed, false, `an empty listing after an uncertain client exit is not cleanup: ${JSON.stringify(rec.container.cleanup)}`);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(j.dir, "docker_launch"), "utf8")).state, "exited-uncertain");
+  assert.ok(!j.containerExists(), "the creator has not created the container yet");
+  const hold = { CLAUDE_ASYNC_CONTAINER_CONFIRM_HOLD_MS: "500" };
+  const countNow = () => core.countActiveJobs(Date.now(), { check: () => ({ status: "completed" }) }).count;
+  const held = countNow();
+  const s1 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.equal(s1.containerCleanup, "unconfirmed", JSON.stringify(s1.containerCleanupError));
+  assert.match(String(s1.containerCleanupError), /process carrying this job's label is alive|killed|uncertain/);
+  assert.ok(await waitFor(() => j.containerExists(), 10_000), "the creator created the container after the runner finished");
+  const s2 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold);
+  assert.equal(s2.containerCleanup, "unconfirmed");
+  assert.ok(!j.containerExists(), "a later check removed the late container");
+  assert.equal(countNow(), held, "the job still holds its concurrency slot");
+  assert.ok(await waitFor(() => withFakeDaemon(j, () => core.checkJob(j.jobId, 0), hold).containerCleanup === "confirmed", 15_000),
+    "confirmed once the creator is gone and nothing is listed");
+  assert.equal(countNow(), held - 1, "and the slot is released");
+});
+
+test("B2: reconcile scans for surviving launch processes even when docker_launch says \"exited\"", { skip: SKIP }, async () => {
+  const j = setup({});
+  runSync(j);
+  // the runner recorded a conclusive exit and confirmed; take the confirmation away and fake a survivor
+  const rec = j.exitRecord();
+  assert.equal(rec.container.cleanup.confirmed, true);
+  rec.container.cleanup.confirmed = false;
+  fs.writeFileSync(path.join(j.dir, "exit.json"), JSON.stringify(rec));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(j.dir, "docker_launch"), "utf8")).state, "exited");
+  const c1 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0, { findDockerClients: () => [424242] }));
+  assert.equal(c1.containerCleanup, "unconfirmed", "a live process carrying the label blocks confirmation in every launch state");
+  const c2 = withFakeDaemon(j, () => core.checkJob(j.jobId, 0, { findDockerClients: () => [] }));
+  assert.equal(c2.containerCleanup, "confirmed");
+});

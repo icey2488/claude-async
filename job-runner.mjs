@@ -98,12 +98,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
-import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive, isOurProcess } from "./job-core.mjs";
+import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive, isOurProcess, findDockerClientsForJob } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
 import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
-         redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER } from "./container.mjs";
+         redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER, listJobContainers,
+         classifyClientExit } from "./container.mjs";
 import { createMinter } from "./github-app.mjs";
 import { acquireRunnerLock } from "./runner-lock.mjs";
 
@@ -162,12 +163,17 @@ const cancelPath = path.join(path.dirname(specPath), "cancel_requested");
 const dockerPidPath = path.join(path.dirname(specPath), "docker_client.pid");
 // Container jobs: the launch state job-core reads to decide whether a `docker run` could still
 // create a container (see job-core.mjs containerLaunchPending). Written BEFORE the client is
-// spawned ("pending"), again once its pid is known ("spawned"), when the client exited on its own
-// ("exited": no further creation possible) and when this runner had to kill it ("killed": the
-// daemon may still be serving its create request). A runner that dies between any two of these
+// spawned ("pending"), again once its pid is known ("spawned"), when the client exited after its
+// launch demonstrably completed ("exited": no further creation possible), when it exited in a way
+// that proves nothing ("exited-uncertain": e.g. killed by someone else before this runner saw the
+// container; a descendant or the daemon may still create it; container.mjs classifyClientExit) and
+// when this runner had to kill it ("killed": the daemon may still be serving its create request). A runner that dies between any two of these
 // leaves the earlier state behind, which job-core treats as "uncertain", never as "done".
 const dockerLaunchPath = path.join(path.dirname(specPath), "docker_launch");
-const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null };
+// observedRunning: this runner saw the job's container listed while the client ran (creation had
+// completed); launchState: the last docker_launch state written (review round 3, B2).
+const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null,
+                         observedRunning: false, launchState: null };
 // Container jobs: the GitHub App installation token on disk (see header item 8).
 const credsDir = containerSpec ? (containerSpec.credsDir || path.join(path.dirname(specPath), CREDS_DIR_NAME)) : null;
 const tokenPath = credsDir ? path.join(credsDir, CREDS_TOKEN_NAME) : null;
@@ -175,6 +181,7 @@ const tokenState = { generations: 0, expiresAt: 0, lastError: null, lastLoggedEr
 const TOKEN_EXPIRY_WARN_MS = 5 * 60 * 1000;
 let tokenRefresh = null;
 function writeLaunchState(state, pid = null) {
+  containerState.launchState = state;
   const tmp = dockerLaunchPath + ".tmp";
   try {
     fs.writeFileSync(tmp, JSON.stringify({ state, pid, runnerPid: process.pid, at: new Date().toISOString() }), "utf8");
@@ -528,14 +535,26 @@ async function finish(code) {
     if (tokenRefresh) clearInterval(tokenRefresh);
     if (child && child.exitCode === null && child.signalCode === null) { containerState.fallbackFired = true; killClient(child); }
     try {
+      // Liveness first, listing second (review round 3, B2), in EVERY launch state: a surviving
+      // launch process (Docker Desktop's com.docker.cli.exe after docker.exe was killed, a client
+      // this runner's kill has not reaped yet) may still create the container after the listing.
+      const jobIdForScan = containerSpec.jobId || path.basename(path.dirname(specPath));
+      let survivors;
+      try { survivors = findDockerClientsForJob(jobIdForScan); } catch { survivors = null; }
       const r = removeJobContainers("finish");
       const absent = !!(r.ok && r.absent);
-      // A client that had to be killed after the stop wait may have had a create request in flight
-      // daemon-side, so its cleanup is never confirmed here; checkJob() confirms it later.
-      const confirmed = absent && !containerState.fallbackFired;
+      const uncertain = containerState.launchState === "exited-uncertain";
+      // A client that had to be killed after the stop wait, or one that ended without this runner
+      // seeing its launch complete, may have had a create request in flight daemon-side, so its
+      // cleanup is never confirmed here; checkJob() confirms it later (scan, hold, listing).
+      const scanClear = Array.isArray(survivors) && survivors.length === 0;
+      const confirmed = absent && !containerState.fallbackFired && !uncertain && scanClear;
       cleanupRecord = { confirmed, removed: r.removed || 0,
                         ...(!r.ok ? { error: r.error } : !absent ? { error: "a container is still listed after docker rm -f" } : {}),
-                        ...(containerState.fallbackFired ? { clientKilled: true, reason: "the docker client did not exit within the stop wait and was killed" } : {}) };
+                        ...(containerState.fallbackFired ? { clientKilled: true, reason: "the docker client did not exit within the stop wait and was killed" } : {}),
+                        ...(uncertain ? { uncertainExit: true, reason: "the docker client exited before this runner saw its container (killed by someone else?); a descendant or the daemon may still create it" } : {}),
+                        ...(survivors === null ? { reason: "the process scan for this job's docker client failed" }
+                          : survivors.length ? { survivors, reason: `a process carrying this job's label is still alive (pid ${survivors.join(", ")})` } : {}) };
       if (absent && r.removed > 0 && !containerState.cancelled && !containerState.runtimeExceeded) {
         fs.writeSync(errFd, `\n[job-runner] container ${containerSpec.name} was still present after docker exited; removed it\n`);
       }
@@ -721,6 +740,8 @@ function watchContainer() {
   const startedMs = Date.now();
   const maxRuntimeMs = Number(containerSpec.maxRuntimeMs) > 0 ? Number(containerSpec.maxRuntimeMs) : DEFAULT_MAX_RUNTIME_MS;
   const pollMs = Number(process.env.CLAUDE_ASYNC_CONTAINER_POLL_MS) || 1000;
+  const observeMs = Math.max(pollMs, Number(process.env.CLAUDE_ASYNC_CONTAINER_OBSERVE_MS) || 1000);
+  let lastObserve = 0;
   containerWatch = setInterval(() => {
     if (done) return;
     if (!containerState.cancelled && fs.existsSync(cancelPath)) {
@@ -730,6 +751,15 @@ function watchContainer() {
     if (!containerState.runtimeExceeded && Date.now() - startedMs > maxRuntimeMs) {
       containerState.runtimeExceeded = true;
       beginStop(`wall-clock limit (${maxRuntimeMs} ms) reached`);
+    }
+    // Review round 3 (B2): until this runner has seen the job's container listed once, look for it
+    // (throttled), so a later client exit can be told apart from a launch that never completed.
+    if (!containerState.observedRunning && !stop.started && Date.now() - lastObserve >= observeMs) {
+      lastObserve = Date.now();
+      try {
+        const l = listJobContainers({ dockerBin: containerSpec.dockerBin || command, jobId: containerSpec.jobId || path.basename(path.dirname(specPath)) });
+        if (!l.error && l.containers.length) containerState.observedRunning = true;
+      } catch {}
     }
     // Still attached after the first attempt (a container still being created, a slow daemon):
     // retry, throttled.
@@ -756,9 +786,12 @@ function wireChildExit() {
     // try to detect "was this really a kill" from code 1 alone, because 1 is also the CLI's
     // ordinary error exit code -- any such heuristic would misclassify real CLI failures.
     exitInfo = { exitCode: code, exitSignal: signal, exitReason: signal ? "signal" : "exit" };
-    // Container jobs: a client that exited on its own can't create anything any more; one this runner
-    // killed (fallback) keeps the "killed" state written by killClient().
-    if (containerSpec && !containerState.fallbackFired) writeLaunchState("exited", child.pid || null);
+    // Container jobs: a client whose launch demonstrably completed can't create anything any more
+    // ("exited"); one that ended before this runner saw its container proves nothing
+    // ("exited-uncertain", review round 3 B2); one this runner killed (fallback) keeps "killed".
+    if (containerSpec && !containerState.fallbackFired) {
+      writeLaunchState(classifyClientExit({ observedRunning: containerState.observedRunning, code, signal }), child.pid || null);
+    }
     finish(code == null ? (signal ? 1 : 0) : code);
   });
 }

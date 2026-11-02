@@ -1372,7 +1372,7 @@ export function containerCleanupConfirmed(meta, exitRecord) {
 }
 
 // The runner's launch state (docker_launch in the job dir, see job-runner.mjs writeLaunchState):
-// { state: "pending" | "spawned" | "exited" | "killed", pid, at }. null when the runner never got as
+// { state: "pending" | "spawned" | "exited" | "exited-uncertain" | "killed", pid, at }. null when the runner never got as
 // far as the container section (or the file is unreadable), which is treated as uncertain below.
 function readDockerLaunchState(p) {
   try {
@@ -1445,18 +1445,18 @@ export function findDockerClientsForJob(jobId, { spawnSync: run = spawnSync, pla
 
 // Could a `docker run` of this job still create (or start) a container? Decided BEFORE the final
 // listing (see reconcileContainerCleanup). Returns { pending, reason }. In order:
-//   1. launch state "exited": the client ended on its own; nothing more can be created.
-//   2. the recorded client pid is alive: pending (whether or not the runner finished -- the
+//   1. the recorded client pid is alive: pending (whether or not the runner finished -- the
 //      fallback path writes exit_code with the client possibly still winding down).
-//   3. the runner itself is alive and not finished: it may spawn the client yet.
-//   4. no usable pid (state "pending", or no state at all because the runner died early, or the
-//      recorded pid is dead but the runner never saw it exit): a process scan for a client
-//      carrying this job's label decides; a failed scan is uncertain.
-//   5. state "killed" (or the runner's record says the client was killed) within the confirm hold:
-//      the daemon may still be serving the create request.
+//   2. the runner itself is alive and not finished: it may spawn the client yet.
+//   3. a process scan for any process carrying this job's label (a client whose pid was never
+//      recorded, Docker Desktop's com.docker.cli.exe descendant of a killed docker.exe): found, or
+//      a failed scan, is pending. This runs in EVERY launch state, "exited" included (review round
+//      3, B2): the state file says what the runner saw, not that nothing else is still running.
+//   4. launch state "exited": the launch demonstrably completed; nothing more can be created.
+//   5. state "killed" or "exited-uncertain" (or the runner's record says the client was killed or
+//      its exit was uncertain) within the confirm hold: the daemon may still be serving the create.
 function containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClients } = {}) {
   const launch = readDockerLaunchState(p);
-  if (launch && launch.state === "exited") return { pending: false };
   let pid = launch ? launch.pid : null;
   if (!pid) { try { pid = Number(fs.readFileSync(p.dockerPid, "utf8").trim()) || null; } catch {} }
   if (pid && pidAlive(pid)) return { pending: true, reason: "no container found, but the docker client is still alive and may still create one" };
@@ -1471,13 +1471,16 @@ function containerLaunchPending(p, meta, runnerFinished, exitRecord, { findClien
   const found = (findClients || findDockerClientsForJob)(jobId);
   if (found === null) return { pending: true, reason: "no container found, and the process scan for this job's docker client failed" };
   if (found.length) return { pending: true, reason: `no container found, but a docker client process carrying this job's label is alive (pid ${found.join(", ")})` };
-  const killedAt = launch && launch.state === "killed" ? launch.at
-    : (exitRecord && exitRecord.container && exitRecord.container.cleanup && exitRecord.container.cleanup.clientKilled && exitRecord.endedAt)
-      ? new Date(exitRecord.endedAt).getTime() : NaN;
-  if (Number.isFinite(killedAt)) {
-    const since = Date.now() - killedAt;
+  if (launch && launch.state === "exited") return { pending: false };
+  const cl = exitRecord && exitRecord.container && exitRecord.container.cleanup;
+  const heldAt = launch && (launch.state === "killed" || launch.state === "exited-uncertain") ? launch.at
+    : (cl && (cl.clientKilled || cl.uncertainExit) && exitRecord.endedAt) ? new Date(exitRecord.endedAt).getTime() : NaN;
+  if (Number.isFinite(heldAt)) {
+    const since = Date.now() - heldAt;
     if (since < confirmHoldMs()) {
-      return { pending: true, reason: `the docker client was killed ${Math.round(since / 1000)}s ago; its create request may still be in flight daemon-side (holding ${Math.round(confirmHoldMs() / 1000)}s before an empty listing counts)` };
+      const what = launch && launch.state === "exited-uncertain" || (cl && cl.uncertainExit && !cl.clientKilled)
+        ? "exited before its launch was seen to complete (killed by someone else?)" : "was killed";
+      return { pending: true, reason: `the docker client ${what} ${Math.round(since / 1000)}s ago; its create request may still be in flight daemon-side (holding ${Math.round(confirmHoldMs() / 1000)}s before an empty listing counts)` };
     }
   }
   return { pending: false };

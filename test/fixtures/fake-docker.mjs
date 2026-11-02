@@ -15,6 +15,12 @@
 //                it is in the real engine: the client hands the create request to a detached "daemon"
 //                process which writes the state after N ms whether or not the client is still alive
 //                (a killed client's request is still served). The client waits for the state to appear.
+//                $FAKE_DOCKER_DETACHED_CREATOR_MS=N models Docker Desktop's docker.exe handing the work
+//                to a com.docker.cli.exe descendant: the client spawns a DETACHED creator whose command
+//                line carries the full run argv (so the label-based process scan finds it), which
+//                creates the container after N ms, stays attached until it is removed (or
+//                $FAKE_DOCKER_CREATOR_LINGER_MS, default 30000), then exits. Killing only the client
+//                leaves the creator running, exactly the case review round 3 (B2) describes.
 //   ps -a ... -> prints "<id>\t<state>\t<label>" for the container, if it exists. Fails like a
 //                daemon that is down while $FAKE_DOCKER_DAEMON_DOWN names an existing file.
 //   rm -f <id>-> removes the container (exit 0; a missing one is also exit 0, as with docker 29),
@@ -32,6 +38,14 @@ const argv = process.argv.slice(2);
 if (argv[0] === "__daemon-create") {
   const [, file, json, delay] = argv;
   setTimeout(() => { try { fs.writeFileSync(file, json); } catch {} }, Number(delay) || 0);
+} else if (argv[0] === "__creator") {
+  // __creator <stateFile> <stateJson> <delayMs> <lingerMs> -- <the client's run argv>
+  const [, file, json, delay, linger] = argv;
+  const until = Date.now() + Number(delay) + (Number(linger) || 30000);
+  setTimeout(() => {
+    try { fs.writeFileSync(file, json); } catch {}
+    const t = setInterval(() => { if (!fs.existsSync(file) || Date.now() > until) { clearInterval(t); process.exit(0); } }, 25);
+  }, Number(delay) || 0);
 } else {
 
 const log = process.env.FAKE_DOCKER_LOG;
@@ -66,7 +80,14 @@ if (argv[0] === "run") {
   if (createDelay) await sleep(createDelay);
   const state = JSON.stringify({ id, label, state: "running" });
   const daemonDelay = Number(process.env.FAKE_DOCKER_DAEMON_CREATE_DELAY_MS) || 0;
-  if (daemonDelay) {
+  const creatorDelay = Number(process.env.FAKE_DOCKER_DETACHED_CREATOR_MS) || 0;
+  if (creatorDelay) {
+    const d = spawn(process.execPath, [fileURLToPath(import.meta.url), "__creator", stateFile, state, String(creatorDelay),
+                                       String(process.env.FAKE_DOCKER_CREATOR_LINGER_MS || 30000), "--", ...argv],
+                    { detached: true, stdio: "ignore" });
+    d.unref();
+    while (!readState()) await sleep(25);
+  } else if (daemonDelay) {
     const d = spawn(process.execPath, [fileURLToPath(import.meta.url), "__daemon-create", stateFile, state, String(daemonDelay)],
                     { detached: true, stdio: "ignore" });
     d.unref();

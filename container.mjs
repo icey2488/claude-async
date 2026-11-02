@@ -707,6 +707,21 @@ export function cleanupJobContainers({ dockerBin, jobId, spawnSync = nodeSpawnSy
            ...(errors.length ? { errors } : {}) };
 }
 
+// How conclusive a docker client's exit is (review round 3, B2), for the runner's docker_launch state:
+//   "exited"           the launch is over: the runner saw the job's container listed while the client
+//                      ran (creation had completed), or, on POSIX, the client ended with an exit status
+//                      of its own (an external kill shows up as a signal there);
+//   "exited-uncertain" anything else, notably on win32, where TerminateProcess/taskkill on docker.exe
+//                      arrives as an ordinary exit code and its com.docker.cli.exe descendant (or the
+//                      daemon) may still create the container. Never conclusive: job-core keeps the
+//                      cleanup unconfirmed until the process scan finds nothing and the confirm hold
+//                      has passed.
+export function classifyClientExit({ observedRunning, code, signal, platform = process.platform }) {
+  if (observedRunning) return "exited";
+  if (platform !== "win32" && !signal && code !== null && code !== undefined) return "exited";
+  return "exited-uncertain";
+}
+
 // ----------------------------------------------------------------------- stdout: PR URL ---
 
 // The PR URL the job reported, if it names the job's own repo (or a fork's PR against it shows the
