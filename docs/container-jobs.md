@@ -455,40 +455,72 @@ docker network create -o com.docker.network.bridge.enable_icc=false claude-jobs-
 # then: CLAUDE_ASYNC_CONTAINER_NETWORK=claude-jobs-p1
 ```
 
-This is recommended but was not tested on Docker Desktop here.
+This is recommended for phase 1 (there is no proxy to reach yet, so ICC off costs nothing) but was
+not tested on Docker Desktop here. It does NOT carry over to phase 2: see below.
 
-### Phase 2 (designed, not implemented): egress allowlist
+### Phase 2 (designed, not implemented, not tested): egress allowlist
 
 The job runs on an **internal** Docker network with no route out. A small proxy container is the
-only thing attached to both that network and a normal one, and it allows a fixed list of hosts.
+only thing attached to both a job network and a normal one, and it allows a fixed list of hosts.
+
+**Topology: one internal network per job, with the proxy connected to each.** Round-2 review
+(finding A5) caught that the earlier recipe, one shared internal bridge with `enable_icc=false`
+holding both the jobs and the proxy, blocks the job-to-proxy connection as well: that connection is
+itself inter-container traffic on that bridge, and Docker's ICC switch has no per-pair exception.
+Jobs would have had no route to GitHub or Anthropic at all. The recommended layout is:
 
 ```
-            claude-jobs  (internal, 172.30.0.0/24, ICC off)
-  +--------------------+          +--------------------------+       bridge
-  |  job container     | -------> | egress-proxy (squid)     | ----> internet (allowlisted hosts)
-  |  HTTPS_PROXY=      |  :3128   | on claude-jobs + bridge  | ----> host.docker.internal:11434
-  |  http://egress-    |          +--------------------------+       (GET/POST to 4 Ollama paths)
-  |  proxy:3128        |
-  +--------------------+   no other route out, no host gateway
+   claude-job-<idA> (internal)      claude-job-<idB> (internal)
+  +------------------+             +------------------+
+  | job A            |             | job B            |
+  +--------+---------+             +---------+--------+
+           | :3128                           | :3128
+           v                                 v
+  +--------------------------------------------------+      bridge
+  | egress-proxy (squid), connected to every job net |----> internet (allowlisted hosts)
+  +--------------------------------------------------+----> host.docker.internal:11434 (4 Ollama paths)
+     no other member on a job network; no host gateway on job networks
 ```
 
-One-time setup on claunker (an explicit subnet, so the squid ACL can name it exactly):
+- **Why per-job networks and not a shared ICC-on network:** on one shared network with ICC on, the
+  proxy is reachable, but so is every other job (job A can hit a dev server job B started). On one
+  shared network with ICC off nothing can reach anything, the proxy included. A network per job
+  with exactly two members (the job and the proxy) gives job-to-proxy and nothing else, with
+  Docker's own network isolation doing the job-to-job separation instead of ICC. The cost is one
+  `docker network create`/`connect` per job and a `rm` afterwards, which the runner can do around
+  `docker run` (not implemented).
+- **Alternative, same property:** the proxy on its own network and each job attached to it with
+  `docker network connect`; that puts all jobs on one network with the proxy, so job-to-job
+  isolation again depends on ICC off, which also cuts the proxy. Not recommended.
+- The proxy's *own* egress network stays the default bridge (or a dedicated normal network), which
+  is where `host.docker.internal` is added. Job networks get no `--add-host`.
+
+One-time setup on claunker (the proxy; job networks are per job):
 
 ```powershell
-docker network create --internal --subnet 172.30.0.0/24 `
-  -o com.docker.network.bridge.enable_icc=false claude-jobs
 docker run -d --name egress-proxy --restart unless-stopped `
   --network bridge --add-host host.docker.internal:host-gateway `
   -v D:\claude-async-proxy\squid.conf:/etc/squid/squid.conf:ro ubuntu/squid:<pinned>
-docker network connect --ip 172.30.0.2 claude-jobs egress-proxy
+```
+
+Per job (what the runner would do around `docker run`; today this is a manual recipe):
+
+```powershell
+docker network create --internal claude-job-<jobId>
+docker network connect claude-job-<jobId> egress-proxy
+docker run ... --network claude-job-<jobId> -e HTTPS_PROXY=http://egress-proxy:3128 ...   # no --add-host
+docker network disconnect claude-job-<jobId> egress-proxy ; docker network rm claude-job-<jobId>   # after the job
 ```
 
 `squid.conf` (CONNECT-only for TLS, so squid sees hostnames, never content; Ollama is plain HTTP, so
-it is never a CONNECT target and is limited to the four read/generate paths):
+it is never a CONNECT target and is limited to the four read/generate paths). With per-job networks
+the client subnets vary, so the `jobs` ACL names the proxy's non-bridge interfaces by address range
+or, simpler, every RFC1918 source except the proxy's own bridge subnet; the example below uses the
+Docker default pool for user networks (`172.17.0.0/16` is the default bridge, excluded):
 
 ```
 http_port 3128
-acl jobs src 172.30.0.0/24
+acl jobs src 172.18.0.0/15 172.20.0.0/14 172.24.0.0/13 192.168.0.0/16
 acl ssl_ports port 443
 acl CONNECT method CONNECT
 acl allowed_tls dstdomain github.com api.github.com codeload.github.com uploads.github.com
@@ -505,13 +537,26 @@ http_access deny all
 access_log stdio:/proc/self/fd/1
 ```
 
-Then on the bridge: `CLAUDE_ASYNC_CONTAINER_NETWORK=claude-jobs` and
-`CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY=http://172.30.0.2:3128` (or `http://egress-proxy:3128`).
+Check `docker network inspect` for the pool your Docker Desktop actually assigns and narrow the
+`jobs` ACL to it. On the bridge: `CLAUDE_ASYNC_CONTAINER_NETWORK=<per-job network>` (the runner
+would set it per job once implemented) and `CLAUDE_ASYNC_CONTAINER_EGRESS_PROXY=http://egress-proxy:3128`.
 With the proxy set, `container.mjs` adds `HTTPS_PROXY`/`HTTP_PROXY` (both cases) and `NO_PROXY`, and
 **omits** `--add-host host.docker.internal:host-gateway`, so the only way to the host is through the
 proxy's Ollama rule. The CLI's proxy support is unverified (its network-config page could not be
 fetched); the smoke test should confirm one real call through the proxy. With the two traffic
 variables set, Claude Code should need only `api.anthropic.com`; verify with squid's access log.
+
+**Phase-2 acceptance test (to add to the smoke test before phase 2 is called done; not written):**
+create two job networks, connect the proxy to both, start two hardened job containers (one per
+network) each with a listener on some port, then assert: (1) each reaches the proxy and completes
+one real `CONNECT api.github.com:443` through it (`curl --proxy http://egress-proxy:3128
+https://api.github.com/`); (2) neither reaches the other's listener by address or by name
+(`probe.sh` from each against the other's IP: CLOSED/unresolvable); (3) direct egress is blocked:
+`curl https://api.github.com/` without the proxy fails, `host.docker.internal` does not resolve from
+a job, and the Docker bridge gateway is unreachable; (4) a non-allowlisted host through the proxy
+gets squid's 403; (5) `GET http://host.docker.internal:11434/api/tags` through the proxy works and
+`POST /api/pull` is denied. None of this has been run anywhere yet. The existing automated test
+checks only the argv (proxy env present, `--add-host` absent).
 
 Trade-offs: the proxy sees hostnames, not content, so `github.com` allows pushing to any repo the
 token can reach, and a job can still exfiltrate through an allowed host (a gist, a PR comment).
