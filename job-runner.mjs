@@ -27,6 +27,9 @@
  * still alive. Lets job-core.mjs's checkJob() (and a human reading the job dir after the fact)
  * see whether a runner was ever re-absorbed into a job mid-flight, not just at launch.
  *
+ * runner.lock: created with O_EXCL as the very first act, holding this pid; a second runner for the
+ * same job dir exits 3 (a stale lock from a dead runner is taken over). One runner per job dir.
+ *
  * runner.pid: writes its own process.pid to the job dir before doing anything else. On win32,
  * job-core.mjs's launch() may spawn us indirectly through a PowerShell/CreateProcessW shell-out
  * (to escape the caller's Job Object -- see the win32 note in job-core.mjs), in which case the
@@ -81,7 +84,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { closeCard } from "./card-hook.mjs";
-import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive } from "./job-core.mjs";
+import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive, isOurProcess } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
@@ -94,6 +97,32 @@ if (!specPath) process.exit(2);
 const pidWriteDelayMs = Number(process.env.CLAUDE_ASYNC_TEST_DELAY_PIDFILE_MS) || 0;
 if (pidWriteDelayMs > 0) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pidWriteDelayMs);
+}
+
+// Runner exclusivity (review round 2): exactly one runner per job dir. runner.lock is created with
+// O_EXCL and holds our pid; a second runner for the same spec (a retried launch, a scheduler
+// re-fire, an operator running the spec by hand) finds it and exits 3 before touching docker, the
+// logs or exit.json. A lock whose pid is dead (a runner that was TerminateProcess'ed) is stale and
+// is taken over, since the job dir's next occupant is the retry. win32 pid reuse: a live pid that
+// is not a node/claude process is treated as stale too (same rule as job-core's isOurProcess).
+{
+  const lockPath = path.join(path.dirname(specPath), "runner.lock");
+  const takeLock = () => { const fd = fs.openSync(lockPath, "wx"); fs.writeSync(fd, String(process.pid)); fs.closeSync(fd); };
+  try { takeLock(); }
+  catch (e) {
+    if (e.code !== "EEXIST") throw e;
+    let holder = null;
+    try { holder = Number(fs.readFileSync(lockPath, "utf8").trim()) || null; } catch {}
+    const live = holder !== null && holder !== process.pid && pidAlive(holder) && isOurProcess(holder);
+    const note = (msg) => { try { fs.appendFileSync(path.join(path.dirname(specPath), "err.log"), `\n[job-runner] ${msg}\n`); } catch {} };
+    if (live) {
+      note(`another runner (pid ${holder}) owns this job dir (runner.lock); this runner (pid ${process.pid}) exits without starting anything`);
+      process.exit(3);
+    }
+    note(`stale runner.lock (pid ${holder === null ? "unreadable" : holder}, not alive); taken over by pid ${process.pid}`);
+    try { fs.unlinkSync(lockPath); takeLock(); }
+    catch (e2) { if (e2.code === "EEXIST") { note("lost the race for runner.lock; exiting"); process.exit(3); } throw e2; }
+  }
 }
 
 // Written before anything else that could fail. On win32 the runner may be launched via the

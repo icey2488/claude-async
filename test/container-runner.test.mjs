@@ -442,3 +442,29 @@ test("A3: the runner's 64 KiB tail window never emits a token suffix when the bo
     for (let i = 0; i + 8 <= SECRET_GH.length; i++) assert.ok(!rec.includes(SECRET_GH.slice(i, i + 8)), `k=${k}: exit.json carries ${SECRET_GH.slice(i, i + 8)}`);
   }
 });
+
+// ------------------------------------------------- review round 2, question: runner exclusivity ---
+// Two runners for one job dir would share the label, the pid file and the log files. The runner
+// takes runner.lock with O_EXCL as its first act; a second runner for the same spec exits 3 without
+// spawning anything. A lock left by a dead runner (stale pid) is taken over.
+test("runner lock: a second runner for the same job dir exits without running docker; a stale lock is taken over", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "4000" });
+  const a = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  assert.ok(await waitFor(() => j.containerExists()));
+  const lock = path.join(j.dir, "runner.lock");
+  assert.ok(fs.existsSync(lock), "runner.lock exists while the runner runs");
+  assert.equal(Number(fs.readFileSync(lock, "utf8")), a.pid);
+  const b = runSync(j);
+  assert.equal(b.status, 3, `the duplicate exits 3: ${b.stderr}`);
+  assert.equal(j.calls().filter((x) => x[0] === "run").length, 1, "exactly one docker run");
+  assert.match(fs.readFileSync(path.join(j.dir, "err.log"), "utf8"), /another runner \(pid \d+\) owns this job dir/);
+  assert.equal(await exited(a), 0);
+  assert.equal(j.exitRecord().exitCode, 0, "the first runner's run was undisturbed");
+  // stale lock from a dead runner: taken over
+  const k = setup({});
+  fs.writeFileSync(path.join(k.dir, "runner.lock"), "999999");
+  const r = runSync(k);
+  assert.equal(r.status, 0);
+  assert.equal(k.exitRecord().exitCode, 0);
+  assert.match(fs.readFileSync(path.join(k.dir, "err.log"), "utf8"), /stale runner\.lock/);
+});

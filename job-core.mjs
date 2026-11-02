@@ -450,7 +450,7 @@ function getProcessImageName(pid) {
 
 // True when the process is ours (node runner or claude CLI). If the image name can't be
 // determined (permissions, OS quirk) we give benefit of the doubt — conservative/safe.
-function isOurProcess(pid) {
+export function isOurProcess(pid) {
   const name = getProcessImageName(pid);
   if (!name) return true;
   return name.includes("node") || name.includes("claude");
