@@ -7,14 +7,16 @@
 // retry-until-confirmed behaviour is exercised across both processes.
 // Host-job behavior of the runner is covered by test/multihost/exit-reason.test.mjs.
 // Run: node --test test/container-runner.test.mjs
-import { test, after } from "node:test";
+import { test, after, before } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { startFakeGitHub } from "./fixtures/fake-github-app.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(here, "..", "job-runner.mjs");
@@ -23,7 +25,14 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "claude-async-container-runner
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
 const core = await import("../job-core.mjs");
-after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
+// The GitHub App the runner mints installation tokens for: a throwaway key, a fake api.github.com.
+const APP_KEYS = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const APP_KEY_FILE = path.join(TMP, "app.pem");
+fs.writeFileSync(APP_KEY_FILE, APP_KEYS.privateKey.export({ type: "pkcs1", format: "pem" }), { mode: 0o600 });
+fs.chmodSync(APP_KEY_FILE, 0o600);
+let gh;
+before(async () => { gh = await startFakeGitHub(path.join(TMP, "fake-github"), { publicKey: APP_KEYS.publicKey }); });
+after(async () => { if (gh) await gh.close(); try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {} });
 
 // The fake docker is a node script; on win32 a .mjs can't be spawned directly, so the "docker
 // binary" in spec.json is a small POSIX shim that execs node with the script.
@@ -39,7 +48,7 @@ let seq = 0;
 const REPO = "icey2488/container-job-scratch";
 const SECRET_GH = "ghp_RUNNERSECRET000000000000000000000000";
 const SECRET_OAUTH = "sk-ant-oat01-RUNNERSECRET";
-function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
+function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000, refreshMs = 20 * 60_000, githubApp: appPatch = {} } = {}) {
   const jobId = `cjob-${process.pid}-${++seq}`;
   const dir = path.join(core.JOB_ROOT, jobId);
   fs.mkdirSync(dir, { recursive: true });
@@ -50,12 +59,15 @@ function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
                  argv: ["run", "--rm", "--pull=never", "--name", name, "--label", `claude-async.job=${jobId}`, "img",
                         "/usr/local/bin/claude-async-job-entry", REPO, "", "--", "claude", "-p", "--", "x"],
                  cwd: dir, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
-                 container: { name, jobId, dockerBin: docker, repo: REPO, maxRuntimeMs, envFile: path.join(dir, "secrets.env") } };
-  fs.writeFileSync(spec.container.envFile, `GH_TOKEN=${SECRET_GH}\nCLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
+                 container: { name, jobId, dockerBin: docker, repo: REPO, maxRuntimeMs, envFile: path.join(dir, "secrets.env"),
+                              credsDir: path.join(dir, "creds"),
+                              githubApp: { appId: "123456", keyFile: APP_KEY_FILE, installationId: 777, repoName: "container-job-scratch",
+                                           refreshMs, apiBase: gh.url, ...appPatch } } };
+  fs.writeFileSync(spec.container.envFile, `CLAUDE_CODE_OAUTH_TOKEN=${SECRET_OAUTH}\n`);
   fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId, pid: 1, startedAt: new Date().toISOString(),
     sandbox: "container", container: { name, jobId, dockerBin: docker, repo: REPO }, ...meta }));
-  const env = { ...process.env, FAKE_DOCKER_LOG: log, CLAUDE_ASYNC_TEST: "1", HOME: path.join(TMP, "home"),
+  const env = { ...process.env, FAKE_DOCKER_LOG: log, FAKE_DOCKER_CAT_FILE: path.join(dir, "creds", "token"), CLAUDE_ASYNC_TEST: "1", HOME: path.join(TMP, "home"),
                 USERPROFILE: path.join(TMP, "home"), CLAUDE_ASYNC_CONFIG_DIR: path.join(TMP, "home", ".claude-async"),
                 CLAUNKER_JOBCARD_CMD: JSON.stringify(["__no_such_jobcard_binary__"]), CLAUDE_ASYNC_CONTAINER_POLL_MS: "100",
                 ...extraEnv };
@@ -64,7 +76,9 @@ function setup(extraEnv = {}, { meta = {}, maxRuntimeMs = 4 * 3600_000 } = {}) {
   const containerExists = () => fs.existsSync(`${log}.state.json`);
   const patchMeta = (patch) => { const m = JSON.parse(fs.readFileSync(path.join(dir, "meta.json"), "utf8"));
                                  fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ ...m, ...patch })); };
-  return { jobId, dir, name, env, log, calls, exitRecord, containerExists, patchMeta, spec: path.join(dir, "spec.json") };
+  const tokenFile = path.join(dir, "creds", "token");
+  const readToken = () => { try { return fs.readFileSync(tokenFile, "utf8").trim(); } catch { return null; } };
+  return { jobId, dir, name, env, log, calls, exitRecord, containerExists, patchMeta, spec: path.join(dir, "spec.json"), tokenFile, readToken };
 }
 const pidGone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
 // checkJob()/cancelJob() run in this process; point the fake at the job's daemon state while fn runs.
@@ -108,6 +122,135 @@ test("container job: output captured, exit.json written, cleanup by label confir
     "finish() lists this job's containers by label");
   assert.ok(!calls.some((a) => a[0] === "kill"), "never by name");
   assert.equal(core.checkJob(j.jobId, 0).containerCleanup, "confirmed");
+  // the installation token was on disk before `docker run` (the fake container read it at start)
+  const out = fs.readFileSync(path.join(j.dir, "out.log"), "utf8");
+  const tok = /^CAT:(ghs_\w+)$/m.exec(out);
+  assert.ok(tok, `the container saw the token file: ${out}`);
+  assert.ok(gh.tokens().includes(tok[1]), "it is a token the fake GitHub issued");
+  assert.ok(!JSON.stringify(rec).includes(tok[1]), "exit.json never carries it");
+  assert.match(rec.stdoutTail.join("\n"), /CAT:\[REDACTED\]/);
+  assert.ok(!fs.existsSync(j.tokenFile) && !fs.existsSync(path.dirname(j.tokenFile)), "the creds dir is deleted on finish");
+});
+
+// ------------------------------------------------------------ GitHub App token delivery ---
+// The runner mints the App's installation token before `docker run`, keeps it in <jobdir>/creds/token
+// (0700 dir, 0600 file; the argv mounts the dir read-only at /run/claude-async/creds), rewrites it IN
+// PLACE every refreshMs while the container runs, redacts every generation, and deletes it on finish.
+
+test("token delivery: file created before docker run with owner-only modes, refreshed in place (same inode), all generations redacted, deleted on finish", { skip: SKIP }, async () => {
+  const before = gh.tokens().length;
+  const j = setup({ FAKE_DOCKER_RUN_MS: "2000" }, { refreshMs: 300 });
+  const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  assert.ok(await waitFor(() => j.readToken() !== null), "token file exists");
+  const st0 = fs.statSync(j.tokenFile);
+  assert.equal(st0.mode & 0o777, 0o600, "token file is 0600");
+  assert.equal(fs.statSync(path.dirname(j.tokenFile)).mode & 0o777, 0o700, "creds dir is 0700");
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    assert.equal(st0.uid, 1000, "as root, the file is handed to the container's uid so a 0600 file is readable there");
+    assert.equal(fs.statSync(path.dirname(j.tokenFile)).uid, 1000);
+  }
+  const t0 = j.readToken();
+  assert.ok(await waitFor(() => j.calls().some((a) => a[0] === "run")), "docker run started");
+  const runAt = JSON.parse(fs.readFileSync(j.log, "utf8").split("\n")[0]);
+  assert.ok(runAt.argv.includes("run"));
+  assert.ok(await waitFor(() => j.readToken() !== t0, 5000), "the token was rewritten");
+  const t1 = j.readToken();
+  assert.equal(fs.statSync(j.tokenFile).ino, st0.ino, "rewritten in place: same inode (no rename)");
+  assert.equal(fs.statSync(j.tokenFile).mode & 0o777, 0o600);
+  assert.equal(await exited(child), 0);
+  const issued = gh.tokens().slice(before);
+  assert.ok(issued.length >= 3, `several generations were minted (${issued.length})`);
+  assert.equal(issued[0], t0); assert.ok(issued.includes(t1));
+  assert.ok(!fs.existsSync(j.tokenFile) && !fs.existsSync(path.dirname(j.tokenFile)), "deleted on finish");
+  const out = fs.readFileSync(path.join(j.dir, "out.log"), "utf8");
+  assert.match(out, new RegExp(`^CAT:${t0}$`, "m"), "the container read the first generation at start");
+  const end = /^CAT_END:(ghs_\w+)$/m.exec(out);
+  assert.ok(end && end[1] !== t0 && issued.includes(end[1]), "the container read a newer generation at the end (in-place rewrite propagates)");
+  const rec = JSON.stringify(j.exitRecord());
+  for (const t of issued) {
+    assert.ok(!rec.includes(t), `exit.json leaks generation ${t.slice(0, 8)}`);
+    assert.ok(!rec.includes(Buffer.from(`x-access-token:${t}`).toString("base64").slice(0, 30)), "nor its Basic-header form");
+  }
+  assert.match(rec, /CAT:\[REDACTED\]/);
+  assert.match(rec, /CAT_END:\[REDACTED\]/);
+  assert.ok(!rec.includes(APP_KEY_FILE) && !fs.readFileSync(path.join(j.dir, "err.log"), "utf8").includes("PRIVATE"), "the key never leaves the host side");
+  assert.equal(j.exitRecord().warnings, undefined, "no token warning on a healthy run");
+  // every mint carried a JWT the fake could verify, for this installation and repo
+  const mints = gh.calls().filter((c) => c.method === "POST");
+  assert.ok(mints.length >= issued.length);
+  assert.deepEqual(mints.at(-1).body, { repositories: ["container-job-scratch"], permissions: { contents: "write", pull_requests: "write", metadata: "read" } });
+  assert.ok(gh.calls().every((c) => c.jwtOk), "every call carried a JWT the fake verified against the key");
+});
+
+test("token refresh failure: the old token is kept and retried; near expiry a warning lands in exit.json", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "1500" }, { refreshMs: 200 });
+  gh.setExpiresMs(2 * 60_000);                     // the token GitHub hands out "expires" in 2 min (< 5 min)
+  let t0;
+  try {
+    const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+    assert.ok(await waitFor(() => j.readToken() !== null));
+    t0 = j.readToken();
+    gh.setFailMint(true);                          // every refresh from now on fails
+    await new Promise((r) => setTimeout(r, 700));
+    assert.equal(j.readToken(), t0, "the old token stays in the file while refresh fails");
+    assert.equal(await exited(child), 0);
+  } finally { gh.setFailMint(false); gh.setExpiresMs(null); }
+  const rec = j.exitRecord();
+  assert.equal(rec.exitCode, 0);
+  assert.ok(rec.warnings && rec.warnings.some((w) => /installation token.*could not be refreshed.*within 5 minutes of (its )?expiry|expired/i.test(w)), JSON.stringify(rec.warnings));
+  const errLog = fs.readFileSync(path.join(j.dir, "err.log"), "utf8");
+  assert.match(errLog, /WARN: .*token refresh failed .*500/);
+  assert.ok((errLog.match(/token refresh failed/g) || []).length <= 3, "a repeating failure is logged once per distinct error, not per tick");
+  assert.ok(!errLog.includes(t0), "err.log never carries the token");
+  assert.ok(!fs.existsSync(j.tokenFile));
+});
+
+test("token refresh failure far from expiry: logged, old token kept, no exit.json warning", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "1200" }, { refreshMs: 200 });
+  try {
+    const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+    assert.ok(await waitFor(() => j.readToken() !== null));
+    gh.setFailMint(true);
+    assert.equal(await exited(child), 0);
+  } finally { gh.setFailMint(false); }
+  const rec = j.exitRecord();
+  assert.equal(rec.warnings, undefined, JSON.stringify(rec.warnings));
+  assert.match(fs.readFileSync(path.join(j.dir, "err.log"), "utf8"), /token refresh failed/);
+});
+
+test("first mint fails: the container is never started, exit 78 with a warning naming the cause; nothing left on disk", { skip: SKIP }, () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "5000" });
+  gh.setFailMint(true);
+  let r;
+  try { r = runSync(j); } finally { gh.setFailMint(false); }
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(!j.calls().some((a) => a[0] === "run"), "docker run never invoked");
+  const rec = j.exitRecord();
+  assert.equal(rec.exitCode, 78);
+  assert.ok(rec.warnings.some((w) => /could not mint the GitHub App installation token.*500.*container was not started/i.test(w)), JSON.stringify(rec.warnings));
+  assert.equal(fs.readFileSync(path.join(j.dir, "exit_code"), "utf8"), "78");
+  assert.ok(!fs.existsSync(path.dirname(j.tokenFile)));
+  assert.equal(core.checkJob(j.jobId, 0).status, "failed");
+  // a spec without the App section (an old job-core, a hand-written spec) is refused the same way
+  const k = setup({ FAKE_DOCKER_RUN_MS: "5000" }, { githubApp: { appId: null } });
+  runSync(k);
+  assert.ok(!k.calls().some((a) => a[0] === "run"));
+  assert.equal(k.exitRecord().exitCode, 78);
+  assert.ok(k.exitRecord().warnings.some((w) => /githubApp/.test(w)));
+});
+
+test("cancel during the first mint: no container, cancelled exit, creds dir removed", { skip: SKIP }, async () => {
+  const j = setup({ FAKE_DOCKER_RUN_MS: "5000" });
+  // slow the mint down by making the fake hold the JWT verification... simplest: write the cancel
+  // intent before launch and after the runner started minting is racy, so cancel is written right
+  // after spawn; whichever side wins, no container may be left and the exit reads cancelled.
+  const child = spawn(process.execPath, [RUNNER, j.spec], { env: j.env, stdio: "ignore" });
+  fs.writeFileSync(path.join(j.dir, "cancel_requested"), new Date().toISOString());
+  assert.equal(await exited(child), 0);
+  const rec = j.exitRecord();
+  assert.equal(rec.exitReason, "cancelled");
+  assert.ok(!j.containerExists());
+  assert.ok(!fs.existsSync(path.dirname(j.tokenFile)));
 });
 
 test("container job: a nonzero container exit is recorded as-is; docker run failure (125) gets a warning", { skip: SKIP }, () => {
@@ -430,7 +573,7 @@ test("A4: a wall-clock stop that needed the fallback kill still records containe
 test("A3: the runner's 64 KiB tail window never emits a token suffix when the boundary cuts a token", { skip: SKIP }, () => {
   const WINDOW = 64 * 1024, FAKE_OUT = "container stdout\n".length;
   for (const k of [1, 20, 39]) {
-    const j = setup({});
+    const j = setup({ FAKE_DOCKER_CAT_FILE: "" });   // no CAT line: the window arithmetic below assumes the fixed fake output
     const A = 100;
     // final size S = A + 1 + 41 + B + 1 + FAKE_OUT; the window starts at S - WINDOW = A + k, inside the token
     const B = WINDOW - (1 + 41 + 1 + FAKE_OUT) + k;

@@ -63,9 +63,23 @@
  *       checkJob()/cancelJob() keep retrying an unconfirmed cleanup.
  *   (6) exit.json's container record also carries the repo, the PR URL the job reported on stdout
  *       for that repo (prUrl), and a warning when the entrypoint could not clone it (exit 70).
- *   (7) Redaction: the env file's two values are read into memory once (never written anywhere),
- *       and exit.json's stdout/stderr tails and the Discord ping's headline are redacted with them
- *       plus GitHub/Anthropic token shapes. out.log/err.log on disk stay raw.
+ *   (7) Redaction: the env file's value is read into memory once (never written anywhere), every
+ *       installation token this runner mints is added as it is minted, and exit.json's stdout/stderr
+ *       tails and the Discord ping's headline are redacted with all of them (plus their base64 forms
+ *       and the GitHub/Anthropic token shapes). out.log/err.log on disk stay raw.
+ *   (8) GitHub App token delivery (spec.container.githubApp, github-app.mjs): before `docker run` the
+ *       runner mints a one-hour installation token scoped to the job's repo and writes it to
+ *       <jobdir>/creds/token (dir 0700, file 0600, handed to the container's uid when the runner is
+ *       root), which the argv bind-mounts read-only at /run/claude-async/creds for the image's git
+ *       credential helper and gh wrapper. Every spec.container.githubApp.refreshMs (default 45 min;
+ *       tokens live 60) it re-mints and rewrites the file IN PLACE (write at offset 0, truncate to
+ *       the new length, fsync: the same inode the container has, never a rename, so the content
+ *       change is what propagates through the bind mount), keeps the old token when a refresh
+ *       fails (retrying on the next tick, logging once per distinct error), records a warning in
+ *       exit.json when refresh keeps failing within 5 minutes of the token's expiry, and deletes the
+ *       file and dir in finish(). A first mint that fails means the container is never started
+ *       (exit 78, warning). The App's private key is read from its host path by github-app.mjs on
+ *       every mint and is never written, logged or passed anywhere.
  *
  * Atomic write choice: write to runner_heartbeat.tmp then fs.renameSync -> runner_heartbeat.
  * On Windows NTFS, renameSync uses MoveFileExW(MOVEFILE_REPLACE_EXISTING) which is atomic
@@ -88,8 +102,9 @@ import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive, isOurProcess } fr
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
-import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
-         redactSecrets } from "./container.mjs";
+import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
+         redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER } from "./container.mjs";
+import { createMinter } from "./github-app.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -140,7 +155,8 @@ try { spec = JSON.parse(fs.readFileSync(specPath, "utf8")); }
 catch { process.exit(2); }
 
 const { command, argv, cwd, out, err, exit } = spec;
-// Container jobs only (see the header): { name, jobId, dockerBin, repo, maxRuntimeMs }. null for host jobs.
+// Container jobs only (see the header): { name, jobId, dockerBin, repo, maxRuntimeMs, envFile, credsDir,
+// githubApp: { appId, keyFile, installationId, repoName, refreshMs, apiBase } }. null for host jobs.
 const containerSpec = spec.container && typeof spec.container === "object" ? spec.container : null;
 
 const heartbeatPath = path.join(path.dirname(specPath), "runner_heartbeat");
@@ -155,6 +171,12 @@ const dockerPidPath = path.join(path.dirname(specPath), "docker_client.pid");
 // leaves the earlier state behind, which job-core treats as "uncertain", never as "done".
 const dockerLaunchPath = path.join(path.dirname(specPath), "docker_launch");
 const containerState = { cancelled: false, runtimeExceeded: false, fallbackFired: false, lastCleanupError: null };
+// Container jobs: the GitHub App installation token on disk (see header item 8).
+const credsDir = containerSpec ? (containerSpec.credsDir || path.join(path.dirname(specPath), CREDS_DIR_NAME)) : null;
+const tokenPath = credsDir ? path.join(credsDir, CREDS_TOKEN_NAME) : null;
+const tokenState = { generations: 0, expiresAt: 0, lastError: null, lastLoggedError: null, startFailed: null, inFlight: false };
+const TOKEN_EXPIRY_WARN_MS = 5 * 60 * 1000;
+let tokenRefresh = null;
 function writeLaunchState(state, pid = null) {
   const tmp = dockerLaunchPath + ".tmp";
   try {
@@ -169,7 +191,9 @@ function killClient(child) {
   try { child.kill("SIGKILL"); } catch {}
 }
 // Container jobs: the secret values to redact from anything that leaves this runner. In memory only.
-const redactValues = containerSpec ? readEnvFileSecretValues(containerSpec.envFile) : [];
+// The env file's value(s) now; every installation token generation is appended as it is minted.
+const redactValues = containerSpec ? [...readEnvFileSecretValues(containerSpec.envFile)] : [];
+const addRedactValue = (v) => { for (const e of secretEncodings([v])) if (!redactValues.includes(e)) redactValues.push(e); };
 const redact = (text) => (containerSpec ? redactSecrets(text, redactValues) : text);
 
 // 2026-09-09 runner-termination investigation: self-reported Job Object membership, refreshed on
@@ -319,6 +343,97 @@ function removeJobContainers(why) {
   return r;
 }
 
+// ------------------------------------------------------------- GitHub App token file (8) ---
+
+const containerUid = Number(String(CONTAINER_USER).split(":")[0]);
+// As root (a Linux host), hand the dir and file to the container's uid: a 0600 file owned by root
+// is unreadable to uid 1000 inside. As any other user the runner's own uid stays (it must then be
+// the container's uid, or the engine's file sharing must not enforce host modes, as Docker Desktop's
+// does not). Best-effort: EPERM is expected when not root.
+function chownToContainer(p) {
+  if (process.platform === "win32" || typeof process.getuid !== "function" || process.getuid() !== 0) return;
+  try { fs.chownSync(p, containerUid, containerUid); } catch {}
+}
+function ensureCredsDir() {
+  fs.mkdirSync(credsDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(credsDir, 0o700); } catch {}
+  chownToContainer(credsDir);
+}
+// In place, never a rename: the container holds the DIRECTORY as a bind mount, and what must reach
+// it is new content in the same file. Write the new token at offset 0, then truncate to its length
+// (tokens of one app are the same length, so a reader never sees an empty file), then fsync. A
+// rename would also work for a directory mount on Linux, but a bind mount through Docker Desktop's
+// file sharing is what claunker runs, and in-place content changes are the propagation the smoke
+// test measures; one mechanism, measured, rather than two.
+function writeTokenFile(token) {
+  const data = `${token}\n`;
+  const existed = fs.existsSync(tokenPath);
+  const fd = fs.openSync(tokenPath, fs.constants.O_WRONLY | fs.constants.O_CREAT, 0o600);
+  try {
+    fs.writeSync(fd, data, 0, "utf8");
+    fs.ftruncateSync(fd, Buffer.byteLength(data));
+    fs.fsyncSync(fd);
+  } finally { fs.closeSync(fd); }
+  if (!existed) { try { fs.chmodSync(tokenPath, 0o600); } catch {} chownToContainer(tokenPath); }
+}
+function removeCredsDir() {
+  if (!credsDir) return;
+  try { fs.rmSync(credsDir, { recursive: true, force: true }); } catch (e) {
+    try { fs.writeSync(errFd, `\n[job-runner] WARN: could not delete ${credsDir}: ${e.message}\n`); } catch {}
+  }
+}
+let minter = null;
+// Mints a fresh installation token and rewrites the file. Returns true on success. On failure the
+// previous token stays in place (it is still valid until its expiry) and the next tick retries.
+async function refreshToken(why) {
+  if (tokenState.inFlight) return false;
+  tokenState.inFlight = true;
+  try {
+    const { token, expiresAt } = await minter.mint();
+    addRedactValue(token);
+    writeTokenFile(token);
+    tokenState.generations++;
+    tokenState.expiresAt = expiresAt;
+    if (tokenState.lastError) { try { fs.writeSync(errFd, `\n[job-runner] GitHub App installation token refreshed after earlier failures (generation ${tokenState.generations})\n`); } catch {} }
+    tokenState.lastError = null; tokenState.lastLoggedError = null;
+    return true;
+  } catch (e) {
+    const msg = redact(String(e && e.message || e));
+    tokenState.lastError = msg;
+    const leftMs = tokenState.expiresAt ? tokenState.expiresAt - Date.now() : 0;
+    if (msg !== tokenState.lastLoggedError) {
+      tokenState.lastLoggedError = msg;
+      try {
+        fs.writeSync(errFd, `\n[job-runner] WARN: GitHub App installation token refresh failed (${why}): ${msg}; ` +
+          (tokenState.generations ? `keeping the current token (expires in ${Math.max(0, Math.round(leftMs / 60000))} min), retrying every ${refreshMs()} ms` : "no token yet") + "\n");
+      } catch {}
+    }
+    if (tokenState.generations && leftMs < TOKEN_EXPIRY_WARN_MS && !tokenState.nearExpiryLogged) {
+      tokenState.nearExpiryLogged = true;
+      try { fs.writeSync(errFd, `\n[job-runner] WARN: the installation token is within ${TOKEN_EXPIRY_WARN_MS / 60000} minutes of expiry (or expired) and refresh keeps failing; git/gh calls in the container will start failing\n`); } catch {}
+    }
+    return false;
+  } finally { tokenState.inFlight = false; }
+}
+const refreshMs = () => Math.max(50, Number(containerSpec && containerSpec.githubApp && containerSpec.githubApp.refreshMs) || 45 * 60_000);
+// Before `docker run`: the creds dir, the minter, the first token, the refresh timer. Returns true
+// when the container may start. On failure records the cause for exit.json (startFailed).
+async function prepareGitHubToken() {
+  const ga = containerSpec.githubApp;
+  if (!ga || !ga.appId || !ga.keyFile || !ga.installationId || !ga.repoName) {
+    tokenState.startFailed = "spec.container.githubApp is missing or incomplete (appId, keyFile, installationId, repoName); this spec was not written by a job-core that knows the GitHub App";
+    return false;
+  }
+  try {
+    ensureCredsDir();
+    minter = createMinter({ appId: ga.appId, keyFile: ga.keyFile, installationId: ga.installationId, repoName: ga.repoName, apiBase: ga.apiBase || undefined });
+  } catch (e) { tokenState.startFailed = redact(String(e && e.message || e)); return false; }
+  if (!(await refreshToken("initial"))) { tokenState.startFailed = tokenState.lastError; return false; }
+  tokenRefresh = setInterval(() => { if (!done) refreshToken("periodic").catch(() => {}); }, refreshMs());
+  tokenRefresh.unref();
+  return true;
+}
+
 // Best-effort: a runner that cannot record must still finish normally. cleanup: container jobs'
 // cleanup record from finish() ({ confirmed, removed, error? }).
 function recordExit(cleanup = null) {
@@ -362,6 +477,15 @@ function recordExit(cleanup = null) {
     }
     // 125 is docker run's own failure (daemon down, bad flag, image refused), not the CLI's.
     if (exitInfo.exitCode === 125) warnings.push("docker run itself failed (exit 125) before or while starting the container; see stderrTail");
+    if (tokenState.startFailed) {
+      warnings.push(`could not mint the GitHub App installation token: ${tokenState.startFailed}; the container was not started ` +
+        `(exit ${ENTRY_EXIT_CONFIG}). Check CLAUDE_ASYNC_GITHUB_APP_ID / _KEY_FILE and that the App is installed on ${containerSpec.repo}`);
+    } else if (tokenState.lastError && (!tokenState.expiresAt || tokenState.expiresAt - Date.now() < TOKEN_EXPIRY_WARN_MS)) {
+      const expired = tokenState.expiresAt && tokenState.expiresAt <= Date.now();
+      warnings.push(`the GitHub App installation token could not be refreshed (last error: ${tokenState.lastError}) and ` +
+        `${expired ? "had expired" : "was within 5 minutes of its expiry"} when the job ended (generations minted: ${tokenState.generations}); ` +
+        "git/gh calls late in the job may have failed with authentication errors");
+    }
     if (exitInfo.exitCode === ENTRY_EXIT_CLONE) {
       warnings.push(`the container could not clone ${containerSpec.repo} (exit ${ENTRY_EXIT_CLONE} from the image's entrypoint); ` +
         "check that the bot can read the repo and that baseRef exists; see stderrTail");
@@ -404,6 +528,7 @@ async function finish(code) {
   let cleanupRecord = null;
   if (containerSpec) {
     if (containerWatch) clearInterval(containerWatch);
+    if (tokenRefresh) clearInterval(tokenRefresh);
     if (child && child.exitCode === null && child.signalCode === null) { containerState.fallbackFired = true; killClient(child); }
     try {
       const r = removeJobContainers("finish");
@@ -422,6 +547,9 @@ async function finish(code) {
           `(${cleanupRecord.error || cleanupRecord.reason}); claude_check / claude_cancel retry it\n`);
       }
     } catch {}
+    // The token file goes with the job, whatever the cleanup result (a container that somehow
+    // survived loses its credential rather than keeping one on disk).
+    removeCredsDir();
   }
   // Write exit.json BEFORE exit_code (and therefore before closeCard() too): exit_code is the
   // signal most external readers poll for "the job is done", so any reader that observes
@@ -491,13 +619,42 @@ logIfPathextSanitized(err, process.env, spawnEnv, `spawning ${command}`);
 
 let child;
 let containerWatch = null;
-if (containerSpec && fs.existsSync(cancelPath)) {
-  // Cancelled before `docker run`: never start the container at all.
+// Cancelled before `docker run`: never start the container at all.
+function finishCancelledBeforeLaunch() {
   containerState.cancelled = true;
   try { fs.writeSync(errFd, `\n[job-runner] cancel requested before docker run; not starting container ${containerSpec.name}\n`); } catch {}
   exitInfo = { exitCode: null, exitSignal: null, exitReason: "cancelled" };
   finish(130);
+}
+if (containerSpec && fs.existsSync(cancelPath)) {
+  finishCancelledBeforeLaunch();
+} else if (containerSpec) {
+  // Container jobs: the GitHub App installation token must be on disk (for the creds mount) before
+  // the container starts; minting is a network call, so the spawn happens in its continuation. A
+  // cancel that lands during the mint is honoured before anything is spawned.
+  prepareGitHubToken().then((ready) => {
+    if (done) return;
+    if (fs.existsSync(cancelPath)) { finishCancelledBeforeLaunch(); return; }
+    if (!ready) {
+      try { fs.writeSync(errFd, `\n[job-runner] could not mint the GitHub App installation token: ${tokenState.startFailed}; not starting container ${containerSpec.name}\n`); } catch {}
+      exitInfo = { exitCode: ENTRY_EXIT_CONFIG, exitSignal: null, exitReason: "exit" };
+      finish(ENTRY_EXIT_CONFIG);
+      return;
+    }
+    startChild();
+  }).catch((e) => {
+    if (done) return;
+    tokenState.startFailed = redact(String(e && e.message || e));
+    exitInfo = { exitCode: ENTRY_EXIT_CONFIG, exitSignal: null, exitReason: "exit" };
+    finish(ENTRY_EXIT_CONFIG);
+  });
 } else {
+  startChild();
+}
+
+// Spawns the job's command (the CLI for host jobs, the docker client for container jobs) and wires
+// its exit. Host jobs reach here synchronously at module load, exactly as before container mode.
+function startChild() {
   // Container jobs: "a launch is pending" is on disk BEFORE the spawn, so a runner that dies in the
   // next few lines can never be mistaken for one that never got this far.
   if (containerSpec) writeLaunchState("pending");
@@ -508,14 +665,17 @@ if (containerSpec && fs.existsSync(cancelPath)) {
     try { fs.writeSync(errFd, `\n[job-runner] failed to start ${command}: ${e.message}\n`); } catch {}
     exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };
     finish(127);
+    return;
   }
+  if (containerSpec) watchContainer();
+  wireChildExit();
 }
 
 // Container jobs: the docker client's pid (job-core's "may a launch still be pending?"), then a poll
 // for the cancel intent and the wall-clock limit. Either one removes the job's containers on every
 // tick until the client exits, which also catches a container that was still being created when
 // the cancel arrived.
-if (child && containerSpec) {
+function watchContainer() {
   // Test-only knob (test/container-runner.test.mjs, finding A1): die between the spawn and the pid
   // write, the exact window a TerminateProcess can hit. Production never sets this.
   if (process.env.CLAUDE_ASYNC_TEST_DIE_AFTER_SPAWN === "1") process.kill(process.pid, "SIGKILL");
@@ -584,7 +744,7 @@ if (child && containerSpec) {
   }
 }
 
-if (child) {
+function wireChildExit() {
   child.on("error", (e) => {
     try { fs.writeSync(errFd, `\n[job-runner] spawn error for ${command}: ${e.message}\n`); } catch {}
     if (!done) exitInfo = { exitCode: null, exitSignal: null, exitReason: "spawn-error", spawnError: e.message };

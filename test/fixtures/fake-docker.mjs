@@ -4,6 +4,9 @@
 // ({ id, label, state }), so separate invocations (run / ps / rm) see the same "daemon":
 //   run ...   -> after $FAKE_DOCKER_CREATE_DELAY_MS (default 0) creates the container (state file,
 //                state "running"), prints $FAKE_DOCKER_STDOUT (first), "container stdout" / "container stderr",
+//                and, with $FAKE_DOCKER_CAT_FILE set, "CAT:<that file's content>" at start and
+//                "CAT_END:<content>" right before exiting (what a container would see of the host's
+//                token file through the creds mount; the runner must have written it before `run`),
 //                then runs for $FAKE_DOCKER_RUN_MS (default 0) and exits $FAKE_DOCKER_RUN_EXIT
 //                (default 0), removing the container (--rm) -- unless $FAKE_DOCKER_LEAVE_RUNNING=1,
 //                which models a client that exits while its container keeps running. If the
@@ -71,7 +74,11 @@ if (argv[0] === "run") {
   } else {
     fs.writeFileSync(stateFile, state);
   }
+  const cat = (tag) => { if (!process.env.FAKE_DOCKER_CAT_FILE) return;
+    let v; try { v = fs.readFileSync(process.env.FAKE_DOCKER_CAT_FILE, "utf8").trim(); } catch (e) { v = `ERR:${e.code}`; }
+    process.stdout.write(`${tag}:${v}\n`); };
   if (process.env.FAKE_DOCKER_STDOUT) process.stdout.write(process.env.FAKE_DOCKER_STDOUT + "\n");
+  cat("CAT");
   process.stdout.write("container stdout\n");
   process.stderr.write("container stderr\n");
   const runMs = Number(process.env.FAKE_DOCKER_RUN_MS) || 0;
@@ -80,6 +87,7 @@ if (argv[0] === "run") {
   for (;;) {
     if (!readState()) process.exit(137);                    // removed under us (rm -f)
     if (Date.now() >= deadline) {
+      cat("CAT_END");
       if (process.env.FAKE_DOCKER_LEAVE_RUNNING !== "1") { try { fs.rmSync(stateFile); } catch {} }
       process.exit(code);
     }
