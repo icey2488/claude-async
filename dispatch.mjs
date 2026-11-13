@@ -19,7 +19,7 @@ import os from "node:os";
 import { startJob, checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
-import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
+import { DEPTH_ENV, DEPTH_HEADER, PROFILES, DEFAULT_PROFILE } from "./guard.mjs";
 
 export const FORWARD_TIMEOUT_MS = 20_000; // start/check: a remote start includes its own launch (task path: up to ~15s)
 export const LIST_TIMEOUT_MS = 5_000;
@@ -35,8 +35,8 @@ export function defaultCtx() {
 export function startLocal(args, cfg, startOptions = {}) {
   const jobId = mintJobId({ host: cfg.localHost, descriptor: args.jobId, now: startOptions.now,
                             ...(startOptions.suffix ? { suffix: startOptions.suffix() } : {}) });
-  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef } = args;
-  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef },
+  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef, profile } = args;
+  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile },
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
@@ -77,11 +77,11 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
   const route = resolveRoute(args.host, ctx.cfg);
   if (route.error) return { error: route.error, host: args.host ?? null, hostname: os.hostname() };
   if (route.kind === "local") return startLocal(args, ctx.cfg, ctx.startOptions);
-  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef } = args;
-  // sandbox/repo/baseRef are only sent when given, so a forwarded host-mode start's body is unchanged.
+  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile } = args;
+  // sandbox/repo/baseRef/profile are only sent when given, so a forwarded host-mode start's body is unchanged.
   const out = await forward(ctx, route, "POST", "/v1/start",
                             { host, prompt, workFolder, jobId, model, effort, intent, ...(sandbox ? { sandbox } : {}),
-                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}) },
+                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}), ...(profile ? { profile } : {}) },
                             FORWARD_TIMEOUT_MS);
   return { host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
@@ -210,6 +210,13 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
       baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
                   "(default: the repo's default branch). The job works on a new branch and opens a PR."),
+      profile: z.enum(PROFILES).optional().describe(`Only affects jobs run under safe permissions ` +
+                  `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1); ignored otherwise. Default "${DEFAULT_PROFILE}". ` +
+                  `"readonly": no file edits, no git write, no interpreters/code-runners -- investigation ` +
+                  `only. "code": the above plus file editing and the dev-tool runners (the historical, ` +
+                  `unrestricted-ish default). "ops": "code" plus ops-actions/run.mjs's named operational ` +
+                  `actions. A nested job (one this job itself dispatches) may not request a profile ` +
+                  `broader than its own.`),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 

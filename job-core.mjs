@@ -24,7 +24,7 @@ import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
-         DEPTH_ENV } from "./guard.mjs";
+         DEPTH_ENV, PROFILES, DEFAULT_PROFILE, PROFILE_ENV, isProfile, checkProfile } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues, readTokenFileSecretValues,
          redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME,
@@ -249,38 +249,82 @@ function quotedPosixPath(p) {
   return `"${p.replace(/\\/g, "/")}"`;
 }
 
+// Absolute path to tools/http-get-loopback.mjs and ops-actions/run.mjs, in both path-separator
+// spellings a job's own Bash or PowerShell call might use (a literal backslash path, the way
+// Windows shells render one, and the forward-slash spelling node accepts natively and a job might
+// type verbatim). Prefix rules match literal typed text, so both spellings need their own rule.
+const LOOPBACK_HELPER_SCRIPT = path.join(REPO_DIR, "tools", "http-get-loopback.mjs");
+const OPS_ACTION_RUNNER_SCRIPT = path.join(REPO_DIR, "ops-actions", "run.mjs");
+const bothSlashSpellings = (p) => [p, p.replace(/\\/g, "/")];
+
 // Job-scoped permissions.allow/deny for --permission-mode dontAsk (SAFE_PERMISSIONS_ENV_DEFAULT
-// above). Sized to what tonight's jobs actually did (git, pytest, uv, node, PowerShell reads,
-// worktree ops, file edits) per the design doc's DO item 2 -- NOT a substitute for the
-// job-tool-gate hook's per-call review; the two are complementary layers (see the design doc's
-// rollout section). The deny list is deliberately the belt to the gate hook's suspenders: a
+// above), now split by PROFILE (safe-mode-profiles, 2026-11-09/2026-11-12, guard.mjs's PROFILES):
+//   - "readonly": Read/Glob/Grep/WebSearch, read-only git, the read-only PowerShell cmdlets below,
+//     version-only gh/claude checks, and the loopback GET helper. NO Edit/Write/MultiEdit/
+//     NotebookEdit, no interpreter/code-runner prefixes (node/python/npm/pytest/uv/mkdir), and no
+//     git subcommand that mutates the working tree, refs, or config.
+//   - "code" (DEFAULT_PROFILE, matches the only profile that existed before this feature): the
+//     above plus file editing, the dev-tool runners, and the write-capable git subcommands.
+//   - "ops": "code" plus ops-actions/run.mjs, the only path to the two named operational actions
+//     (see that file's header).
+// NOT a substitute for the job-tool-gate hook's per-call review; the two are complementary layers
+// (see docs/publishing.md's rollout section). The deny list (the SAME for every profile -- it is
+// the floor, never loosened by profile) is deliberately the belt to the gate hook's suspenders: a
 // static deny rule can never be overridden by a PreToolUse hook's "allow" (confirmed against the
 // current permissions docs -- "deny rules... evaluated regardless of what a PreToolUse hook
 // returns"), so these hold even if the gate hook is disabled, missing, or buggy. `//` anchors at
 // the filesystem root so the rule holds regardless of which workFolder/worktree a job runs in.
-export function buildSafePermissionsSettings() {
-  // Shared between Bash and PowerShell so the two shells can't drift (2026-10-21 rehearsal,
-  // D:\code\reviews\safe-permissions-rehearsal-20261021.md: PowerShell originally had only its
-  // own read-only allow rules while Bash got the full dev-tool set below, hand-written separately
-  // -- so the SAME logical command, e.g. `uv run pytest`, was allowed or denied purely depending
-  // on which shell tool Claude Code happened to invoke that turn, which is not something a job's
-  // own prompt controls or can predict). Covers git, the dev-tool runners, and mkdir (added in the
-  // same rehearsal: a scaffolding job's first compound Bash command, `cd ... && mkdir -p src tests
-  // docs && git status`, was denied outright because `mkdir` matched no allow rule at all --
-  // Claude Code decomposes a `&&`-joined command into its sub-commands and denies the whole call
-  // if ANY one isn't covered, so the allowed `git status` alongside it didn't save the call
-  // either. Directory creation is routine scaffolding, not a destructive verb).
-  const SHELL_ALLOW_PREFIXES = [
-    "git status*", "git diff*", "git log*", "git show*",
-    "git branch*", "git rev-parse*", "git remote*", "git describe*",
+export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
+  const resolvedProfile = isProfile(profile) ? profile : DEFAULT_PROFILE;
+
+  // Every prefix below that previously had no space before its trailing "*" (git status*, git
+  // diff*, ...) is word-boundary-unsafe: Claude Code's own docs give "Bash(ls *)" (space before
+  // the star) specifically so the rule does not also match an unrelated command sharing the same
+  // text prefix (e.g. "lsof"), and the 2026-11-09 job's WebSearch against those docs confirmed
+  // this live. Simply inserting the space would instead BREAK the common bare-command case (e.g.
+  // plain `git status`, invoked constantly with zero arguments, would no longer match "git status
+  // *" since that requires a literal trailing space). So every one of these git prefixes below is
+  // listed TWICE: once as an exact string (matches the bare command only) and once with a trailing
+  // " *" (matches the command plus arguments), which is boundary-safe and still covers both shapes.
+  // `git ls-files` and `git worktree list` are new (ITEM 1): both are read-only and safe in every
+  // profile, including `readonly`. `git branch` (bare, no flags) and `git remote` (bare) are also
+  // read-only (they list, they don't create/add) -- `git branch <name>` (create) and
+  // `git remote add/remove/set-url` (mutate .git/config) need an argument that isn't a bare
+  // invocation, so they are deliberately left off this read-only set and only reachable through
+  // WRITE_GIT_PREFIXES below (code/ops only). `git branch -a`/`-v` and friends are NOT added here:
+  // flag-only forms share no fixed literal prefix with `--list`, and some branch flags (`-m`/`-M`,
+  // move/rename) mutate -- a known, deliberately left residual gap, same as the flag-order gaps
+  // SHELL_DENY_PREFIXES already documents below.
+  const READ_GIT_EXACT = [
+    "git status", "git diff", "git log", "git show", "git rev-parse", "git describe",
+    "git fetch", "git ls-files", "git branch", "git branch --list", "git worktree list",
+    "git remote",
+  ];
+  const READ_GIT_SPACED = [
+    "git status *", "git diff *", "git log *", "git show *", "git rev-parse *", "git describe *",
+    "git fetch *", "git ls-files *", "git branch --list *", "git worktree list *",
+  ];
+  const READ_GIT_PREFIXES = [...READ_GIT_EXACT, ...READ_GIT_SPACED];
+
+  // Write-capable git subcommands (code/ops only). Already word-boundary-safe (space before the
+  // star) from the 2026-10-21 rehearsal; unchanged here except `git branch *`/`git remote *` added
+  // back (the broader, mutation-capable forms the READ_GIT set above deliberately excludes) so
+  // code/ops jobs keep exactly the branch-create/remote-add capability they had before this split.
+  const WRITE_GIT_PREFIXES = [
     "git add *", "git commit *", "git checkout *", "git worktree *",
     // git switch (2026-10-21 safe-perms-finish task 3): the modern equivalent of
     // `git checkout <branch>`/`git checkout -b`, same risk class as the checkout rule already
     // above -- added here rather than left out, since CLAUDE.md names it alongside checkout as a
     // normal branch operation a job should be able to do.
-    "git switch *",
-    "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *",
+    "git switch *", "git branch *", "git remote *",
   ];
+  // Interpreters/code-runners and mkdir (code/ops only; ABSENT from readonly on purpose -- a
+  // "readonly" profile should not get bare interpreter/runner access either, since those can write
+  // files just as easily as Edit/Write can). Unchanged from the single-profile set (2026-10-21
+  // rehearsal: mkdir was added there because Claude Code decomposes a `&&`-joined compound command
+  // into its sub-commands and denies the WHOLE call if any one isn't covered, so routine
+  // scaffolding like `mkdir -p src tests docs && git status` needs its own allow rule).
+  const DEV_TOOL_PREFIXES = ["pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"];
   const SHELL_DENY_PREFIXES = [
     "git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*",
     // 2026-10-21 safe-perms-finish task 3 (known gap named in the rehearsal, D:\code\reviews\
@@ -314,7 +358,8 @@ export function buildSafePermissionsSettings() {
   // require, chosen because allowing the URI in any argument position would mean the static prefix
   // itself could no longer anchor on the fixed host/port, re-opening the same gap. `ollama run`/
   // `generate`/`list`/`ps`/`show` cover the CLI alternative CLAUDE.md also names; that path has no
-  // URL of its own for a bypass to hide in.
+  // URL of its own for a bypass to hide in. Available in EVERY profile, including readonly -- it's
+  // a fixed, validated local inference call, not a general network or write capability.
   const OLLAMA_ALLOW_PREFIXES = [
     "curl http://127.0.0.1:11434/api/generate", "curl http://localhost:11434/api/generate",
     "Invoke-RestMethod http://127.0.0.1:11434/api/generate", "Invoke-RestMethod http://localhost:11434/api/generate",
@@ -322,20 +367,79 @@ export function buildSafePermissionsSettings() {
     "ollama run ", "ollama generate ", "ollama list", "ollama ps", "ollama show ",
   ];
 
+  // Read-only PowerShell cmdlets (safe-mode-profiles ITEM 1, 2026-11-09 denial tally §F: these were
+  // badly underprovisioned -- Get-ScheduledTask/Get-NetTCPConnection/Get-CimInstance alone accounted
+  // for 3 of 13 tallied denials). Every one of these only reads state; none can write a file, run
+  // arbitrary code, or read file CONTENTS (Get-Item returns metadata, not a file's bytes). Available
+  // in every profile, including readonly. `Get-Content` is deliberately NOT in this list -- see
+  // ITEM 2 below for why it is excluded from every profile, not narrowed per-profile.
+  const READONLY_CMDLETS = [
+    "Get-ChildItem", "Get-Item", "Get-ScheduledTask", "Get-ScheduledTaskInfo", "Get-NetTCPConnection",
+    "Get-CimInstance", "Get-Process", "Get-Service", "Test-Path", "Get-Date", "Get-FileHash", "Resolve-Path",
+  ];
+  const READONLY_CMDLET_ALLOW = READONLY_CMDLETS.flatMap((c) => [`PowerShell(${c})`, `PowerShell(${c} *)`]);
+
+  // Version/auth-status-only checks (ITEM 1, denial tally §F: invoking `gh`/`claude` at all matched
+  // no allow rule, so even a harmless `--version` was denied). Exact strings only -- NOT prefixes --
+  // so `gh auth status --hostname evil.example` or `gh --version && gh pr create` can never ride
+  // along; Claude Code decomposes `&&`-joined commands and denies the whole call if any sub-command
+  // isn't covered, so a chained `gh pr create` still gets refused even if the first clause matches.
+  const VERSION_ONLY_ALLOW = ["gh --version", "gh auth status", "claude --version"];
+
+  // Loopback GET helper (ITEM 1): the one HTTP escape hatch every profile gets, see
+  // tools/http-get-loopback.mjs's header for what it refuses. `node <path> *` (not a bare `node *`
+  // rule, which DEV_TOOL_PREFIXES already withholds from readonly) -- the trailing wildcard only
+  // ever needs to cover the one positional URL argument.
+  const LOOPBACK_ALLOW = forShells(bothSlashSpellings(LOOPBACK_HELPER_SCRIPT).map((p) => `node ${p} *`));
+  // Ops action runner (ITEM 3): ops profile only. See ops-actions/run.mjs's header -- the script
+  // enforces CLAUDE_ASYNC_JOB_PROFILE==="ops" on itself too, but that is a convention the script
+  // follows, not a boundary this allow rule provides; see the file's own header for the honest
+  // limits of that self-check.
+  const OPS_RUNNER_ALLOW = forShells(bothSlashSpellings(OPS_ACTION_RUNNER_SCRIPT).map((p) => `node ${p} *`));
+
+  const baseAllow = [
+    "Read", "Glob", "Grep", "WebSearch",
+    ...forShells(READ_GIT_PREFIXES),
+    ...forShells(OLLAMA_ALLOW_PREFIXES.map((p) => `${p}*`)),
+    ...READONLY_CMDLET_ALLOW,
+    ...forShells(VERSION_ONLY_ALLOW),
+    ...LOOPBACK_ALLOW,
+  ];
+  // PowerShell(Get-ChildItem *)/(Get-Item *) above already cover listing; Get-Content is
+  // deliberately excluded (ITEM 2 -- see READONLY_CMDLETS' comment).
+  const allow = resolvedProfile === "readonly" ? baseAllow : [
+    ...baseAllow,
+    "Edit", "Write", "MultiEdit", "NotebookEdit",
+    ...forShells(WRITE_GIT_PREFIXES),
+    ...forShells(DEV_TOOL_PREFIXES),
+    ...(resolvedProfile === "ops" ? OPS_RUNNER_ALLOW : []),
+  ];
+
   return {
     permissions: {
-      allow: [
-        "Read", "Glob", "Grep", "WebSearch",
-        "Edit", "Write", "MultiEdit", "NotebookEdit",
-        ...forShells(SHELL_ALLOW_PREFIXES),
-        ...forShells(OLLAMA_ALLOW_PREFIXES.map((p) => `${p}*`)),
-        "PowerShell(Get-ChildItem *)", "PowerShell(Get-Content *)", "PowerShell(Get-Item *)",
-      ],
+      allow,
       deny: [
         ...forShells(SHELL_DENY_PREFIXES),
         "Edit(//**/CLAUDE.md)", "Edit(//**/hooks/**)", "Edit(//**/.claude/settings*.json)",
         "Edit(//**/config.yaml)", "Edit(//**/scheduled-tasks/**)",
-        "Read(//**/.env)", "Read(//**/.ssh/**)",
+        // ITEM 2 (shell secret-read hole, safe-mode-profiles 2026-11-12): Read(//**/.env) below
+        // denies the Claude Code READ tool against a secret file, but it has no effect on a
+        // PowerShell `Get-Content .env` call -- that is a wholly different permission namespace
+        // (a Bash/PowerShell command-prefix match, not a file-path check), so the blanket
+        // `PowerShell(Get-Content *)` allow rule that existed before this change let any job read
+        // ANY file's contents, secrets included, straight past the Read-tool deny below. Fixed by
+        // removing that allow rule entirely (every profile) rather than attempting a path-glob-
+        // shaped deny for it: this permission surface only supports a literal command-text prefix
+        // (optionally with a trailing wildcard), which cannot express "unless the path looks like
+        // an env file" -- a job that genuinely needs a file's contents uses the Read tool, which
+        // the three rules right below already govern. (ITEM 2 also covers "and similar" shell
+        // reads: no other read-only PowerShell cmdlet in READONLY_CMDLETS above returns file
+        // CONTENTS -- Get-Item is metadata-only -- so Get-Content was the one gap.)
+        //
+        // Secret files (keep both forms, plus the bare filename -- all anchored with //**/ so they
+        // match in nested directories too, e.g. sub/.env, sub/prod.env, sub/.env.local):
+        "Read(//**/.env)", "Read(//**/*.env)", "Read(//**/.env.*)",
+        "Read(//**/.ssh/**)",
         // 2026-10-21 safe-permissions rehearsal gap (D:\code\reviews\safe-permissions-rehearsal-
         // 20261021.md): none of the rules above match a path shaped like the live chassis
         // (D:\claunker\**, e.g. D:\claunker\hermes\plugins.py) -- a decoy probe confirmed Edit was
@@ -358,6 +462,25 @@ export function buildSafePermissionsSettings() {
       ],
     },
   };
+}
+
+// Denial guidance (ITEM 4, safe-mode-profiles 2026-11-12): the 2026-11-09 denial tally (§F) found
+// jobs giving up after a single denied call instead of retrying with a plain, differently-shaped
+// command, or reporting the exact denial and moving on -- the generic "don't ask mode" refusal
+// text doesn't tell a job WHY it was denied or what to do about it. Appended via
+// --append-system-prompt (additive to, never a replacement for, the CLI's own system prompt) only
+// when safe permissions are actually on, so a --dangerously-skip-permissions job's prompt is
+// unchanged. Mirrors the same "stop and report, do not route around a denial" rule this very job
+// was launched under.
+export function buildDenialGuidanceText(profile) {
+  const resolvedProfile = isProfile(profile) ? profile : DEFAULT_PROFILE;
+  return `Safe mode is on for this job (profile: "${resolvedProfile}", --permission-mode dontAsk). ` +
+    `A denied tool call means it matched no allow rule, or an explicit deny rule won -- it is not a ` +
+    `transient error, and retrying the exact same command will be denied again. Do not look for a ` +
+    `workaround (a different shell, --no-verify, sudo, piping through a second command, writing a ` +
+    `helper script that does the same thing) to route around a denial. If the task genuinely needs a ` +
+    `capability this profile does not grant, stop and say so in your final report with the exact ` +
+    `denial text, rather than working around it.`;
 }
 
 // Builds the --settings object every claude-async job launch gets (merged with any other
@@ -966,7 +1089,7 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
 // start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef }, opts = {}) {
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile }, opts = {}) {
   const hostname = os.hostname();
   const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
   const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
@@ -1022,6 +1145,16 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const depthError = checkDepth(d.depth);
   if (depthError) return fail("depth", depthError);
 
+  // Job profile (guard.mjs's PROFILES/checkProfile): an accident guard, not a security control --
+  // see guard.mjs's header. Resolved and validated before anything is written, same as depth
+  // above. Applies identically whether this becomes a host or a container job (see the comment on
+  // extraEnv[PROFILE_ENV] below for why); only the permission SETTINGS built from it are host-only
+  // today (buildSafePermissionsSettings() is never consulted on the container path).
+  const requestedProfile = profile === undefined ? DEFAULT_PROFILE : profile;
+  const profileError = checkProfile(d.depth, requestedProfile, process.env);
+  if (profileError) return fail("profile", profileError);
+  const resolvedProfile = requestedProfile;
+
   const p = jobPaths(id);
   const nowMs = (opts.now || new Date()).getTime();
   const caps = resolveCaps(opts.caps);
@@ -1069,7 +1202,13 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // whichever of ultracode/hooks lost that race).
   const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
   const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled, liveHermesHome, ollamaGuard: safePermissionsEnabled });
-  if (safePermissionsEnabled) Object.assign(settingsObj, buildSafePermissionsSettings());
+  if (safePermissionsEnabled) {
+    Object.assign(settingsObj, buildSafePermissionsSettings(resolvedProfile));
+    // Denial guidance (ITEM 4): additive system-prompt text, only when safe permissions are
+    // actually enforced -- a --dangerously-skip-permissions job never sees a denial in the first
+    // place, so its prompt is left exactly as before this change.
+    argv.push("--append-system-prompt", buildDenialGuidanceText(resolvedProfile));
+  }
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
     // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the
@@ -1084,6 +1223,14 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   argv.push("--settings", JSON.stringify(settingsObj));
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
+  // Set on the launched process's own env regardless of sandbox mode (host or container) and
+  // regardless of whether safe permissions are even on for THIS job: a nested job this one later
+  // dispatches reads its parent's profile from here (guard.mjs's checkProfile), and ops-actions/
+  // run.mjs reads this directly to confirm it is running inside an "ops" job. Threading it through
+  // for container jobs too (even though buildSafePermissionsSettings() is never applied to the
+  // container's own CLI invocation -- see docs on that split) keeps the accident guard consistent
+  // for anything a container job itself dispatches.
+  extraEnv[PROFILE_ENV] = resolvedProfile;
   // CLAUDE_ASYNC_JOB_EFFORT: tells hooks/no-background-hook.mjs this job's effort level, so it
   // can gate the Workflow tool to ultracode-effort jobs without guessing (job-core.mjs is the
   // only place that knows `eff` authoritatively). Set on the launched CLI process's own
@@ -1185,6 +1332,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const meta = { jobId: id, ...(opts.host ? { host: opts.host } : {}), hostname,
                  pid, pidSource, launchPath, ...(jobMembership ? { jobMembership } : {}),
                  workFolder: containerPlan ? null : cwd, model: resolvedModel, effort: eff, depth: d.depth + 1,
+                 profile: resolvedProfile,
                  prompt: prompt.length > 500 ? prompt.slice(0, 500) + "…" : prompt,
                  startedAt: new Date().toISOString(),
                  cardId: cardId || null, startHead: startHead || null,

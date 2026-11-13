@@ -511,6 +511,126 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
   (outstanding tokens die within the hour), delete its private key, and revoke the setup-token for a
   full cut-off. See the doc's "Rollback".
 
+## Safe-mode job profiles (`feat/safe-mode-profiles-v2`, 2026-11-12)
+
+By default every claude-async job runs with `--dangerously-skip-permissions` — unattended `-p` runs
+have no one to answer a permission prompt, so this has always been the hardcoded default.
+`CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` (or `opts.safePermissions`/`startOptions.safePermissions` in
+tests) switches that to `--permission-mode dontAsk`, Claude Code's own headless mode: it honors
+`permissions.allow`/`permissions.deny` and auto-denies anything that matches neither. The allow/deny
+lists are built per-job by `job-core.mjs`'s `buildSafePermissionsSettings(profile)`, scoped by one of
+three **profiles** (`guard.mjs`'s `PROFILES`):
+
+| Profile | Gets | Does NOT get |
+|---|---|---|
+| `readonly` | `Read`/`Glob`/`Grep`/`WebSearch`, read-only git (`status`, `diff`, `log`, `show`, `rev-parse`, `describe`, `fetch`, `ls-files`, `branch` (bare/`--list`), `worktree list`, `remote`), the read-only PowerShell cmdlets and version-only `gh`/`claude` checks below, and the loopback GET helper | `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, any interpreter or code runner (`node`, `python`, `npm`, `pytest`, `uv`, `mkdir`), and any git subcommand that mutates the working tree, refs, or config |
+| `code` (**default**, matches the only profile that existed before this feature) | everything `readonly` has, plus file editing, the dev-tool runners, and the write-capable git subcommands (`add`, `commit`, `checkout`, `worktree add/remove`, `switch`, `branch <name>`, `remote add/remove`) | the `ops` runner below |
+| `ops` | everything `code` has, plus `ops-actions/run.mjs` | — |
+
+The **deny floor is identical across all three profiles** and never loosens per profile — it is the
+belt to the gate hook's suspenders (see "No-background enforcement hook" above for the same
+relationship): destructive git forms (`push`, `merge`, `rebase`, `reset --hard`, `clean -f`, forced
+branch/checkout/switch variants), edits to `CLAUDE.md`/`hooks/**`/`.claude/settings*.json`/
+`config.yaml`/`scheduled-tasks/**`/the live chassis (`//**/claunker/**`), and reads of `.ssh/**` or
+anything shaped like an env file.
+
+**Env-file deny (anchored for nested directories too):** `Read(//**/.env)`, `Read(//**/*.env)`,
+`Read(//**/.env.*)` — covers the bare filename, `*.env`-suffixed names (`prod.env`), and
+`.env.`-prefixed names (`.env.local`), each matching at any depth (`sub/.env` is denied exactly like
+`.env`).
+
+**The shell secret-read hole (ITEM 2).** The three `Read(...)` denies above only bind the Claude Code
+`Read` tool — they have no effect on a PowerShell `Get-Content .env` call, which is a completely
+different permission surface (a Bash/PowerShell command-prefix match, not a file-path check). Before
+this fix, `PowerShell(Get-Content *)` was unconditionally allow-listed, so any safe-mode job could
+read a secret file's contents straight past the `Read`-tool deny. Fixed by removing that allow rule
+entirely (every profile, not narrowed per profile) rather than attempting a path-shaped deny for it —
+this permission surface only supports a literal command-prefix match, which can't express "unless the
+path looks like an env file." A job that needs a file's contents uses the `Read` tool instead, which
+the three rules above already govern. `PowerShell(Get-ChildItem *)`/`(Get-Item *)` stay allowed — they
+list a directory or return a file's metadata, never its contents.
+
+**Word-boundary fix.** Several existing git rules (`git status*`, `git diff*`, `git log*`, `git
+show*`, `git rev-parse*`, `git describe*`, `git ls-files*`) had no space before the trailing `*`,
+which Claude Code's own docs call out as boundary-unsafe (`Bash(ls *)`, with a space, is the
+documented-safe form — a no-space prefix can also match an unrelated command sharing the same text,
+e.g. `lsof` for a bare `ls*`). Simply inserting the space would instead break the extremely common
+bare-command case (`git status` with no arguments would stop matching `git status *`, which requires
+a literal trailing space). Each of these is now listed **twice**: once as an exact string (matches
+the bare command only) and once with a trailing `" *"` (matches the command plus arguments) — both
+boundary-safe, together covering both shapes. `git fetch` and `git worktree list` are new additions
+(ITEM 1) in this same boundary-safe shape, available in every profile including `readonly`: both are
+read-only (`fetch` never touches the working tree; `worktree list` only reads), and were previously
+denied by simple omission, not by design.
+
+**Read-only PowerShell cmdlets and version checks (ITEM 1).** The 2026-11-09 denial tally found these
+badly underprovisioned — three cmdlets alone accounted for several of the denials it tallied. Every
+profile now allow-lists (exact command and `" *"`-suffixed form, each): `Get-ChildItem`, `Get-Item`,
+`Get-ScheduledTask`, `Get-ScheduledTaskInfo`, `Get-NetTCPConnection`, `Get-CimInstance`,
+`Get-Process`, `Get-Service`, `Test-Path`, `Get-Date`, `Get-FileHash`, `Resolve-Path`; plus the exact
+strings `gh --version`, `gh auth status`, `claude --version` (exact only, never a prefix, so a
+chained `gh pr create` riding along a `gh --version &&` can't sneak through — Claude Code decomposes
+a `&&`-joined command and denies the whole call if any sub-command isn't covered).
+
+**Loopback GET helper (ITEM 1), every profile.** `tools/http-get-loopback.mjs` is the one HTTP escape
+hatch every profile gets: `node <path-to-it> *`, both path-separator spellings, both shells. A bare
+`Invoke-WebRequest`/`curl` allow rule scoped to "loopback" can't actually express that restriction (a
+prefix rule matches literal argv text, not what the URL resolves to, and can't pin the HTTP method),
+so this is a fixed, validated script instead — GET only, refuses anything whose hostname isn't
+`127.0.0.1`/`localhost`/`::1`, refuses userinfo, never auto-follows a redirect off loopback, bounds
+the response to 64 KB. `tools/http-get-loopback.mjs`'s own header comment has the full contract.
+
+**Ops action runner (ITEM 3), `ops` profile only.** `ops-actions/run.mjs` is the only way an
+`ops`-profile job takes an operational action (restarting a service, running a scheduled task)
+instead of editing files or running tests — a bare allow rule for `schtasks`/`taskkill`/
+`Stop-Process` would let a job run *any* such command with *any* argument, so this is one script, a
+fixed registry of named actions (`hostapi-restart`, `agentglass-update-restart` today), no free-form
+command arguments, and every invocation (allowed, refused, or failed) appended to an audit log under
+`~/.claude-async-jobs/ops-actions-audit.jsonl` (override: `OPS_ACTIONS_AUDIT_LOG`). The script also
+refuses to run unless its own `CLAUDE_ASYNC_JOB_PROFILE` env is exactly `"ops"` — a convention the
+script enforces on itself, not a host-level sandboxing boundary (`node` is an allowed prefix in every
+profile, so a determined job could still write a different script doing the same thing). `--dry-run`
+prints the exact steps a real run would take without executing them.
+
+**Nested-profile accident guard.** Same shape as the existing dispatch-depth guard
+(`CLAUDE_ASYNC_DEPTH`): a nested job (one a running job itself dispatches, `depth > 0`) cannot
+request a profile broader than the one its own environment carries
+(`CLAUDE_ASYNC_JOB_PROFILE`, set by `startJob()` on every launched job's own process, regardless of
+whether safe permissions are even on for that job). Like the depth guard, this stops an accidental or
+naive escalation, not a determined adversary — a child could in principle misreport its own
+environment before dispatching. Enforced by `guard.mjs`'s `checkProfile()`, called from `startJob()`
+before anything is written to disk, same ordering as every other `startJob()` rejection.
+
+**Denial guidance in job prompts (ITEM 4).** The 2026-11-09 denial tally found jobs giving up after
+one denied call instead of retrying with a differently-shaped command, or reporting the denial and
+moving on — the CLI's own generic "don't ask mode" refusal text doesn't say *why* a call was denied
+or what to do about it. When safe permissions are on, `startJob()` appends (`--append-system-prompt`,
+additive to the CLI's own system prompt) a short block naming the active profile and saying plainly:
+a denial is not transient, do not retry the same command or look for a workaround, and if the task
+genuinely needs a capability the profile doesn't grant, stop and say so in the final report with the
+exact denial text. A `--dangerously-skip-permissions` job's prompt is unchanged — the block is only
+added when a job can actually be denied in the first place.
+
+**Container-job interaction.** `profile` is validated and recorded (`meta.json`, and forwarded as
+`CLAUDE_ASYNC_JOB_PROFILE` into the container's own env via `container.mjs`'s `FORWARDED_ENV_KEYS`,
+same as the depth guard already was) for a `sandbox:"container"` job too, so the accident guard stays
+consistent for whatever a container job itself dispatches. But `buildSafePermissionsSettings()` is
+**never** consulted on the container path — `container.mjs`'s `buildContainerCliArgv()` always runs
+the CLI inside the container with `--dangerously-skip-permissions`; the Docker container itself is
+the sandbox boundary there, not the permission profile. A container job's profile therefore has no
+effect on what it can do inside the container.
+
+**Using it.** `claude_start`'s `profile` param (`"readonly"` | `"code"` default | `"ops"`) only
+matters when `CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1`; same for `host-api.mjs`'s `/v1/start` body field
+(validated against `guard.mjs`'s `PROFILES`, 400 on an unrecognized value).
+
+**Known residual gaps**, same shape as the ones the 2026-10-21 rehearsal already documented and left
+open: flag-order variants prefix matching can't express (`git branch -fd`, `--force --delete`
+reversed); `git remote` (bare, listing) is read-only-safe, but `code`/`ops`'s broader `git remote *`
+(needed for `remote add`) also admits `remote remove`/`set-url`, unchanged from before this profile
+split. Verification of every check above against a real `claude` process is tracked separately (see
+the PR this section shipped with) — this document describes the design, not a live-tested guarantee.
+
 ## Dispatch defaults (model + effort)
 
 - `claude_start` accepts a `model` param (any `--model` value, e.g. `claude-opus-4-8` /

@@ -118,6 +118,43 @@ export function checkDepth(depth) {
     : null;
 }
 
+// Job profiles (safe-mode-profiles, 2026-11-09/2026-11-12): same accident-guard nature as depth
+// above -- a nested job (depth > 0) is refused a profile BROADER than the one its own environment
+// carries (CLAUDE_ASYNC_JOB_PROFILE, set by job-core.mjs's startJob() into the launched process's
+// env), so a job cannot escalate its own blast radius by dispatching a child with a wider profile
+// than it was given. Like depth, this is enforced against a value the dispatcher controls and a
+// child could in principle misreport if it fabricated its own environment before calling back in --
+// it stops an accidental or naive escalation, not a determined adversary. Profiles only affect
+// anything when safe mode (CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) is on; see job-core.mjs's
+// buildSafePermissionsSettings(). Applies identically to host and container jobs (set in extraEnv
+// either way) even though the permission settings themselves are host-only today -- see job-core.mjs's
+// startJob() comment on that split.
+export const PROFILES = Object.freeze(["readonly", "code", "ops"]);
+export const DEFAULT_PROFILE = "code"; // matches the only profile that existed before this feature
+export const PROFILE_ENV = "CLAUDE_ASYNC_JOB_PROFILE";
+const PROFILE_RANK = Object.freeze({ readonly: 0, code: 1, ops: 2 });
+
+export function isProfile(value) {
+  return typeof value === "string" && PROFILES.includes(value);
+}
+
+// depth: the CALLER's dispatch depth (0 = a human or the bridge itself; >0 = the caller is itself
+// a running job). requestedProfile: the profile being asked for the NEW job. env: the environment
+// to read the caller's own profile from (CALLER's process.env, i.e. this process -- an inherited
+// value if this process is itself a launched job). Returns null if fine, else a refusal string.
+export function checkProfile(depth, requestedProfile, env = process.env) {
+  if (!isProfile(requestedProfile)) return `invalid profile ${JSON.stringify(requestedProfile)} (must be one of ${PROFILES.join(", ")})`;
+  if (depth > 0) {
+    const parentRaw = env[PROFILE_ENV];
+    const parent = isProfile(parentRaw) ? parentRaw : DEFAULT_PROFILE;
+    if (PROFILE_RANK[requestedProfile] > PROFILE_RANK[parent]) {
+      return `nested job (dispatch depth ${depth}) may not request profile "${requestedProfile}", broader ` +
+        `than its parent's profile "${parent}"; no job started`;
+    }
+  }
+  return null;
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function defaultPidAlive(pid) {

@@ -3,7 +3,7 @@
  * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
  * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
- *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef? }
+ *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef?, profile? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
  *   POST /v1/cancel  body { jobId }   (container jobs only; see job-core.mjs cancelJob)
  *   GET  /v1/jobs
@@ -41,13 +41,14 @@ import { fileURLToPath } from "node:url";
 import { checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
 import { loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
-import { DEPTH_HEADER } from "./guard.mjs";
+import { DEPTH_HEADER, PROFILES } from "./guard.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 
 export const DEFAULT_PORT = 7850;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max", "ultracode"]);
 const SANDBOXES = new Set(["host", "container"]);
+const PROFILE_SET = new Set(PROFILES);
 
 // 100.64.0.0/10 (RFC 6598 CGNAT space, which Tailscale assigns node addresses from): first octet
 // 100, top two bits of the second octet 01 -> second octet 64..127.
@@ -181,10 +182,14 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
         if (body.sandbox !== undefined && body.sandbox !== null && !SANDBOXES.has(body.sandbox)) {
           return send(res, 400, { error: `invalid sandbox ${JSON.stringify(body.sandbox)}`, hostname });
         }
+        if (body.profile !== undefined && body.profile !== null && !PROFILE_SET.has(body.profile)) {
+          return send(res, 400, { error: `invalid profile ${JSON.stringify(body.profile)} (must be one of ${PROFILES.join(", ")})`, hostname });
+        }
         const out = await startLocal(
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
             model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,
-            sandbox: body.sandbox || undefined, repo: body.repo || undefined, baseRef: body.baseRef || undefined },
+            sandbox: body.sandbox || undefined, repo: body.repo || undefined, baseRef: body.baseRef || undefined,
+            profile: body.profile || undefined },
           cfg, { ...startOptions, depth: req.headers[DEPTH_HEADER] ?? "" });
         return send(res, out.error ? (STATUS_BY_CODE[out.errorCode] || 400) : 200, { ...out, hostname: out.hostname || hostname });
       }
