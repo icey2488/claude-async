@@ -262,6 +262,57 @@ for jobs whose `runner_heartbeat` has gone stale with no `exit_code`, i.e. exact
 `claude_check`'s `died`/`timed_out` classification already detects) could fire the same webhook
 for those, but that is future work, not implemented here.
 
+## AgentGlass Lantern telemetry (`feat/lantern-telemetry`, 2026-11-13)
+
+`job-runner.mjs` posts every job's status to AgentGlass's local Lantern board
+(`POST http://127.0.0.1:<port>/agents/status`) on the job's own behalf, so a
+headless claude-async job shows up on Starboard even though it never runs the
+UserPromptSubmit hook's own `curl` (denied under safe mode). See
+`lantern-notify.mjs` and `lantern-session.mjs` for the full design; the short
+version:
+
+- **On by default.** `CLAUDE_ASYNC_LANTERN=0` turns it off entirely. A machine
+  with no AgentGlass running gets one quick, silently-logged connection
+  failure per job (to `err.log`, never to the job's own stdout) — the first
+  failed call disables the rest for that job, so it never retries or spams.
+- **Port**: `CLAUDE_ASYNC_LANTERN_PORT` overrides it; otherwise the port
+  AgentGlass last published at `~/.config/agentglass/port` wins, falling back
+  to 4000. The host is always the literal `127.0.0.1` and is never
+  configurable.
+- **Session id**: the Claude Code CLI runs in plain `-p` text mode (no
+  `--output-format json`), so there is no API for this — `job-runner.mjs`
+  instead watches `~/.claude/projects/<escaped-cwd>/` for the one new
+  transcript file the CLI's own process writes, and reads its `sessionId`.
+  This is undocumented upstream behavior, inferred from this machine's own
+  `~/.claude/projects`; it fails closed (never guesses) when it can't confirm
+  a match, or when two jobs race in the same cwd. **Container jobs never get
+  a session id** — their CLI runs inside an isolated container whose
+  `~/.claude/projects` the host can't see — so their Lantern line can only be
+  cleared by a person (AgentGlass's `done` path requires a session; see
+  `agentboard.ts`'s `forgetAgent`). A host job that never resolves one (slow
+  CLI startup past the ~20s watch window) has the same limitation.
+- **node:http, not `fetch()`.** On at least one machine (Windows, Node
+  24.19.0), three or more `fetch()` calls in one process followed by
+  `process.exit()` reliably crash with `Assertion failed:
+  !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c, line 94` —
+  reproduced with nothing but three sequential `await fetch(...)` calls
+  against a local server. A job can easily make 2-3 Lantern calls (start,
+  a repost, done) in the same process as `discord-notify.mjs`'s own `fetch()`
+  call, so `lantern-notify.mjs` uses `node:http.request()` instead, which
+  does not trigger it (and never follows a redirect, for free).
+- **Test isolation.** This machine runs a real local AgentGlass; any test
+  that spawns `job-runner.mjs` without `CLAUDE_ASYNC_LANTERN_PORT` would
+  otherwise post to the real board. `lantern-notify.mjs` refuses to fall
+  through to the real default destination while `CLAUDE_ASYNC_TEST`/
+  `NODE_TEST_CONTEXT` is set, unless an explicit destination was given —
+  the same belt-and-suspenders discord-notify.mjs already uses, for the
+  same reason (2026-10-18 test-isolation incident, see its header).
+- **The job's own prompt** gets one line prepended (`lantern-preamble.mjs`,
+  `withLanternPreamble()`) telling the agent the runner reports Lantern
+  status and to ignore any hook instruction telling it to `curl` its own —
+  the CLI's eyes only; the card title and `meta.json`'s prompt preview still
+  show the caller's original prompt untouched.
+
 ## Multi-host dispatch (`feat/multihost`)
 
 Design and config are in README's "Multi-host" section. Operational notes:

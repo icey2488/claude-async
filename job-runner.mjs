@@ -110,6 +110,8 @@ import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG
 import { createMinter } from "./github-app.mjs";
 import { acquireRunnerLock } from "./runner-lock.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
+import { lanternEnabled, postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta } from "./lantern-notify.mjs";
+import { watchForSessionId } from "./lantern-session.mjs";
 
 const specPath = process.argv[2];
 if (!specPath) process.exit(2);
@@ -253,6 +255,55 @@ function writeHeartbeat() {
 // the child's captured output.
 const outFd = fs.openSync(out, "a");
 const errFd = fs.openSync(err, "a");
+
+// ------------------------------------------------------------- Lantern telemetry (AgentGlass) ---
+//
+// Best-effort status reporting to AgentGlass's local Lantern board, strictly on this runner's own
+// behalf -- see lantern-notify.mjs/lantern-session.mjs for the networking/discovery and
+// lanternPreamble's header for why the job's own prompt no longer needs to do this itself.
+// Failures never touch out.log/err.log via the job's own fds, never change exitInfo/exit_code,
+// and the very first failure (connection refused when AgentGlass isn't running, a timeout, ...)
+// silences every later call for this job -- one quiet attempt per job on a machine without
+// AgentGlass, not a repeated one per status change. CLAUDE_ASYNC_LANTERN=0 disables it entirely.
+const metaPath = path.join(path.dirname(specPath), "meta.json");
+// Host jobs: the job dir's own name (job-core.mjs's `path.basename(p.d)`, e.g.
+// "claunker.fix-bug-20260925-k3v9x0qa") -- already the short, recognizable kebab slug the board
+// asks for, and available immediately (unlike meta.json's `intent`, written later -- see below).
+// Container jobs: spec.container.jobId is the same thing, carried separately because launchCwd
+// (the docker client's own cwd) is the job dir, not a workFolder a person would recognize.
+const lanternName = containerSpec ? (containerSpec.jobId || path.basename(path.dirname(specPath))) : path.basename(path.dirname(specPath));
+let lanternAlive = lanternEnabled();
+let lanternSession = "";
+let lanternDoing = "";
+let stopLanternIntentWatch = null;
+let stopLanternSessionWatch = null;
+function lanternLog(msg) { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} }
+// Fire-and-forget: must never delay job start or exit. postLanternStatus/postLanternDone never
+// reject (every failure is caught inside them), so this never needs a .catch of its own.
+function lanternPost() {
+  if (!lanternAlive) return;
+  postLanternStatus({
+    name: lanternName, doing: lanternDoing,
+    worktree: containerSpec ? "" : (cwd || ""),
+    session: lanternSession, logLine: lanternLog,
+  }).then((r) => { if (!r.ok) lanternAlive = false; });
+}
+if (lanternAlive) {
+  lanternPost(); // the start post -- doing/session are usually still unknown at this point
+  // meta.json's `intent` (job-core writes meta.json only after launching this runner and minting
+  // a card, so it is very often not there yet): repost once it appears, carrying whatever doing
+  // text the dispatcher gave this job.
+  stopLanternIntentWatch = pollUntil(() => readIntentFromMeta(metaPath), { intervalMs: 300, timeoutMs: 8000,
+    onFound: (intent) => { lanternDoing = intent; lanternPost(); } });
+  // The CLI's own session id, when this is a host job with a real cwd (see lantern-session.mjs's
+  // header for why container jobs can never get one: their CLI runs inside an isolated container
+  // whose ~/.claude/projects the host can't see). Started here, BEFORE `child = spawn(...)` below
+  // (container jobs mint a token first; host jobs spawn immediately after this), so its directory
+  // snapshot predates the file the CLI is about to create.
+  if (!containerSpec && cwd) {
+    stopLanternSessionWatch = watchForSessionId({ cwd, onFound: (id) => { lanternSession = id; lanternPost(); } });
+  }
+}
 
 // Exit record: written to its OWN file (exit.json, next to meta.json), never merged into
 // meta.json. meta.json already has a writer (job-core), and a second, independent
@@ -665,6 +716,23 @@ async function finish(code) {
       logLine: (msg) => { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} },
     });
   } catch {}
+  // Lantern: stop both watchers (a found session/intent after this point would just be wasted
+  // work) and clear this job's line. Every exit path reaches here through this one finish(), so
+  // this covers completed, failed, spawn-error, signal, and every container stop reason the same
+  // way the Discord ping above does. Awaited (its own LANTERN_TIMEOUT_MS bounds the wait) so the
+  // process does not exit mid-request, same reasoning as the Discord ping; nothing here can
+  // change `code` or any file already written above.
+  if (stopLanternIntentWatch) stopLanternIntentWatch();
+  if (stopLanternSessionWatch) stopLanternSessionWatch();
+  if (lanternAlive) {
+    if (lanternSession) {
+      try { await postLanternDone({ name: lanternName, session: lanternSession, logLine: lanternLog }); } catch {}
+    } else {
+      lanternLog("lantern: no session id was resolved for this job, so its Lantern line cannot be " +
+        "cleared (the board's done path requires one); it will age out on its own after 14 days, or a " +
+        "person can clear it by hand");
+    }
+  }
   try { fs.closeSync(outFd); } catch {}
   try { fs.closeSync(errFd); } catch {}
   process.exit(0);
