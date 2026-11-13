@@ -272,6 +272,11 @@ const metaPath = path.join(path.dirname(specPath), "meta.json");
 // Container jobs: spec.container.jobId is the same thing, carried separately because launchCwd
 // (the docker client's own cwd) is the job dir, not a workFolder a person would recognize.
 const lanternName = containerSpec ? (containerSpec.jobId || path.basename(path.dirname(specPath))) : path.basename(path.dirname(specPath));
+// Test-only escape hatch: a job's own spec.json, never an env var, so it can never leak to a job
+// this runner wasn't told about. job-core.mjs (the only production writer of spec.json) never
+// sets this field; only test harnesses that author their own spec.json directly do (see
+// lantern-notify.mjs's "Test isolation" header note). undefined for every real job.
+const lanternServer = typeof spec.lanternServer === "string" ? spec.lanternServer : undefined;
 let lanternAlive = lanternEnabled();
 let lanternSession = "";
 let lanternDoing = "";
@@ -285,7 +290,7 @@ function lanternPost() {
   postLanternStatus({
     name: lanternName, doing: lanternDoing,
     worktree: containerSpec ? "" : (cwd || ""),
-    session: lanternSession, logLine: lanternLog,
+    session: lanternSession, server: lanternServer, logLine: lanternLog,
   }).then((r) => { if (!r.ok) lanternAlive = false; });
 }
 if (lanternAlive) {
@@ -726,7 +731,7 @@ async function finish(code) {
   if (stopLanternSessionWatch) stopLanternSessionWatch();
   if (lanternAlive) {
     if (lanternSession) {
-      try { await postLanternDone({ name: lanternName, session: lanternSession, logLine: lanternLog }); } catch {}
+      try { await postLanternDone({ name: lanternName, session: lanternSession, server: lanternServer, logLine: lanternLog }); } catch {}
     } else {
       lanternLog("lantern: no session id was resolved for this job, so its Lantern line cannot be " +
         "cleared (the board's done path requires one); it will age out on its own after 14 days, or a " +

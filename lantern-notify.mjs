@@ -28,14 +28,23 @@
  * start post), because job-runner.mjs stops calling this module for the rest of that job the
  * first time a post fails -- see its lanternPost() wrapper.
  *
- * Test isolation: the same incident discord-notify.mjs guards against (2026-10-18 test-isolation
- * incident, see its header) applies here unchanged -- a job-runner.mjs child spawned by a test
- * inherits this machine's real environment, and on a machine that actually runs AgentGlass (this
- * one does; D:\code\agentglass is a live local install) a test posting with no explicit
- * destination would land on Erick's real Lantern board. postLanternStatus/postLanternDone refuse
- * to fall through to the real default destination while CLAUDE_ASYNC_TEST/NODE_TEST_CONTEXT is
- * set UNLESS the caller gave an explicit `server` or CLAUDE_ASYNC_LANTERN_PORT -- a test server a
- * test deliberately pointed at (lantern-runner.test.mjs) still goes through.
+ * Test isolation (2026-11-13 live-board incident: node job-runner.mjs children spawned by tests
+ * with no Lantern-specific setup at all -- e.g. test/runner-lock.test.mjs's `job1`, `job2`, ... --
+ * posted real start lines to Erick's board, because the destination is loopback:4000 by default,
+ * which is exactly AgentGlass's own default port; config-dir isolation (CLAUDE_ASYNC_CONFIG_DIR)
+ * does nothing for Lantern, since resolveLanternPort() never reads it):
+ * postLanternStatus/postLanternDone refuse to fall through to the real default destination
+ * whenever CLAUDE_ASYNC_TEST/NODE_TEST_CONTEXT is set (isTestMode(), from discord-notify.mjs) --
+ * UNLESS the caller passed an explicit `server` argument. This is a function parameter only, never
+ * an env var: CLAUDE_ASYNC_LANTERN_PORT (the one documented operator knob, for a human pointing
+ * their own real AgentGlass at a non-default port) does NOT exempt the block any more -- it used
+ * to, and that was the hole test/multihost/lantern-runner.test.mjs's integration tests fell through
+ * via the ambient env, which every *other* test-spawned job-runner.mjs child also inherits for
+ * free. A test that needs job-runner.mjs (a separate OS process) to hit its own fake server now
+ * writes a `lanternServer` field into the job's own spec.json instead (see job-runner.mjs) --
+ * something only that one test's spec.json ever contains, never ambient, never leaked across jobs.
+ * No test has to remember to opt out: the default is "blocked" for every job-runner.mjs child
+ * started during a test run, whether or not that test has ever heard of Lantern.
  *
  * Only the fields named in postLanternStatus/postLanternDone's own parameter lists ever leave
  * this process: name, doing, worktree, session, done. Never the prompt, environment, or file
@@ -137,10 +146,11 @@ function postJson(url, body, { timeoutMs = LANTERN_TIMEOUT_MS, logLine, httpImpl
 }
 
 // See the header's "Test isolation" note: true when a caller is about to fall through to the
-// REAL default destination (no explicit `server`, no CLAUDE_ASYNC_LANTERN_PORT) while a test
-// harness's env markers are set.
+// REAL default destination (no explicit `server`) while a test harness's env markers are set.
+// CLAUDE_ASYNC_LANTERN_PORT deliberately does NOT exempt this -- an env var can't be the gate,
+// since every job-runner.mjs child a test spawns inherits the same ambient environment.
 function blockedRealSendInTestMode(server) {
-  return !server && !process.env.CLAUDE_ASYNC_LANTERN_PORT && isTestMode();
+  return !server && isTestMode();
 }
 
 // Posts/replaces this job's status line. Only `name` is required -- AgentBoard.saidBy treats a

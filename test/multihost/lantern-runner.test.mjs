@@ -1,8 +1,9 @@
 // lantern-notify.mjs / lantern-session.mjs, wired into the REAL job-runner.mjs: integration tests
 // against a local (loopback) HTTP server standing in for AgentGlass, with no fakes inside
-// job-runner.mjs itself -- only CLAUDE_ASYNC_LANTERN / CLAUDE_ASYNC_LANTERN_PORT (real,
-// documented knobs, same tier as discord-notify's notify.json) point it at the test server
-// instead of a real AgentGlass install.
+// job-runner.mjs itself. CLAUDE_ASYNC_LANTERN (the real, documented off-switch) still works via
+// env; pointing the runner at the test server, instead of a real AgentGlass install, goes through
+// spec.json's own `lanternServer` field (see job-runner.mjs) -- a per-job parameter only this
+// test's own spec.json carries, never an env var every spawned job-runner.mjs would inherit.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -12,6 +13,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP } from "./_setup.mjs";
 import { projectDirNameForCwd, claudeProjectsDir } from "../../lantern-session.mjs";
+import { LANTERN_HOST, resolveLanternPort } from "../../lantern-notify.mjs";
 
 after(cleanupTmp);
 
@@ -37,6 +39,15 @@ function prepareJob({ sleepMs = 0, exitCode = 0 } = {}) {
     jobId: `lantern-job-${id}`, pid: 1, status: "running", startedAt: new Date().toISOString(),
   }));
   return { dir, cwd, jobId: path.basename(dir) };
+}
+
+// Patches spec.json with the test's own fake-AgentGlass URL -- the only channel that lets a
+// spawned job-runner.mjs child skip the test-mode block (see lantern-notify.mjs); never an env var.
+function setLanternServer(dir, url) {
+  const p = path.join(dir, "spec.json");
+  const spec = JSON.parse(fs.readFileSync(p, "utf8"));
+  spec.lanternServer = url;
+  fs.writeFileSync(p, JSON.stringify(spec));
 }
 
 function addIntent(dir, intent) {
@@ -91,7 +102,8 @@ test("off switch: CLAUDE_ASYNC_LANTERN=0 means no requests are ever made", async
   const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
   const { server, requests } = startServer();
   const port = await listen(server);
-  const { code } = await spawnRunner(dir, { CLAUDE_ASYNC_LANTERN: "0", CLAUDE_ASYNC_LANTERN_PORT: String(port) });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const { code } = await spawnRunner(dir, { CLAUDE_ASYNC_LANTERN: "0" });
   await close(server);
   assert.equal(code, 0);
   assert.equal(requests.length, 0);
@@ -106,7 +118,8 @@ test("on + reachable: start post, session discovered mid-run, done clears the li
   const { server, requests } = startServer();
   const port = await listen(server);
   const sessionId = "11111111-2222-3333-4444-555555555555";
-  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(port) });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, {});
   // Give the start post a moment to land before planting the transcript, so the test also
   // exercises the "doing/session still unknown" shape of the very first post.
   await new Promise((r) => setTimeout(r, 500));
@@ -136,7 +149,8 @@ test("meta.json's intent, written after the runner starts, is picked up and repo
   const { dir } = prepareJob({ sleepMs: 3000, exitCode: 0 });
   const { server, requests } = startServer();
   const port = await listen(server);
-  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(port) });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, {});
   await new Promise((r) => setTimeout(r, 400));
   addIntent(dir, "investigate the flaky test");
   await runnerDone;
@@ -150,12 +164,48 @@ test("connection refused is silent: job still completes, nothing lantern-related
   const port = probe.address().port;
   await new Promise((r) => probe.close(r));
   const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
-  const { code } = await spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(port) });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const { code } = await spawnRunner(dir, {});
   assert.equal(code, 0);
   const out = fs.readFileSync(path.join(dir, "out.log"), "utf8");
   assert.doesNotMatch(out, /lantern/i, "a telemetry failure must never reach the job's own stdout");
   const err = fs.readFileSync(path.join(dir, "err.log"), "utf8");
   assert.match(err, /lantern/i, "the failure is still visible in the job dir's own diagnostic log");
+});
+
+// 2026-11-13 live-board incident guard: a fake job spawned exactly like a test that has never
+// heard of Lantern (no lanternServer in spec.json, no CLAUDE_ASYNC_LANTERN* env) must never reach
+// the port AgentGlass's own default would resolve to -- a decoy listener stands in for the real
+// board and must receive zero requests. If something on this machine already owns that port
+// (most likely the real local AgentGlass, exactly the thing this guard exists to protect), the
+// bind itself fails and this test is skipped rather than silently passing or risking a false pass
+// against the real board.
+test("decoy-listener guard: a job that never configured Lantern at all makes zero requests to the default destination", async () => {
+  const port = resolveLanternPort();
+  const decoy = http.createServer((req, res) => { res.writeHead(200); res.end("ok"); });
+  let bound = true;
+  await new Promise((resolve) => {
+    decoy.once("error", () => { bound = false; resolve(); });
+    decoy.listen(port, LANTERN_HOST, resolve);
+  });
+  if (!bound) {
+    console.log(`SKIP: something is already listening on ${LANTERN_HOST}:${port} (likely the real ` +
+      "AgentGlass) -- can't bind the decoy, so this run relies solely on the structural fix " +
+      "(no fallthrough to the default destination in test mode without an explicit server).");
+    return;
+  }
+  const decoyHits = [];
+  decoy.on("request", (req) => decoyHits.push(req.url));
+  try {
+    const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
+    // No setLanternServer call, no CLAUDE_ASYNC_LANTERN* env -- exactly the shape of every other
+    // test in this repo that spawns job-runner.mjs without ever thinking about Lantern.
+    const { code } = await spawnRunner(dir, {});
+    assert.equal(code, 0);
+    assert.equal(decoyHits.length, 0, `expected zero requests to the default Lantern destination, got ${decoyHits.length}`);
+  } finally {
+    await new Promise((r) => decoy.close(r));
+  }
 });
 
 test("a redirect from the Lantern server is never followed", async () => {
@@ -167,7 +217,8 @@ test("a redirect from the Lantern server is never followed", async () => {
   });
   const port = await listen(server);
   const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
-  const { code } = await spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(port) });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const { code } = await spawnRunner(dir, {});
   await close(server);
   await close(targetServer);
   assert.equal(code, 0);

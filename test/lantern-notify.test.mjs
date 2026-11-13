@@ -90,6 +90,32 @@ test("lanternServerUrl: always the literal loopback host, whatever the port", ()
 });
 
 // ---------------------------------------------------------------------------
+// Test-mode real-send guard (2026-11-13 live-board incident: fake jobs from the test suite
+// reached Erick's real AgentGlass board -- see lantern-notify.mjs's "Test isolation" header note)
+// ---------------------------------------------------------------------------
+
+test("postLanternStatus/postLanternDone: the default destination is never dialed under test mode, even with CLAUDE_ASYNC_LANTERN_PORT set to the real default", async () => {
+  // This file always runs under `node --test`, so isTestMode() is already true here -- the same
+  // condition every job-runner.mjs child spawned by any test inherits. A throwing httpImpl proves
+  // the block fires BEFORE any socket is touched, not merely that a response gets ignored.
+  const throwingHttp = { request: () => { throw new Error("must never dial the default Lantern destination in test mode"); } };
+  process.env.CLAUDE_ASYNC_LANTERN_PORT = String(DEFAULT_LANTERN_PORT); // must NOT unblock the send
+  const r1 = await postLanternStatus({ name: "job-x", httpImpl: throwingHttp });
+  assert.deepEqual(r1, { ok: false, skipped: "test mode" });
+  const r2 = await postLanternDone({ name: "job-x", session: "s-1", httpImpl: throwingHttp });
+  assert.deepEqual(r2, { ok: false, skipped: "test mode" });
+});
+
+test("postLanternStatus: an explicit `server` parameter is the only thing that still gets through under test mode", async () => {
+  const { server, requests } = startServer();
+  const base = await listen(server);
+  const r = await postLanternStatus({ name: "job-x", server: base });
+  await close(server);
+  assert.equal(r.ok, true);
+  assert.equal(requests.length, 1, "an explicit server parameter is never blocked, even in test mode");
+});
+
+// ---------------------------------------------------------------------------
 // postLanternStatus / postLanternDone
 // ---------------------------------------------------------------------------
 
