@@ -24,7 +24,7 @@ import { queryJobMembershipOnce } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 import { withdrawTicket } from "./launcher-claim.mjs";
 import { resolveCaps, parseDepth, checkDepth, checkCaps, withStartLock, recentStarts, recordStart,
-         DEPTH_ENV, PROFILES, DEFAULT_PROFILE, PROFILE_ENV, isProfile, checkProfile } from "./guard.mjs";
+         DEPTH_ENV, PROFILES, DEFAULT_PROFILE, PROFILE_ENV, JOB_ID_ENV, isProfile, checkProfile } from "./guard.mjs";
 import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage, buildContainerSettings,
          buildContainerCliArgv, buildDockerRunArgv, cleanupJobContainers, readEnvFileSecretValues, readTokenFileSecretValues,
          redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME,
@@ -249,24 +249,32 @@ function quotedPosixPath(p) {
   return `"${p.replace(/\\/g, "/")}"`;
 }
 
-// Absolute path to tools/http-get-loopback.mjs and ops-actions/run.mjs, in both path-separator
-// spellings a job's own Bash or PowerShell call might use (a literal backslash path, the way
-// Windows shells render one, and the forward-slash spelling node accepts natively and a job might
-// type verbatim). Prefix rules match literal typed text, so both spellings need their own rule.
+// Absolute path to the wrapper scripts a safe-mode job may call directly (tools/http-get-loopback.mjs,
+// tools/git-ro.mjs, tools/ollama-generate.mjs), in both path-separator spellings a job's own Bash or
+// PowerShell call might use (a literal backslash path, the way Windows shells render one, and the
+// forward-slash spelling node accepts natively and a job might type verbatim). Prefix rules match
+// literal typed text, so both spellings need their own rule.
 const LOOPBACK_HELPER_SCRIPT = path.join(REPO_DIR, "tools", "http-get-loopback.mjs");
-const OPS_ACTION_RUNNER_SCRIPT = path.join(REPO_DIR, "ops-actions", "run.mjs");
+const GIT_RO_SCRIPT = path.join(REPO_DIR, "tools", "git-ro.mjs");
+const OLLAMA_GENERATE_SCRIPT = path.join(REPO_DIR, "tools", "ollama-generate.mjs");
 const bothSlashSpellings = (p) => [p, p.replace(/\\/g, "/")];
 
 // Job-scoped permissions.allow/deny for --permission-mode dontAsk (SAFE_PERMISSIONS_ENV_DEFAULT
-// above), now split by PROFILE (safe-mode-profiles, 2026-11-09/2026-11-12, guard.mjs's PROFILES):
-//   - "readonly": Read/Glob/Grep/WebSearch, read-only git, the read-only PowerShell cmdlets below,
-//     version-only gh/claude checks, and the loopback GET helper. NO Edit/Write/MultiEdit/
-//     NotebookEdit, no interpreter/code-runner prefixes (node/python/npm/pytest/uv/mkdir), and no
-//     git subcommand that mutates the working tree, refs, or config.
+// above), split by PROFILE (safe-mode-profiles, 2026-11-09/2026-11-12/2026-11-13, guard.mjs's
+// PROFILES -- exactly ["readonly", "code"]; see guard.mjs's header for why "ops" was removed):
+//   - "readonly": Read/Glob/Grep/WebSearch, the tools/git-ro.mjs wrapper (a tight allowlist of
+//     read-only git subcommands and flags -- see that file's header for why raw `git ...` prefixes
+//     cannot be allow-listed safely at all, even "read-only" ones), the read-only PowerShell
+//     cmdlets below, version-only gh/claude checks, the loopback GET helper, and the
+//     tools/ollama-generate.mjs wrapper. NO Edit/Write/MultiEdit/NotebookEdit, no raw `git`
+//     subcommand of any kind, and no interpreter/code-runner prefix (node/python/npm/pytest/uv/
+//     mkdir) -- see decision A above (and guard.mjs's header) for why this is a tool-level
+//     allowlist, not an OS sandbox: it is accident protection on this host, not a boundary against
+//     a job that chooses to write and run its own script.
 //   - "code" (DEFAULT_PROFILE, matches the only profile that existed before this feature): the
-//     above plus file editing, the dev-tool runners, and the write-capable git subcommands.
-//   - "ops": "code" plus ops-actions/run.mjs, the only path to the two named operational actions
-//     (see that file's header).
+//     above plus file editing, the dev-tool runners, raw git (read and write subcommands alike --
+//     a "code" job can already run arbitrary node/python, so a tighter git wrapper buys nothing
+//     there), and the write-capable git subcommands.
 // NOT a substitute for the job-tool-gate hook's per-call review; the two are complementary layers
 // (see docs/publishing.md's rollout section). The deny list (the SAME for every profile -- it is
 // the floor, never loosened by profile) is deliberately the belt to the gate hook's suspenders: a
@@ -277,6 +285,16 @@ const bothSlashSpellings = (p) => [p, p.replace(/\\/g, "/")];
 export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   const resolvedProfile = isProfile(profile) ? profile : DEFAULT_PROFILE;
 
+  // Raw git for "code" only (2026-11-13 review round: a reviewer-demonstrated set of raw `git ...`
+  // allow rules -- including ones that LOOK read-only, like `git log -1 --output=file`,
+  // `git diff --no-index NUL <any file>`, `git fetch --upload-pack=...`, `git show REV:path
+  // --ext-diff` -- all let "readonly" write a file, read an arbitrary untracked file, or exfiltrate
+  // to an attacker-controlled upload-pack/remote. Prefix matching on argv text cannot express "but
+  // not with --output/--no-index/--ext-diff/--textconv/--upload-pack/-c/-C"; tools/git-ro.mjs's own
+  // per-subcommand flag ALLOWLIST is readonly's only path to git. "code" keeps raw git -- unchanged
+  // from before this fix -- because a "code" job can already run arbitrary node/python, so the
+  // wrapper would add verification overhead with no real boundary to show for it.
+  //
   // Every prefix below that previously had no space before its trailing "*" (git status*, git
   // diff*, ...) is word-boundary-unsafe: Claude Code's own docs give "Bash(ls *)" (space before
   // the star) specifically so the rule does not also match an unrelated command sharing the same
@@ -286,15 +304,6 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   // *" since that requires a literal trailing space). So every one of these git prefixes below is
   // listed TWICE: once as an exact string (matches the bare command only) and once with a trailing
   // " *" (matches the command plus arguments), which is boundary-safe and still covers both shapes.
-  // `git ls-files` and `git worktree list` are new (ITEM 1): both are read-only and safe in every
-  // profile, including `readonly`. `git branch` (bare, no flags) and `git remote` (bare) are also
-  // read-only (they list, they don't create/add) -- `git branch <name>` (create) and
-  // `git remote add/remove/set-url` (mutate .git/config) need an argument that isn't a bare
-  // invocation, so they are deliberately left off this read-only set and only reachable through
-  // WRITE_GIT_PREFIXES below (code/ops only). `git branch -a`/`-v` and friends are NOT added here:
-  // flag-only forms share no fixed literal prefix with `--list`, and some branch flags (`-m`/`-M`,
-  // move/rename) mutate -- a known, deliberately left residual gap, same as the flag-order gaps
-  // SHELL_DENY_PREFIXES already documents below.
   const READ_GIT_EXACT = [
     "git status", "git diff", "git log", "git show", "git rev-parse", "git describe",
     "git fetch", "git ls-files", "git branch", "git branch --list", "git worktree list",
@@ -306,10 +315,9 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   ];
   const READ_GIT_PREFIXES = [...READ_GIT_EXACT, ...READ_GIT_SPACED];
 
-  // Write-capable git subcommands (code/ops only). Already word-boundary-safe (space before the
-  // star) from the 2026-10-21 rehearsal; unchanged here except `git branch *`/`git remote *` added
-  // back (the broader, mutation-capable forms the READ_GIT set above deliberately excludes) so
-  // code/ops jobs keep exactly the branch-create/remote-add capability they had before this split.
+  // Write-capable git subcommands ("code" only). Already word-boundary-safe (space before the
+  // star) from the 2026-10-21 rehearsal; `git branch *`/`git remote *` admit the broader,
+  // mutation-capable forms the read-only set above deliberately excludes.
   const WRITE_GIT_PREFIXES = [
     "git add *", "git commit *", "git checkout *", "git worktree *",
     // git switch (2026-10-21 safe-perms-finish task 3): the modern equivalent of
@@ -318,7 +326,7 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
     // normal branch operation a job should be able to do.
     "git switch *", "git branch *", "git remote *",
   ];
-  // Interpreters/code-runners and mkdir (code/ops only; ABSENT from readonly on purpose -- a
+  // Interpreters/code-runners and mkdir ("code" only; ABSENT from readonly on purpose -- a
   // "readonly" profile should not get bare interpreter/runner access either, since those can write
   // files just as easily as Edit/Write can). Unchanged from the single-profile set (2026-10-21
   // rehearsal: mkdir was added there because Claude Code decomposes a `&&`-joined compound command
@@ -343,38 +351,25 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
     "git branch -D*", "git branch --delete --force*", "git branch --force --delete*",
     "git checkout -- *", "git checkout .*", "git checkout -f*",
     "git switch -f*", "git switch --force*", "git switch --discard-changes*",
+    // "code" profile accident guards (2026-11-13 review round, decision A): these are belt
+    // protection against an ACCIDENTAL destructive call, same spirit as the forms just above, not a
+    // boundary against a job that writes its own script to do the same thing (decision A).
+    "git worktree remove --force*", "git worktree remove -f*", "git checkout --force*",
   ];
   const forShells = (prefixes) => prefixes.flatMap((p) => [`Bash(${p})`, `PowerShell(${p})`]);
 
-  // Local-model delegation (CLAUDE.md's "local model delegation (Ollama)" section): the two exact
-  // URLs CLAUDE.md names for the resident qwen2.5-coder:7b model. Deliberately NOT a broad
-  // "curl *" or "Invoke-RestMethod *" rule -- see OLLAMA_GUARD_HOOK_SCRIPT's comment above and
-  // hooks/ollama-guard-hook.mjs's header for why the trailing wildcard here (needed for -d/-Method/
-  // -Body args, which vary every call) is only safe in combination with that hook, which denies
-  // any call that smuggles a second URL, a userinfo "@" host trick, a file-writing/upload/config
-  // flag, or shell chaining into the same allowed prefix. Invoke-RestMethod/Invoke-WebRequest
-  // rules require the URI as the FIRST positional argument (`Invoke-RestMethod http://... -Method
-  // Post ...`), not a later `-Uri` flag -- a narrower rule than ollama-guard-hook.mjs alone would
-  // require, chosen because allowing the URI in any argument position would mean the static prefix
-  // itself could no longer anchor on the fixed host/port, re-opening the same gap. `ollama run`/
-  // `generate`/`list`/`ps`/`show` cover the CLI alternative CLAUDE.md also names; that path has no
-  // URL of its own for a bypass to hide in. Available in EVERY profile, including readonly -- it's
-  // a fixed, validated local inference call, not a general network or write capability.
-  const OLLAMA_ALLOW_PREFIXES = [
-    "curl http://127.0.0.1:11434/api/generate", "curl http://localhost:11434/api/generate",
-    "Invoke-RestMethod http://127.0.0.1:11434/api/generate", "Invoke-RestMethod http://localhost:11434/api/generate",
-    "Invoke-WebRequest http://127.0.0.1:11434/api/generate", "Invoke-WebRequest http://localhost:11434/api/generate",
-    "ollama run ", "ollama generate ", "ollama list", "ollama ps", "ollama show ",
-  ];
-
   // Read-only PowerShell cmdlets (safe-mode-profiles ITEM 1, 2026-11-09 denial tally §F: these were
   // badly underprovisioned -- Get-ScheduledTask/Get-NetTCPConnection/Get-CimInstance alone accounted
-  // for 3 of 13 tallied denials). Every one of these only reads state; none can write a file, run
-  // arbitrary code, or read file CONTENTS (Get-Item returns metadata, not a file's bytes). Available
-  // in every profile, including readonly. `Get-Content` is deliberately NOT in this list -- see
-  // ITEM 2 below for why it is excluded from every profile, not narrowed per-profile.
+  // for 3 of 13 tallied denials). Every one of these only reads state; none can write a file or run
+  // arbitrary code. Available in every profile, including readonly. `Get-Content` is NOT in this
+  // list (ITEM 2 -- it returns file CONTENTS, which must go through the Read tool's own deny rules
+  // instead). `Get-Item`/`Get-ChildItem` are ALSO deliberately absent (2026-11-13 review round,
+  // fix 3): `Get-Item Env:NAME` / `Get-ChildItem Env:` print environment variable VALUES (including
+  // secrets), which is metadata in the filesystem-path sense these cmdlets were allow-listed for
+  // but not in the sense that matters here. Glob/Read already cover directory listing and file
+  // metadata for a safe-mode job; neither can print an environment variable's value.
   const READONLY_CMDLETS = [
-    "Get-ChildItem", "Get-Item", "Get-ScheduledTask", "Get-ScheduledTaskInfo", "Get-NetTCPConnection",
+    "Get-ScheduledTask", "Get-ScheduledTaskInfo", "Get-NetTCPConnection",
     "Get-CimInstance", "Get-Process", "Get-Service", "Test-Path", "Get-Date", "Get-FileHash", "Resolve-Path",
   ];
   const READONLY_CMDLET_ALLOW = READONLY_CMDLETS.flatMap((c) => [`PowerShell(${c})`, `PowerShell(${c} *)`]);
@@ -391,28 +386,39 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   // rule, which DEV_TOOL_PREFIXES already withholds from readonly) -- the trailing wildcard only
   // ever needs to cover the one positional URL argument.
   const LOOPBACK_ALLOW = forShells(bothSlashSpellings(LOOPBACK_HELPER_SCRIPT).map((p) => `node ${p} *`));
-  // Ops action runner (ITEM 3): ops profile only. See ops-actions/run.mjs's header -- the script
-  // enforces CLAUDE_ASYNC_JOB_PROFILE==="ops" on itself too, but that is a convention the script
-  // follows, not a boundary this allow rule provides; see the file's own header for the honest
-  // limits of that self-check.
-  const OPS_RUNNER_ALLOW = forShells(bothSlashSpellings(OPS_ACTION_RUNNER_SCRIPT).map((p) => `node ${p} *`));
+  // Read-only git wrapper (2026-11-13 review round, fix 1): every profile's ONLY path to git that
+  // isn't raw `git ...` -- "code" also gets raw git (READ_GIT_PREFIXES/WRITE_GIT_PREFIXES below),
+  // but this wrapper is harmless there too (it can only ever do a strict subset of what raw git
+  // already allows), so it is simplest to allow-list it everywhere rather than carve it out.
+  const GIT_RO_ALLOW = forShells(bothSlashSpellings(GIT_RO_SCRIPT).map((p) => `node ${p} *`));
+  // Ollama delegation helper (2026-11-13 review round, fix 2): replaces every raw curl/
+  // Invoke-RestMethod/Invoke-WebRequest Ollama allow rule -- see tools/ollama-generate.mjs's header
+  // for why those couldn't be made safe at all (a second URL, a userinfo "@" host trick, --proxy,
+  // --data-binary @file, -OutFile/-InFile all passed the old rules AND hooks/ollama-guard-hook.mjs).
+  // `ollama list`/`ollama ps` (the CLI, not curl -- no URL of its own to smuggle a bypass into)
+  // are kept as their own word-boundary-safe exact+spaced pair, same shape as the git prefixes
+  // above; the old versions had no space before their trailing "*" (`ollama list*`/`ollama ps*`,
+  // boundary-unsafe) because a single `.map(p => p + "*")` pass was applied uniformly to every
+  // entry in the old OLLAMA_ALLOW_PREFIXES array regardless of whether the string already ended in
+  // a space.
+  const OLLAMA_GENERATE_ALLOW = forShells(bothSlashSpellings(OLLAMA_GENERATE_SCRIPT).map((p) => `node ${p} *`));
+  const OLLAMA_CLI_ALLOW = forShells(["ollama list", "ollama list *", "ollama ps", "ollama ps *"]);
 
   const baseAllow = [
     "Read", "Glob", "Grep", "WebSearch",
-    ...forShells(READ_GIT_PREFIXES),
-    ...forShells(OLLAMA_ALLOW_PREFIXES.map((p) => `${p}*`)),
+    ...GIT_RO_ALLOW,
     ...READONLY_CMDLET_ALLOW,
     ...forShells(VERSION_ONLY_ALLOW),
     ...LOOPBACK_ALLOW,
+    ...OLLAMA_GENERATE_ALLOW,
+    ...OLLAMA_CLI_ALLOW,
   ];
-  // PowerShell(Get-ChildItem *)/(Get-Item *) above already cover listing; Get-Content is
-  // deliberately excluded (ITEM 2 -- see READONLY_CMDLETS' comment).
   const allow = resolvedProfile === "readonly" ? baseAllow : [
     ...baseAllow,
     "Edit", "Write", "MultiEdit", "NotebookEdit",
+    ...forShells(READ_GIT_PREFIXES),
     ...forShells(WRITE_GIT_PREFIXES),
     ...forShells(DEV_TOOL_PREFIXES),
-    ...(resolvedProfile === "ops" ? OPS_RUNNER_ALLOW : []),
   ];
 
   return {
@@ -422,6 +428,10 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
         ...forShells(SHELL_DENY_PREFIXES),
         "Edit(//**/CLAUDE.md)", "Edit(//**/hooks/**)", "Edit(//**/.claude/settings*.json)",
         "Edit(//**/config.yaml)", "Edit(//**/scheduled-tasks/**)",
+        // "code" profile accident guard (2026-11-13 review round, decision A/fix 7): an edit inside
+        // .git/ (hooks, config, refs) is never a normal file-editing need and is easy to reach by
+        // accident via a broad Edit(//**) glob a job constructs itself.
+        "Edit(//**/.git/**)",
         // ITEM 2 (shell secret-read hole, safe-mode-profiles 2026-11-12): Read(//**/.env) below
         // denies the Claude Code READ tool against a secret file, but it has no effect on a
         // PowerShell `Get-Content .env` call -- that is a wholly different permission namespace
@@ -954,6 +964,20 @@ export function isSafeJobId(id) {
   return typeof id === "string" && id.length > 0 && id.length <= 200 && /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(id);
 }
 
+// Fix 5 (nested dispatch, 2026-11-13 review round): the AUTHORITATIVE source for "what profile is
+// job <id> actually running under", read straight from the meta.json startJob() itself wrote at
+// launch -- never from a self-reported header, which a caller can simply lie about. Returns the
+// recorded profile (one of guard.mjs's PROFILES) if `id` names a real job on THIS host with a
+// valid recorded profile, else null (unknown job, unreadable meta.json, or a meta.json predating
+// this field) -- callers fall back to a self-reported profile header in that case.
+export function readJobProfile(id) {
+  if (!isSafeJobId(id)) return null;
+  try {
+    const meta = JSON.parse(fs.readFileSync(jobPaths(id).meta, "utf8"));
+    return isProfile(meta.profile) ? meta.profile : null;
+  } catch { return null; }
+}
+
 // Resolves the Claude Code binary the way the launch path will actually find it, or null. A path
 // must be an existing file. A bare name is searched on PATH as libuv's spawn() would (as-is if it
 // already has an extension, else .com/.exe on win32), then job-launcher.mjs's resolveCommand()
@@ -1104,6 +1128,27 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (sb.mode === "host" && ((repo !== undefined && repo !== null && repo !== "") || (baseRef !== undefined && baseRef !== null && baseRef !== ""))) {
     return fail("invalid", "repo and baseRef are only for container jobs (sandbox: \"container\"); a host job runs in workFolder");
   }
+
+  // Resolved early (before any side effect, including the container preflight below) so fix 4's
+  // refuse-not-downgrade check runs before anything is written. requestedProfile/safePermissionsEnabled
+  // are reused unchanged further down -- there is exactly one source of truth for each in this function.
+  const requestedProfile = profile === undefined ? DEFAULT_PROFILE : profile;
+  const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
+  // Refuse, never downgrade (2026-11-13 review round, fix 4): "readonly" only means anything under
+  // --permission-mode dontAsk on the HOST -- a container job always runs the CLI inside the
+  // container with --dangerously-skip-permissions (the container is the boundary there, not the
+  // profile; see buildSafePermissionsSettings()'s header), and a host job with safe permissions off
+  // also runs with --dangerously-skip-permissions. Silently running a "readonly" request as
+  // unrestricted code would be worse than refusing it outright: the caller asked for a specific
+  // guarantee this launch configuration cannot provide. This also guarantees meta.json can never
+  // record profile:"readonly" for a --dangerously-skip-permissions job -- there is no path from here
+  // to the meta.json write (further down) without this check having already passed.
+  if (requestedProfile === "readonly" && (sb.mode === "container" || !safePermissionsEnabled)) {
+    return fail("profile", `profile "readonly" requires sandbox "host" and safe permissions on ` +
+      `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1); refusing to start it as an unrestricted job instead ` +
+      `(sandbox=${JSON.stringify(sb.mode)}, safePermissions=${safePermissionsEnabled}); no job started`);
+  }
+
   // Container mode: validate the repo name, secrets file, config, docker binary and image now,
   // before anything is written (see container.mjs's planContainerJob()). No host folder is
   // involved: the job clones `repo` inside the container.
@@ -1146,12 +1191,16 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (depthError) return fail("depth", depthError);
 
   // Job profile (guard.mjs's PROFILES/checkProfile): an accident guard, not a security control --
-  // see guard.mjs's header. Resolved and validated before anything is written, same as depth
-  // above. Applies identically whether this becomes a host or a container job (see the comment on
-  // extraEnv[PROFILE_ENV] below for why); only the permission SETTINGS built from it are host-only
-  // today (buildSafePermissionsSettings() is never consulted on the container path).
-  const requestedProfile = profile === undefined ? DEFAULT_PROFILE : profile;
-  const profileError = checkProfile(d.depth, requestedProfile, process.env);
+  // see guard.mjs's header. requestedProfile/safePermissionsEnabled were already resolved above
+  // (fix 4's refuse-not-downgrade check needed them before the container preflight). Applies
+  // identically whether this becomes a host or a container job; only the permission SETTINGS built
+  // from it are host-only today (buildSafePermissionsSettings() is never consulted on the container
+  // path). opts.profileEnv (fix 5, nested dispatch): the AUTHORITATIVE env to read the caller's own
+  // profile from, when the caller is known (host-api.mjs resolves it from the parent job's own
+  // meta.json, or falls back to a self-reported header) -- defaults to this process's own env,
+  // which is only meaningful when startJob() is itself running inside the calling job's process
+  // (never true for a request that arrived over HTTP).
+  const profileError = checkProfile(d.depth, requestedProfile, opts.profileEnv || process.env);
   if (profileError) return fail("profile", profileError);
   const resolvedProfile = requestedProfile;
 
@@ -1189,7 +1238,6 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const jobHermesHome = hermesHomeIsolationEnabled && !containerPlan ? path.join(p.d, "hermes_home") : null;
   if (jobHermesHome) fs.mkdirSync(jobHermesHome, { recursive: true });
 
-  const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
   const argv = ["-p", prompt, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   argv.push(...(safePermissionsEnabled ? ["--permission-mode", "dontAsk"] : ["--dangerously-skip-permissions"]));
   const resolvedModel = model || DEFAULT_MODEL;
@@ -1223,14 +1271,17 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   argv.push("--settings", JSON.stringify(settingsObj));
   // The new job runs one level deeper than its caller (guard.mjs's depth accident guard).
   const extraEnv = { [DEPTH_ENV]: String(d.depth + 1) };
-  // Set on the launched process's own env regardless of sandbox mode (host or container) and
-  // regardless of whether safe permissions are even on for THIS job: a nested job this one later
-  // dispatches reads its parent's profile from here (guard.mjs's checkProfile), and ops-actions/
-  // run.mjs reads this directly to confirm it is running inside an "ops" job. Threading it through
-  // for container jobs too (even though buildSafePermissionsSettings() is never applied to the
-  // container's own CLI invocation -- see docs on that split) keeps the accident guard consistent
-  // for anything a container job itself dispatches.
+  // Set on the launched process's own env regardless of whether safe permissions are even on for
+  // THIS job: if this job itself later dispatches a nested job by forwarding a start request to
+  // another host (dispatch.mjs's forward()), that forward call reads PROFILE_ENV/JOB_ID_ENV from
+  // ITS OWN process.env to self-report this job's profile/id in the PROFILE_HEADER/JOB_ID_HEADER
+  // headers (fix 5, nested dispatch) -- but only when the forward happens to run inside THIS job's
+  // own process. A container job never reads its own env this way (it runs the bare `claude` CLI,
+  // never this repo's own dispatch.mjs), so CLAUDE_ASYNC_JOB_PROFILE is deliberately NOT forwarded
+  // into the container (container.mjs's FORWARDED_ENV_KEYS) -- nothing there reads it.
+  // CLAUDE_ASYNC_JOB_ID (JOB_ID_ENV) lets this job name itself the same way for the same reason.
   extraEnv[PROFILE_ENV] = resolvedProfile;
+  extraEnv[JOB_ID_ENV] = id;
   // CLAUDE_ASYNC_JOB_EFFORT: tells hooks/no-background-hook.mjs this job's effort level, so it
   // can gate the Workflow tool to ultracode-effort jobs without guessing (job-core.mjs is the
   // only place that knows `eff` authoritatively). Set on the launched CLI process's own

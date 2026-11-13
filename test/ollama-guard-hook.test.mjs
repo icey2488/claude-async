@@ -184,3 +184,23 @@ test("malformed hook input (no tool_name) -> deny", () => {
 test("unparseable stdin -> deny", () => {
   assertDenied("not json");
 });
+
+// --- KNOWN BLOCKED GAP (2026-11-13 review round, fix 2) -----------------------------------------
+// job-core.mjs's buildSafePermissionsSettings() now allow-lists ONLY tools/ollama-generate.mjs
+// (plus bare `ollama list`/`ollama ps`) for Ollama delegation -- every raw curl/Invoke-RestMethod/
+// Invoke-WebRequest rule was removed (see that file's OLLAMA_GENERATE_ALLOW/OLLAMA_CLI_ALLOW).
+// hooks/ollama-guard-hook.mjs was SUPPOSED to be updated in the same change to recognize
+// `node <path-to-ollama-generate.mjs> ...` as a safe shape (its command text contains "ollama",
+// so looksLikeOllamaAttempt() catches it, and without that recognition it falls through to the
+// final deny). That edit could not be made: this session's tool permissions deny Edit/Write to
+// ANY path under a `hooks/` directory (confirmed against hooks/ollama-guard-hook.mjs directly,
+// "File is in a directory that is denied by your permission settings" -- not specific to
+// ~/.claude), so the hook shipped in this PR is UNCHANGED from before this fix. The test below
+// documents the resulting (undesired) CURRENT behavior with a real assertion, rather than leaving
+// the gap undiscoverable: a job whose safe-mode settings allow the wrapper call will have it
+// DENIED by this hook before it ever reaches the static allow/deny floor. Flip this assertion
+// (assertDenied -> assertPass) once the hook can be edited to add the wrapper-call recognition
+// documented in this PR's job report.
+test("KNOWN GAP: node tools/ollama-generate.mjs ... is currently denied (hook was not updated; see PR report)", () => {
+  assertDenied(bash(`node tools/ollama-generate.mjs --model qwen2.5-coder:7b --prompt hi`));
+});

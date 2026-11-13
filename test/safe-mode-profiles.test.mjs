@@ -20,7 +20,7 @@ delete process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS; // pin the env-var default
 const core = await import("../job-core.mjs");
 const guard = await import("../guard.mjs");
 const { startJob, buildSafePermissionsSettings, buildDenialGuidanceText } = core;
-const { PROFILES, DEFAULT_PROFILE, PROFILE_ENV, isProfile, checkProfile } = guard;
+const { PROFILES, DEFAULT_PROFILE, PROFILE_ENV, JOB_ID_ENV, isProfile, checkProfile } = guard;
 
 const WORK_FOLDER = os.tmpdir();
 
@@ -41,13 +41,14 @@ const jid = (label) => `profiles-${label}-${crypto.randomBytes(3).toString("hex"
 
 // ---------------------------------------------------------------- guard.mjs: PROFILES/checkProfile
 
-test("guard.mjs: PROFILES is exactly readonly/code/ops, DEFAULT_PROFILE is code", () => {
-  assert.deepEqual(PROFILES, ["readonly", "code", "ops"]);
+test("guard.mjs: PROFILES is exactly readonly/code, DEFAULT_PROFILE is code", () => {
+  assert.deepEqual(PROFILES, ["readonly", "code"]);
   assert.equal(DEFAULT_PROFILE, "code");
 });
 
-test("guard.mjs: isProfile rejects anything outside PROFILES", () => {
+test("guard.mjs: isProfile rejects anything outside PROFILES, including the removed \"ops\"", () => {
   for (const p of PROFILES) assert.ok(isProfile(p));
+  assert.ok(!isProfile("ops"));
   assert.ok(!isProfile("bogus"));
   assert.ok(!isProfile(undefined));
   assert.ok(!isProfile(42));
@@ -55,6 +56,7 @@ test("guard.mjs: isProfile rejects anything outside PROFILES", () => {
 
 test("guard.mjs: checkProfile refuses an invalid profile regardless of depth", () => {
   assert.match(checkProfile(0, "bogus"), /invalid profile/);
+  assert.match(checkProfile(0, "ops"), /invalid profile/);
 });
 
 test("guard.mjs: checkProfile at depth 0 (top-level caller) allows any valid profile", () => {
@@ -62,19 +64,23 @@ test("guard.mjs: checkProfile at depth 0 (top-level caller) allows any valid pro
 });
 
 test("guard.mjs: checkProfile refuses a nested job requesting a profile broader than its parent's", () => {
-  const err = checkProfile(1, "ops", { [PROFILE_ENV]: "readonly" });
-  assert.match(err, /nested job.*may not request profile "ops".*broader.*"readonly"/);
+  const err = checkProfile(1, "code", { [PROFILE_ENV]: "readonly" });
+  assert.match(err, /nested job.*may not request profile "code".*broader.*"readonly"/);
 });
 
 test("guard.mjs: checkProfile allows a nested job requesting its parent's own profile or narrower", () => {
   assert.equal(checkProfile(1, "readonly", { [PROFILE_ENV]: "readonly" }), null);
-  assert.equal(checkProfile(1, "code", { [PROFILE_ENV]: "ops" }), null);
-  assert.equal(checkProfile(1, "ops", { [PROFILE_ENV]: "ops" }), null);
+  assert.equal(checkProfile(1, "code", { [PROFILE_ENV]: "code" }), null);
+  assert.equal(checkProfile(1, "readonly", { [PROFILE_ENV]: "code" }), null);
 });
 
 test("guard.mjs: checkProfile treats a missing/invalid parent profile as DEFAULT_PROFILE (code)", () => {
+  // code is DEFAULT_PROFILE, so a parent that reads as code (missing, or an unrecognized string)
+  // is never "broader" than code -- there is nothing broader than DEFAULT_PROFILE left to request
+  // since "ops" was removed, so this only has a positive case to assert now.
   assert.equal(checkProfile(1, "code", {}), null);
-  assert.match(checkProfile(1, "ops", {}), /broader than its parent's profile "code"/);
+  assert.equal(checkProfile(1, "code", { [PROFILE_ENV]: "bogus" }), null);
+  assert.equal(checkProfile(1, "readonly", {}), null);
 });
 
 // ------------------------------------------------------- job-core.mjs: buildSafePermissionsSettings
@@ -84,8 +90,8 @@ function allowSet(profile) { return new Set(buildSafePermissionsSettings(profile
 test("readonly: no file-editing tools, no interpreters/code-runners, no mkdir", () => {
   const allow = allowSet("readonly");
   for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) assert.ok(!allow.has(tool), `${tool} must be absent from readonly`);
-  // A BARE interpreter prefix (e.g. "node *") must be absent -- but the fixed-path loopback
-  // helper call ("node <repo>/tools/http-get-loopback.mjs *") is legitimately present in every
+  // A BARE interpreter prefix (e.g. "node *") must be absent -- but the fixed-path wrapper calls
+  // (http-get-loopback.mjs, git-ro.mjs, ollama-generate.mjs) are legitimately present in every
   // profile, so this only rejects the bare, unscoped form, not every rule that happens to start
   // with the binary name.
   for (const shell of ["Bash", "PowerShell"]) {
@@ -96,12 +102,15 @@ test("readonly: no file-editing tools, no interpreters/code-runners, no mkdir", 
   }
 });
 
-test("readonly: git allow rules are read-only subcommands only, no broad git * prefix", () => {
-  const allow = [...allowSet("readonly")].filter((r) => r.startsWith("Bash(git ") || r.startsWith("PowerShell(git "));
-  const forbidden = /^(Bash|PowerShell)\(git (push|merge|rebase|reset|clean|add |commit |checkout |worktree (add|remove)|switch )/;
-  for (const rule of allow) assert.ok(!forbidden.test(rule), `${rule} must not admit a mutating git subcommand in readonly`);
-  // No rule is a completely unscoped "git *" that would admit anything.
-  for (const rule of allow) assert.ok(rule !== "Bash(git *)" && rule !== "PowerShell(git *)", "no unscoped git * prefix allowed");
+test("readonly: no raw git allow rule at all -- only the tools/git-ro.mjs wrapper", () => {
+  const allow = [...allowSet("readonly")];
+  const rawGit = allow.filter((r) => /^(Bash|PowerShell)\(git /.test(r));
+  assert.deepEqual(rawGit, [], `readonly must have NO raw git allow rule (even read-only-looking ones): ${JSON.stringify(rawGit)}`);
+  const wrapperRules = allow.filter((r) => r.includes("git-ro.mjs"));
+  assert.ok(wrapperRules.some((r) => r.startsWith("Bash(")) && wrapperRules.some((r) => r.startsWith("PowerShell(")),
+    "readonly must allow the git-ro.mjs wrapper via both shells");
+  assert.ok(wrapperRules.some((r) => r.includes("/")) && wrapperRules.some((r) => r.includes("\\")),
+    "git-ro.mjs wrapper rule must cover both path-separator spellings");
 });
 
 test("readonly: no allow rule admits an in-place mutator (sed -i, tee, curl -o, Out-File, Set-Content)", () => {
@@ -110,22 +119,22 @@ test("readonly: no allow rule admits an in-place mutator (sed -i, tee, curl -o, 
   for (const rule of allow) for (const re of mutators) assert.ok(!re.test(rule), `${rule} looks like a mutator and must not be in readonly's allow list`);
 });
 
-test("git fetch and git worktree list are allowed in every profile", () => {
-  for (const profile of PROFILES) {
-    const allow = allowSet(profile);
-    assert.ok(allow.has("Bash(git fetch)") && allow.has("Bash(git fetch *)"), `git fetch missing from ${profile}`);
-    assert.ok(allow.has("PowerShell(git fetch)") && allow.has("PowerShell(git fetch *)"), `git fetch (PowerShell) missing from ${profile}`);
-    assert.ok(allow.has("Bash(git worktree list)") || allow.has("Bash(git worktree list *)") || allow.has("Bash(git worktree *)"),
-      `git worktree list missing from ${profile}`);
-  }
+test("git fetch and raw git worktree list are allowed in code only, not readonly (fix 1)", () => {
+  const ro = allowSet("readonly");
+  assert.ok(!ro.has("Bash(git fetch)") && !ro.has("Bash(git fetch *)"), "raw git fetch must be absent from readonly");
+  const code = allowSet("code");
+  assert.ok(code.has("Bash(git fetch)") && code.has("Bash(git fetch *)"), "git fetch missing from code");
+  assert.ok(code.has("PowerShell(git fetch)") && code.has("PowerShell(git fetch *)"), "git fetch (PowerShell) missing from code");
+  assert.ok(code.has("Bash(git worktree list)") || code.has("Bash(git worktree list *)") || code.has("Bash(git worktree *)"),
+    "git worktree list missing from code");
 });
 
-test("git worktree add/remove are withheld from readonly but present in code and ops", () => {
+test("git worktree add/remove are withheld from readonly but present in code", () => {
   assert.ok(!allowSet("readonly").has("Bash(git worktree *)"));
-  for (const profile of ["code", "ops"]) assert.ok(allowSet(profile).has("Bash(git worktree *)"), `git worktree * missing from ${profile}`);
+  assert.ok(allowSet("code").has("Bash(git worktree *)"));
 });
 
-test("code adds file editing, write-capable git, and the dev-tool runners on top of readonly", () => {
+test("code adds file editing, raw git, and the dev-tool runners on top of readonly's base set", () => {
   const ro = allowSet("readonly");
   const code = allowSet("code");
   for (const rule of ro) assert.ok(code.has(rule), `code profile dropped a readonly rule: ${rule}`);
@@ -135,31 +144,44 @@ test("code adds file editing, write-capable git, and the dev-tool runners on top
   assert.ok(code.has("Bash(git commit *)") && code.has("Bash(git checkout *)"));
 });
 
-test("ops profile only: the ops-actions runner is allow-listed, and ONLY there", () => {
-  for (const profile of ["readonly", "code"]) {
-    const allow = allowSet(profile);
-    assert.ok(![...allow].some((r) => r.includes("ops-actions")), `ops runner must be absent from ${profile}`);
+test("ops is not a recognized profile: buildSafePermissionsSettings falls back to code for it", () => {
+  assert.deepEqual(buildSafePermissionsSettings("ops").permissions.allow, buildSafePermissionsSettings("code").permissions.allow);
+  for (const profile of PROFILES) {
+    assert.ok(![...allowSet(profile)].some((r) => r.includes("ops-actions")), `ops-actions must be absent from ${profile} (the runner was removed)`);
   }
-  const opsAllow = allowSet("ops");
-  assert.ok([...opsAllow].some((r) => r.includes("ops-actions") && r.includes("run.mjs")), "ops runner missing from ops profile");
-  // Both Bash and PowerShell, both path-separator spellings.
-  const opsRunnerRules = [...opsAllow].filter((r) => r.includes("ops-actions"));
-  assert.ok(opsRunnerRules.some((r) => r.startsWith("Bash(")));
-  assert.ok(opsRunnerRules.some((r) => r.startsWith("PowerShell(")));
-  assert.ok(opsRunnerRules.some((r) => r.includes("/")), "forward-slash spelling missing");
-  assert.ok(opsRunnerRules.some((r) => r.includes("\\")), "backslash spelling missing");
 });
 
-test("ops profile has everything code has, plus the ops runner", () => {
-  const code = allowSet("code");
-  const ops = allowSet("ops");
-  for (const rule of code) assert.ok(ops.has(rule), `ops profile dropped a code rule: ${rule}`);
-});
-
-test("Get-Content is absent from every profile's allow list (shell secret-read hole, ITEM 2)", () => {
+test("Get-Content, Get-Item, and Get-ChildItem are absent from every profile's allow list (fix 3: env/file-content read hole)", () => {
   for (const profile of PROFILES) {
     const allow = allowSet(profile);
-    for (const rule of allow) assert.ok(!rule.includes("Get-Content"), `${rule} in ${profile} still allows Get-Content`);
+    for (const rule of allow) {
+      assert.ok(!rule.includes("Get-Content"), `${rule} in ${profile} still allows Get-Content`);
+      assert.ok(!/PowerShell\(Get-Item\b/.test(rule), `${rule} in ${profile} still allows Get-Item (can print env var values via Get-Item Env:NAME)`);
+      assert.ok(!/PowerShell\(Get-ChildItem\b/.test(rule), `${rule} in ${profile} still allows Get-ChildItem (can print env var values via Get-ChildItem Env:)`);
+    }
+  }
+});
+
+test("the loopback helper and ollama-generate wrapper are allow-listed in every profile", () => {
+  for (const profile of PROFILES) {
+    const allow = [...allowSet(profile)];
+    assert.ok(allow.some((r) => r.includes("http-get-loopback.mjs")), `loopback helper missing from ${profile}`);
+    assert.ok(allow.some((r) => r.includes("ollama-generate.mjs")), `ollama-generate wrapper missing from ${profile}`);
+    assert.ok(allow.includes("Bash(ollama list)") && allow.includes("Bash(ollama list *)"), `word-boundary-safe ollama list missing from ${profile}`);
+    assert.ok(allow.includes("Bash(ollama ps)") && allow.includes("Bash(ollama ps *)"), `word-boundary-safe ollama ps missing from ${profile}`);
+    // The old no-space forms must be gone (fix 2: they were boundary-unsafe).
+    assert.ok(!allow.includes("Bash(ollama list*)"), `boundary-unsafe "ollama list*" must be gone from ${profile}`);
+    assert.ok(!allow.includes("Bash(ollama ps*)"), `boundary-unsafe "ollama ps*" must be gone from ${profile}`);
+  }
+});
+
+test("no raw curl/Invoke-RestMethod/Invoke-WebRequest Ollama allow rule remains in any profile (fix 2)", () => {
+  for (const profile of PROFILES) {
+    const allow = [...allowSet(profile)];
+    for (const rule of allow) {
+      assert.ok(!/curl http:\/\/(127\.0\.0\.1|localhost):11434/.test(rule), `${rule} in ${profile} is a raw curl Ollama rule`);
+      assert.ok(!/Invoke-(RestMethod|WebRequest) http:\/\/(127\.0\.0\.1|localhost):11434/.test(rule), `${rule} in ${profile} is a raw PowerShell Ollama rule`);
+    }
   }
 });
 
@@ -172,10 +194,19 @@ test("all three env-file deny shapes are present, anchored for nested directorie
   }
 });
 
-test("the deny floor is identical across all three profiles (never loosened per profile)", () => {
+test("code accident guards (fix 7): .git/** edits and forced worktree-remove/checkout are denied", () => {
+  for (const profile of PROFILES) {
+    const deny = buildSafePermissionsSettings(profile).permissions.deny;
+    assert.ok(deny.includes("Edit(//**/.git/**)"), `.git/** edit deny missing from ${profile}`);
+    assert.ok(deny.some((d) => d.includes("git worktree remove --force")), `git worktree remove --force deny missing from ${profile}`);
+    assert.ok(deny.some((d) => d.includes("git worktree remove -f")), `git worktree remove -f deny missing from ${profile}`);
+    assert.ok(deny.some((d) => d.includes("git checkout --force")), `git checkout --force deny missing from ${profile}`);
+  }
+});
+
+test("the deny floor is identical across both profiles (never loosened per profile)", () => {
   const denies = PROFILES.map((p) => JSON.stringify(buildSafePermissionsSettings(p).permissions.deny.slice().sort()));
   assert.equal(denies[0], denies[1]);
-  assert.equal(denies[1], denies[2]);
 });
 
 test("an unrecognized profile string falls back to DEFAULT_PROFILE (code)'s allow list", () => {
@@ -203,13 +234,14 @@ test("startJob: profile omitted defaults to DEFAULT_PROFILE (code) and is record
   assert.ok(!res.error, JSON.stringify(res));
   assert.equal(res.profile, DEFAULT_PROFILE);
   assert.equal(capture[0].extraEnv[PROFILE_ENV], DEFAULT_PROFILE);
+  assert.equal(capture[0].extraEnv[JOB_ID_ENV], res.jobId);
 });
 
-test("startJob: an explicit profile is recorded and set on the launched process's env", async () => {
+test("startJob: an explicit readonly profile with safe permissions on is recorded and set on the launched process's env", async () => {
   const capture = [];
   const res = await startJob(
     { prompt: "hi", workFolder: WORK_FOLDER, jobId: jid("readonly"), profile: "readonly" },
-    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 } },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: true },
   );
   assert.ok(!res.error, JSON.stringify(res));
   assert.equal(res.profile, "readonly");
@@ -228,16 +260,27 @@ test("startJob: an invalid profile is refused before any job dir is created", as
   assert.ok(!fs.existsSync(path.join(tmpJobRoot, id)), "no job dir should have been created");
 });
 
+test("startJob: requesting the removed \"ops\" profile is refused explicitly, not mapped to anything", async () => {
+  const capture = [];
+  const id = jid("ops-refused");
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: id, profile: "ops" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 } },
+  );
+  assert.equal(res.errorCode, "profile");
+  assert.match(res.error, /invalid profile "ops"/);
+  assert.equal(capture.length, 0);
+  assert.ok(!fs.existsSync(path.join(tmpJobRoot, id)));
+});
+
 test("startJob: a nested job (depth>0) cannot request a profile broader than its own", async () => {
   const capture = [];
   const id = jid("escalate");
   const res = await startJob(
-    { prompt: "hi", workFolder: WORK_FOLDER, jobId: id, profile: "ops" },
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: id, profile: "code" },
     { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 },
-      depth: "1" },
+      depth: "1", profileEnv: { [PROFILE_ENV]: "readonly" } },
   );
-  // process.env has no CLAUDE_ASYNC_JOB_PROFILE set in this test process, so the "parent" reads as
-  // DEFAULT_PROFILE (code); requesting "ops" (broader) at depth 1 must be refused.
   assert.equal(res.errorCode, "profile");
   assert.equal(capture.length, 0);
   assert.ok(!fs.existsSync(path.join(tmpJobRoot, id)));
@@ -247,10 +290,36 @@ test("startJob: a nested job requesting its own (or a narrower) profile is allow
   const capture = [];
   const res = await startJob(
     { prompt: "hi", workFolder: WORK_FOLDER, jobId: jid("nested-ok"), profile: "readonly" },
-    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, depth: "1" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, depth: "1",
+      safePermissions: true, profileEnv: { [PROFILE_ENV]: "readonly" } },
   );
   assert.ok(!res.error, JSON.stringify(res));
   assert.equal(res.profile, "readonly");
+});
+
+test("startJob: \"readonly\" with safe permissions OFF is refused outright, never silently downgraded (fix 4)", async () => {
+  const capture = [];
+  const id = jid("readonly-no-safeperms");
+  const res = await startJob(
+    { prompt: "hi", workFolder: WORK_FOLDER, jobId: id, profile: "readonly" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: false },
+  );
+  assert.equal(res.errorCode, "profile");
+  assert.equal(capture.length, 0, "no job may be launched for a refused readonly request");
+  assert.ok(!fs.existsSync(path.join(tmpJobRoot, id)));
+});
+
+test("startJob: \"readonly\" with sandbox \"container\" is refused outright (fix 4)", async () => {
+  const capture = [];
+  const id = jid("readonly-container");
+  const res = await startJob(
+    { prompt: "hi", sandbox: "container", repo: "icey2488/claude-async", jobId: id, profile: "readonly" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000 }, safePermissions: true,
+      allowedSandboxes: "container" },
+  );
+  assert.equal(res.errorCode, "profile");
+  assert.equal(capture.length, 0);
+  assert.ok(!fs.existsSync(path.join(tmpJobRoot, id)));
 });
 
 test("startJob: --append-system-prompt denial guidance is added only when safe permissions are on", async () => {
@@ -282,5 +351,6 @@ test("startJob: safe permissions on builds permission settings matching the reso
   assert.ok(!res.error, JSON.stringify(res));
   const settings = settingsFromArgv(capture[0].argv);
   assert.ok(!settings.permissions.allow.includes("Edit"), "readonly job's settings must not allow Edit");
-  assert.ok(settings.permissions.allow.includes("Bash(git fetch)"), "readonly job's settings must allow git fetch");
+  assert.ok(!settings.permissions.allow.includes("Bash(git fetch)"), "readonly job's settings must NOT allow raw git fetch");
+  assert.ok(settings.permissions.allow.some((r) => r.includes("git-ro.mjs")), "readonly job's settings must allow the git-ro.mjs wrapper");
 });

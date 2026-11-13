@@ -85,16 +85,16 @@ const ENV_FILE_MAX_BYTES = 64 * 1024;
 // allowlist, not "everything in extraEnv": the docker CLI process itself runs with the host env
 // (HERMES_HOME, PATH, ...), and none of that belongs inside the sandbox.
 //
-// CLAUDE_ASYNC_JOB_PROFILE (safe-mode-profiles, 2026-11-12): forwarded for the same reason
-// CLAUDE_ASYNC_DEPTH already is -- a container job that itself dispatches a nested job needs its
-// own profile visible so guard.mjs's checkProfile can refuse an escalating child, exactly like the
-// depth accident guard. This does NOT make the profile's permission RULES apply inside the
-// container -- job-core.mjs's buildSafePermissionsSettings() is never consulted on the container
-// path at all (container.mjs's buildContainerCliArgv always runs the CLI with
-// --dangerously-skip-permissions; the Docker container itself is the sandbox boundary there, not
-// the profile). It only keeps the accident guard consistent for whatever a container job dispatches.
+// CLAUDE_ASYNC_JOB_PROFILE is deliberately NOT forwarded here (fix 4, 2026-11-13 review round):
+// nothing inside the container ever reads it. A container job runs the bare `claude` CLI with
+// --dangerously-skip-permissions always (buildContainerCliArgv below) -- there is no copy of
+// job-core.mjs's dispatch.mjs/guard.mjs running inside the container to consult it, so forwarding
+// it bought nothing but the appearance of a guard that wasn't actually wired to anything.
+// CLAUDE_ASYNC_DEPTH is kept for the same accident-guard reason it always was (a container job that
+// itself dispatches a nested job via a raw HTTP call from inside the container can still choose to
+// read this and self-report it).
 export const FORWARDED_ENV_KEYS = Object.freeze([
-  "CLAUDE_ASYNC_DEPTH", "CLAUDE_ASYNC_JOB_PROFILE", "CLAUDE_ASYNC_JOB_EFFORT",
+  "CLAUDE_ASYNC_DEPTH", "CLAUDE_ASYNC_JOB_EFFORT",
   "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "BASH_MAX_TIMEOUT_MS",
 ]);
 // Belt to the allowlist above: a forwarded name that looks like a credential is refused even if

@@ -19,7 +19,8 @@ import os from "node:os";
 import { startJob, checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
-import { DEPTH_ENV, DEPTH_HEADER, PROFILES, DEFAULT_PROFILE } from "./guard.mjs";
+import { DEPTH_ENV, DEPTH_HEADER, PROFILES, DEFAULT_PROFILE, PROFILE_ENV, PROFILE_HEADER,
+         JOB_ID_ENV, JOB_ID_HEADER, isProfile } from "./guard.mjs";
 
 export const FORWARD_TIMEOUT_MS = 20_000; // start/check: a remote start includes its own launch (task path: up to ~15s)
 export const LIST_TIMEOUT_MS = 5_000;
@@ -40,6 +41,15 @@ export function startLocal(args, cfg, startOptions = {}) {
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
+// DEPTH_HEADER/PROFILE_HEADER/JOB_ID_HEADER all self-report THIS PROCESS's own env (same accident-
+// guard caveat as guard.mjs's depth/profile checks: a determined caller can misreport any of them).
+// They only carry real information when this forward() call happens to run inside the actual
+// calling job's own process (e.g. a job that embeds dispatch.mjs directly); the ordinary case --
+// the bridge daemon relaying on a job's behalf -- has none of these set, so they read as "0"/absent
+// and the receiving host-api.mjs falls back to its own defaults (see createApiServer below).
+// JOB_ID_HEADER is the one host-api.mjs actually trusts further: when it names a real job ON THE
+// RECEIVING HOST, host-api.mjs reads that job's AUTHORITATIVE recorded profile from its own
+// meta.json instead of trusting PROFILE_HEADER's self-report.
 async function forward(ctx, route, method, pathAndQuery, body, timeoutMs) {
   const url = `${String(route.url).replace(/\/+$/, "")}${pathAndQuery}`;
   let res;
@@ -47,7 +57,9 @@ async function forward(ctx, route, method, pathAndQuery, body, timeoutMs) {
     res = await ctx.fetch(url, {
       method,
       headers: { authorization: `Bearer ${route.token}`, "content-type": "application/json",
-                 [DEPTH_HEADER]: process.env[DEPTH_ENV] || "0" },
+                 [DEPTH_HEADER]: process.env[DEPTH_ENV] || "0",
+                 [PROFILE_HEADER]: isProfile(process.env[PROFILE_ENV]) ? process.env[PROFILE_ENV] : DEFAULT_PROFILE,
+                 ...(process.env[JOB_ID_ENV] ? { [JOB_ID_HEADER]: process.env[JOB_ID_ENV] } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -210,13 +222,17 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
       baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
                   "(default: the repo's default branch). The job works on a new branch and opens a PR."),
-      profile: z.enum(PROFILES).optional().describe(`Only affects jobs run under safe permissions ` +
-                  `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1); ignored otherwise. Default "${DEFAULT_PROFILE}". ` +
-                  `"readonly": no file edits, no git write, no interpreters/code-runners -- investigation ` +
-                  `only. "code": the above plus file editing and the dev-tool runners (the historical, ` +
-                  `unrestricted-ish default). "ops": "code" plus ops-actions/run.mjs's named operational ` +
-                  `actions. A nested job (one this job itself dispatches) may not request a profile ` +
-                  `broader than its own.`),
+      profile: z.enum(PROFILES).optional().describe(`A host-side tool allowlist, NOT a sandbox -- a ` +
+                  `"code" job can run node/python, which can read any file and reach any network ` +
+                  `endpoint that process can, regardless of this setting (untrusted work belongs in ` +
+                  `sandbox:"container" instead). Only affects jobs run under safe permissions ` +
+                  `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) on sandbox:"host"; ignored/refused otherwise. ` +
+                  `Default "${DEFAULT_PROFILE}". "readonly": no file edits, no raw git, no ` +
+                  `interpreters/code-runners -- investigation only; requesting it without safe ` +
+                  `permissions on a host job is refused outright, never silently downgraded. "code": ` +
+                  `the above plus file editing, raw git, and the dev-tool runners (the historical, ` +
+                  `unrestricted-ish default). A nested job (one this job itself dispatches) may not ` +
+                  `request a profile broader than its own.`),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 

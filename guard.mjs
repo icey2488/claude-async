@@ -69,6 +69,14 @@
  * Depth (CLAUDE_ASYNC_DEPTH env / X-Claude-Async-Depth header) is an ACCIDENT guard only, NOT a
  * security control: any caller can simply lie about it. Jobs are launched with depth+1; a start
  * presenting depth > 1 is rejected, which stops a runaway job-dispatches-job chain at two levels.
+ *
+ * Profiles (below) are the same kind of guard, documented plainly: "readonly"/"code" are an
+ * accident-protection allowlist of Claude Code tools on the HOST, not an OS sandbox. A job that can
+ * run node/python (the "code" profile always can) can read any file and make any network call that
+ * process is capable of, regardless of what permissions.allow/deny say -- those lists only gate the
+ * Claude Code tool surface, never the OS. Untrusted work belongs in a container job
+ * (sandbox:"container") with its own scoped credentials, mounts and network; even a container is not
+ * by itself a confidentiality or read-only guarantee (see docs/container-jobs.md).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -118,21 +126,37 @@ export function checkDepth(depth) {
     : null;
 }
 
-// Job profiles (safe-mode-profiles, 2026-11-09/2026-11-12): same accident-guard nature as depth
-// above -- a nested job (depth > 0) is refused a profile BROADER than the one its own environment
-// carries (CLAUDE_ASYNC_JOB_PROFILE, set by job-core.mjs's startJob() into the launched process's
-// env), so a job cannot escalate its own blast radius by dispatching a child with a wider profile
-// than it was given. Like depth, this is enforced against a value the dispatcher controls and a
-// child could in principle misreport if it fabricated its own environment before calling back in --
-// it stops an accidental or naive escalation, not a determined adversary. Profiles only affect
+// Job profiles (safe-mode-profiles, 2026-11-09/2026-11-12/2026-11-13): same accident-guard nature
+// as depth above -- a nested job (depth > 0) is refused a profile BROADER than the one its own
+// environment carries (CLAUDE_ASYNC_JOB_PROFILE, set by job-core.mjs's startJob() into the launched
+// process's env), so a job cannot escalate its own blast radius by dispatching a child with a wider
+// profile than it was given. Like depth, this is enforced against a value the dispatcher controls
+// and a child could in principle misreport if it fabricated its own environment before calling back
+// in -- it stops an accidental or naive escalation, not a determined adversary. Profiles only affect
 // anything when safe mode (CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) is on; see job-core.mjs's
-// buildSafePermissionsSettings(). Applies identically to host and container jobs (set in extraEnv
-// either way) even though the permission settings themselves are host-only today -- see job-core.mjs's
-// startJob() comment on that split.
-export const PROFILES = Object.freeze(["readonly", "code", "ops"]);
+// buildSafePermissionsSettings().
+//
+// "ops" existed briefly in this feature's first draft (2026-11-12) and was removed before merge
+// (two adversarial reviews, 2026-11-13): it needs server-held job identity, hardcoded action
+// config, audit storage outside job write access and no string interpolation into
+// `powershell -Command`, none of which existed. A request for "ops" is refused explicitly (see
+// isProfile/checkProfile below) rather than silently mapped to something else.
+export const PROFILES = Object.freeze(["readonly", "code"]);
 export const DEFAULT_PROFILE = "code"; // matches the only profile that existed before this feature
 export const PROFILE_ENV = "CLAUDE_ASYNC_JOB_PROFILE";
-const PROFILE_RANK = Object.freeze({ readonly: 0, code: 1, ops: 2 });
+// Self-reported by the CALLING process when it forwards a start request to another host's
+// host-api.mjs (dispatch.mjs's forward(), mirroring DEPTH_HEADER) -- same accident-guard caveat as
+// depth: a determined caller can lie about either header. host-api.mjs prefers the AUTHORITATIVE
+// profile recorded in the parent job's own meta.json (looked up via JOB_ID_HEADER) when that job id
+// resolves to a job on the receiving host, and falls back to this header only when it doesn't.
+export const PROFILE_HEADER = "x-claude-async-profile";
+export const JOB_ID_HEADER = "x-claude-async-parent-job-id";
+// Set on every launched job's own process (host and container alike) so it can name itself when it
+// forwards a start request onward (see PROFILE_HEADER/JOB_ID_HEADER above). Also forwarded into
+// containers (container.mjs) for the runner's own git/PR authorship bookkeeping -- unrelated to the
+// profile guard.
+export const JOB_ID_ENV = "CLAUDE_ASYNC_JOB_ID";
+const PROFILE_RANK = Object.freeze({ readonly: 0, code: 1 });
 
 export function isProfile(value) {
   return typeof value === "string" && PROFILES.includes(value);
