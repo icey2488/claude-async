@@ -23,14 +23,14 @@ let seq = 0;
 
 // Prepares a job dir + spec.json + meta.json (no `intent` unless the test adds one later) with a
 // FRESH cwd dir standing in for the job's workFolder, without running the runner yet.
-function prepareJob({ sleepMs = 0, exitCode = 0 } = {}) {
+function prepareJob({ sleepMs = 0, exitCode = 0, extraArgv = [] } = {}) {
   const id = ++seq;
   const dir = path.join(TMP, `lantern-job-${id}`);
   const cwd = path.join(TMP, `lantern-cwd-${id}`);
   fs.mkdirSync(dir, { recursive: true });
   fs.mkdirSync(cwd, { recursive: true });
   const spec = {
-    command: process.execPath, argv: [FAKE, "--sleep-ms", String(sleepMs), "--exit", String(exitCode)],
+    command: process.execPath, argv: [FAKE, "--sleep-ms", String(sleepMs), "--exit", String(exitCode), ...extraArgv],
     cwd, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
   };
   fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
@@ -271,4 +271,35 @@ test("a non-loopback lanternServer in spec.json is refused: no request is ever s
   assert.equal(code, 0);
   const err = fs.readFileSync(path.join(dir, "err.log"), "utf8");
   assert.match(err, /refusing to post.*not a loopback destination/i);
+});
+
+// Fix 5 (readonly compatibility, PR #7 follow-up): job-runner.mjs's Lantern posting is driven only
+// by spec.json's command/argv/cwd and meta.json's intent/transcript discovery -- it never inspects
+// what the CLI's own argv looks like. This plants argv shaped like a real readonly launch (job-core
+// .mjs's --setting-sources "", --append-system-prompt denial guidance, --append-system-prompt-file
+// memory file) to prove that shape never gates or breaks the runner-side status/done posts.
+test("readonly-shaped argv (--setting-sources \"\", --append-system-prompt, --append-system-prompt-file) still produces runner-side Lantern posts", async () => {
+  const memoryFile = path.join(TMP, `lantern-readonly-memory-${++seq}.txt`);
+  fs.writeFileSync(memoryFile, "some CLAUDE.md memory text");
+  const { dir, cwd, jobId } = prepareJob({
+    sleepMs: 1200, exitCode: 0,
+    extraArgv: ["--setting-sources", "", "--append-system-prompt", "Safe mode is on for this job (profile: \"readonly\").",
+                "--append-system-prompt-file", memoryFile],
+  });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  const sessionId = "88888888-9999-0000-1111-222222222222";
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, sessionId);
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.equal(statusPosts.length, 1, "a readonly-shaped launch still gets exactly one status post");
+  assert.deepEqual(statusPosts[0], { name: jobId, doing: "", worktree: cwd, session: sessionId });
+  const donePosts = requests.filter((b) => b.done === true);
+  assert.equal(donePosts.length, 1, "a readonly-shaped launch still gets a done post clearing the same session");
+  assert.deepEqual(donePosts[0], { name: jobId, done: true, session: sessionId });
 });

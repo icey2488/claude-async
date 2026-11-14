@@ -22,6 +22,7 @@ const guard = await import("../guard.mjs");
 const { startJob, buildSafePermissionsSettings, buildDenialGuidanceText, buildReadonlyMemoryAppend,
         READONLY_CLAUDE_MD_MAX_BYTES } = core;
 const { PROFILES, DEFAULT_PROFILE, PROFILE_ENV, JOB_ID_ENV, isProfile, checkProfile } = guard;
+const { LANTERN_PREAMBLE_LINE, withLanternPreamble } = await import("../lantern-preamble.mjs");
 
 const WORK_FOLDER = os.tmpdir();
 
@@ -467,4 +468,83 @@ test("startJob: an unreadable user CLAUDE.md fails a readonly launch before rese
    {claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:operatorSettings,
     userClaudeMdPath:userMdAsDir,caps:{maxStartsPerMinute:1000,maxConcurrent:1000}});
  assert.equal(r.errorCode,"profile"); assert.equal(capture.length,0); assert.ok(!fs.existsSync(path.join(tmpJobRoot,id)));
+});
+
+// --------------------------------------------------------- Lantern notice reaches both profiles
+// (fix 4, 2026-11-13 PR #7 follow-up): the Lantern preamble lives in the one argv slot (-p) every
+// launch builds unconditionally, regardless of profile, BEFORE the readonly-only branch adds its
+// own additive --append-system-prompt (denial guidance) and --append-system-prompt-file (CLAUDE.md
+// memory) flags -- see lantern-preamble.mjs's header for why that placement survives both.
+
+test("startJob: code profile's -p prompt carries the Lantern preamble (fix 4, code launch path)", async () => {
+  const capture = [];
+  const prompt = "do the thing";
+  const res = await startJob(
+    { prompt, workFolder: WORK_FOLDER, jobId: jid("lantern-code") },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000, maxConcurrent: 1000 } },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  assert.equal(res.profile, "code");
+  const argv = capture[0].argv;
+  assert.equal(argv[0], "-p");
+  assert.equal(argv[1], withLanternPreamble(prompt));
+  assert.match(argv[1], new RegExp(LANTERN_PREAMBLE_LINE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
+test("startJob: readonly profile's -p prompt carries the Lantern preamble too, additive with denial guidance and memory file (fix 4, readonly launch path)", async () => {
+  const userMd = path.join(tmpJobRoot, "lantern-readonly-user.md");
+  fs.writeFileSync(userMd, "LANTERN_READONLY_MEMORY_CANARY\n");
+  const projectDir = path.join(tmpJobRoot, "lantern-readonly-project-dir");
+  fs.mkdirSync(projectDir, { recursive: true });
+  const operatorSettings = path.join(tmpJobRoot, "lantern-readonly-operator-settings.json");
+  fs.writeFileSync(operatorSettings, "{}");
+  const capture = [];
+  const prompt = "inspect the thing";
+  const res = await startJob(
+    { prompt, workFolder: projectDir, jobId: jid("lantern-readonly"), profile: "readonly" },
+    { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000, maxConcurrent: 1000 },
+      safePermissions: true, userSettingsPath: operatorSettings, userClaudeMdPath: userMd },
+  );
+  assert.ok(!res.error, JSON.stringify(res));
+  assert.equal(res.profile, "readonly");
+  const argv = capture[0].argv;
+  // The -p prompt carries the preamble exactly as for "code" -- unaffected by --setting-sources ""
+  // or either of readonly's own additive system-prompt flags below.
+  assert.equal(argv[0], "-p");
+  assert.equal(argv[1], withLanternPreamble(prompt));
+  // Both of readonly's own additive mechanisms are present alongside it, not instead of it.
+  assert.ok(argv.includes("--append-system-prompt"), "denial guidance must still be present");
+  const fileIdx = argv.indexOf("--append-system-prompt-file");
+  assert.ok(fileIdx !== -1, "memory file flag must still be present");
+  assert.match(fs.readFileSync(argv[fileIdx + 1], "utf8"), /LANTERN_READONLY_MEMORY_CANARY/);
+});
+
+// -------------------------------------------------- Lantern adds no permission rule (fix 5, PR #7)
+
+// Matches only the AgentGlass Lantern endpoint itself (agents/status, its :4000 port), never the
+// bare word "lantern" -- this worktree's own directory name is claude-async-lantern, so a rule
+// built from a repo path (e.g. the git-ro.mjs wrapper's absolute path) would otherwise false-positive.
+const LANTERN_ENDPOINT_RE = /agents\/status|127\.0\.0\.1:4000|localhost:4000/i;
+
+test("Lantern integration adds no permission rule to either profile's generated settings (fix 5)", () => {
+  for (const profile of PROFILES) {
+    const settings = buildSafePermissionsSettings(profile);
+    for (const rule of [...settings.permissions.allow, ...settings.permissions.deny]) {
+      assert.ok(!LANTERN_ENDPOINT_RE.test(rule), `profile "${profile}" has a Lantern-related permission rule: ${rule}`);
+    }
+  }
+});
+
+test("startJob: Lantern adds no permission rule to either profile's constructed --settings (fix 5)", async () => {
+  for (const profile of ["code", "readonly"]) {
+    const capture = [];
+    const res = await startJob(
+      { prompt: "hi", workFolder: WORK_FOLDER, jobId: jid(`lantern-no-perm-${profile}`), profile },
+      { claudeBin: process.execPath, launch: fakeLaunch(capture), caps: { maxStartsPerMinute: 1000, maxConcurrent: 1000 }, safePermissions: true },
+    );
+    assert.ok(!res.error, JSON.stringify(res));
+    const settings = settingsFromArgv(capture[0].argv);
+    const rules = [...(settings.permissions?.allow || []), ...(settings.permissions?.deny || [])];
+    for (const rule of rules) assert.ok(!LANTERN_ENDPOINT_RE.test(rule), `profile "${profile}" has a Lantern-related permission rule: ${rule}`);
+  }
 });
