@@ -243,9 +243,13 @@ test("API rejections write nothing: wrong host, bad body, depth, caps (429), pre
   }
   assert.equal(tickets().length, 0);
   assert.equal(jobDirs().length, 0);
-  const ok = await post(startBody(), { "x-claude-async-depth": "1" });
+  const nested = await post(startBody(), { "x-claude-async-depth": "1" });
+  assert.equal(nested.status, 400);
+  assert.equal(nested.body.errorCode, "profile");
+  assert.equal(tickets().length, 0);
+  const ok = await post(startBody());
   assert.equal(ok.status, 200);
-  assert.equal(readTicket(ok.body.jobId).envOverrides.CLAUDE_ASYNC_DEPTH, "2");
+  assert.equal(readTicket(ok.body.jobId).envOverrides.CLAUDE_ASYNC_DEPTH, "1");
   const capped = await post(startBody());
   assert.equal(capped.status, 429);
   assert.match(capped.body.error, /cap exceeded on host claunker/);

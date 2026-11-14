@@ -82,7 +82,7 @@ If you'd rather not use the prompt above, or you're not on Windows:
 
 | Tool | Input | Returns |
 |---|---|---|
-| `claude_start` | `host` (required; one of the hosts in `hosts.json`, see Multi-host), `prompt` (required), `workFolder?` (host jobs), `jobId?` (descriptor), `model?`, `effort?`, `intent?`, `sandbox?` (`"host"` default, or `"container"`), `repo?` + `baseRef?` (container jobs: the `owner/repo` cloned inside the container; see [docs/container-jobs.md](docs/container-jobs.md)) | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
+| `claude_start` | `host` (required; one of the hosts in `hosts.json`, see Multi-host), `prompt` (required), `workFolder?` (host jobs), `jobId?` (descriptor), `model?`, `effort?`, `intent?`, `sandbox?` (`"host"` default, or `"container"`), `repo?` + `baseRef?` (container jobs: the `owner/repo` cloned inside the container; see [docs/container-jobs.md](docs/container-jobs.md)), `profile?` (`"readonly"` \| `"code"` default; host accident protection, not a hostile-job boundary -- only affects/applies to jobs run under `CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` on `sandbox:"host"`; `readonly` is refused otherwise, see RUNBOOK.md's "Safe-mode job profiles") | `jobId` (`<host>.<descriptor>-YYYYMMDD-<8 chars>`), `hostname`, `preflight`; the job runs detached |
 | `claude_check` | `jobId` (required), `tailBytes?` | `hostname`, `status`, `exitCode`, and a tail of stdout/stderr (routed by the id's host prefix) |
 | `claude_cancel` | `jobId` (required) | cancels a **container** job (routed by host prefix): records the cancel so a not-yet-created container never runs, removes the job's containers by label, and on a finished job retries an unconfirmed cleanup. Host jobs can't be cancelled with it |
 | `claude_jobs` | — | every job on this host and every `hosts.json` host, each row tagged `host` + `hostname`; an unreachable host is an explicit `unreachable (last seen <time>)` row |
@@ -133,6 +133,8 @@ Optional environment variables:
 | `CLAUDE_ASYNC_ALLOWED_SANDBOXES` | `host` | Which modes this host runs at all: `host`, `container` or `host,container`. Container jobs need `container` in it |
 | `CLAUDE_ASYNC_JOB_SANDBOX` | unset (host) | Exactly `container` makes container jobs the default. The `CLAUDE_ASYNC_CONTAINER_*` and `CLAUDE_ASYNC_GITHUB_APP_*` settings container jobs need (the GitHub App they act as, its private key file, the OAuth env file) are listed in [docs/container-jobs.md](docs/container-jobs.md#configuration-reference) |
 | `CLAUDE_ASYNC_PING_RESUME_FACTOR` | `2` | A tick-to-tick gap bigger than this many ping intervals is treated as a sleep/resume, forgiving that tick's miss |
+| `CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS` | unset (jobs run with `--dangerously-skip-permissions`) | Exactly `1` switches every job to `--permission-mode dontAsk` with a profile-scoped allow/deny list built by `buildSafePermissionsSettings()`. See RUNBOOK.md's "Safe-mode job profiles" section |
+| `CLAUDE_ASYNC_JOB_PROFILE` | set automatically on a running job's own process, not set by an operator directly | One of `readonly` or `code` (default `code`; `ops` was removed, see RUNBOOK.md's Safe-mode job profiles section -- requesting it is refused explicitly). Set by `startJob()` on every launched job's own process; `claude_start`'s `profile` parameter chooses it when `CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` on `sandbox:"host"` (`readonly` is refused outright for a container job or with safe permissions off, never silently downgraded). Nested-profile checks are accident guards, not authorization: unknown parent records are rejected, including cross-host records unavailable locally. Both profiles are accident protection, not secret protection -- see RUNBOOK.md's "Safe-mode job profiles" |
 
 ## Discord notifications
 
@@ -435,3 +437,9 @@ exit-reason tags, the miss-tolerance rule, and the env vars above that tune it.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Native-host profile limits
+
+Neither readonly nor code contains a hostile job or protects secrets in its working tree or environment. Use container jobs for untrusted work with limited credentials, mounts and network. Readonly allows WebSearch (network egress); gh auth status contacts GitHub; Git access is not secret-aware. Readonly excludes ambient settings and preserves trusted operator hooks explicitly. Project and local approvals can widen a code job. See [RUNBOOK](RUNBOOK.md#settings-and-hooks) for the tested CLI version, hooks, conservative Windows stream denies and limitations.
+
+Readonly's `--setting-sources ""` also disables CLAUDE.md memory loading, so a readonly job gets the operator's user-level CLAUDE.md and the project's own CLAUDE.md as plain text appended via `--append-system-prompt-file` instead -- never by widening settings sources. Project CLAUDE.md is repo content, not instructions the job authored, and is trusted no more than the rest of the repository. `code` is unchanged. See [RUNBOOK](RUNBOOK.md#settings-and-hooks) for the mechanism and caps. The same conservative `.env*` Read denies that protect secrets also collaterally block `.env.example`, `.env.sample`, `.env.template` and `.envrc` -- a known, accepted tradeoff, not a bug.

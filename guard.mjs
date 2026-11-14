@@ -69,6 +69,14 @@
  * Depth (CLAUDE_ASYNC_DEPTH env / X-Claude-Async-Depth header) is an ACCIDENT guard only, NOT a
  * security control: any caller can simply lie about it. Jobs are launched with depth+1; a start
  * presenting depth > 1 is rejected, which stops a runaway job-dispatches-job chain at two levels.
+ *
+ * Profiles (below) are the same kind of guard, documented plainly: "readonly"/"code" are an
+ * accident-protection allowlist of Claude Code tools on the HOST, not an OS sandbox. A job that can
+ * run node/python (the "code" profile always can) can read any file and make any network call that
+ * process is capable of, regardless of what permissions.allow/deny say -- those lists only gate the
+ * Claude Code tool surface, never the OS. Untrusted work belongs in a container job
+ * (sandbox:"container") with its own scoped credentials, mounts and network; even a container is not
+ * by itself a confidentiality or read-only guarantee (see docs/container-jobs.md).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -116,6 +124,60 @@ export function checkDepth(depth) {
     ? `dispatch depth ${depth} exceeds ${MAX_DEPTH} (accident guard against job-dispatches-job ` +
       `chains, not a security control); no job started`
     : null;
+}
+
+// Job profiles (safe-mode-profiles, 2026-11-09/2026-11-12/2026-11-13): same accident-guard nature
+// as depth above. Local/API resolution supplies the recorded parent profile; unknown nested
+// parents are refused. This reduces accidental dispatch with a wider profile than the parent.
+// Like depth, the identity is still based on values the dispatcher controls
+// and a child could in principle misreport if it fabricated its own environment before calling back
+// in -- it stops an accidental or naive escalation, not a determined adversary. Profiles only affect
+// anything when safe mode (CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) is on; see job-core.mjs's
+// buildSafePermissionsSettings().
+//
+// "ops" existed briefly in this feature's first draft (2026-11-12) and was removed before merge
+// (two adversarial reviews, 2026-11-13): it needs server-held job identity, hardcoded action
+// config, audit storage outside job write access and no string interpolation into
+// `powershell -Command`, none of which existed. A request for "ops" is refused explicitly (see
+// isProfile/checkProfile below) rather than silently mapped to something else.
+export const PROFILES = Object.freeze(["readonly", "code"]);
+export const DEFAULT_PROFILE = "code"; // matches the only profile that existed before this feature
+export const PROFILE_ENV = "CLAUDE_ASYNC_JOB_PROFILE";
+// Self-reported by the CALLING process when it forwards a start request to another host's
+// host-api.mjs (dispatch.mjs's forward(), mirroring DEPTH_HEADER) -- same accident-guard caveat as
+// depth: a determined caller can lie about either header. host-api.mjs uses the recorded
+// profile in the parent job's own meta.json (looked up via JOB_ID_HEADER) when that job id
+// resolves to a job on the receiving host; unknown nested parents are rejected. The profile
+// header is retained for compatibility but cannot substitute for a missing record.
+export const PROFILE_HEADER = "x-claude-async-profile";
+export const JOB_ID_HEADER = "x-claude-async-parent-job-id";
+// Set on every launched job's own process (host and container alike) so it can name itself when it
+// forwards a start request onward (see PROFILE_HEADER/JOB_ID_HEADER above). Also forwarded into
+// containers (container.mjs) for the runner's own git/PR authorship bookkeeping -- unrelated to the
+// profile guard.
+export const JOB_ID_ENV = "CLAUDE_ASYNC_JOB_ID";
+const PROFILE_RANK = Object.freeze({ readonly: 0, code: 1 });
+
+export function isProfile(value) {
+  return typeof value === "string" && PROFILES.includes(value);
+}
+
+// depth: the CALLER's dispatch depth (0 = a human or the bridge itself; >0 = the caller is itself
+// a running job). requestedProfile: the profile being asked for the NEW job. env: the environment
+// to read the caller's own profile from (CALLER's process.env, i.e. this process -- an inherited
+// value if this process is itself a launched job). Returns null if fine, else a refusal string.
+export function checkProfile(depth, requestedProfile, env = process.env) {
+  if (!isProfile(requestedProfile)) return `invalid profile ${JSON.stringify(requestedProfile)} (must be one of ${PROFILES.join(", ")})`;
+  if (depth > 0) {
+    const parentRaw = env[PROFILE_ENV];
+    if (!isProfile(parentRaw)) return "nested job has no known parent profile; no job started";
+    const parent = parentRaw;
+    if (PROFILE_RANK[requestedProfile] > PROFILE_RANK[parent]) {
+      return `nested job (dispatch depth ${depth}) may not request profile "${requestedProfile}", broader ` +
+        `than its parent's profile "${parent}"; no job started`;
+    }
+  }
+  return null;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

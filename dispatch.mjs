@@ -19,7 +19,8 @@ import os from "node:os";
 import { startJob, checkJob, listJobs, cancelJob } from "./job-core.mjs";
 import { loadHostsConfig, resolveRoute, parseHostPrefix, mintJobId, knownHosts, readLastSeen, recordLastSeen,
          lastSeenPath } from "./hosts.mjs";
-import { DEPTH_ENV, DEPTH_HEADER } from "./guard.mjs";
+import { DEPTH_ENV, DEPTH_HEADER, PROFILES, DEFAULT_PROFILE, PROFILE_ENV, PROFILE_HEADER,
+         JOB_ID_ENV, JOB_ID_HEADER, isProfile } from "./guard.mjs";
 
 export const FORWARD_TIMEOUT_MS = 20_000; // start/check: a remote start includes its own launch (task path: up to ~15s)
 export const LIST_TIMEOUT_MS = 5_000;
@@ -35,11 +36,20 @@ export function defaultCtx() {
 export function startLocal(args, cfg, startOptions = {}) {
   const jobId = mintJobId({ host: cfg.localHost, descriptor: args.jobId, now: startOptions.now,
                             ...(startOptions.suffix ? { suffix: startOptions.suffix() } : {}) });
-  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef } = args;
-  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef },
+  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef, profile } = args;
+  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile },
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
+// DEPTH_HEADER/PROFILE_HEADER/JOB_ID_HEADER all self-report THIS PROCESS's own env (same accident-
+// guard caveat as guard.mjs's depth/profile checks: a determined caller can misreport any of them).
+// They only carry real information when this forward() call happens to run inside the actual
+// calling job's own process (e.g. a job that embeds dispatch.mjs directly); the ordinary case --
+// the bridge daemon relaying on a job's behalf -- has none of these set, so they read as "0"/absent
+// and the receiving host-api.mjs falls back to its own defaults (see createApiServer below).
+// JOB_ID_HEADER is the one host-api.mjs actually trusts further: when it names a real job ON THE
+// RECEIVING HOST, host-api.mjs reads that job's AUTHORITATIVE recorded profile from its own
+// meta.json instead of trusting PROFILE_HEADER's self-report.
 async function forward(ctx, route, method, pathAndQuery, body, timeoutMs) {
   const url = `${String(route.url).replace(/\/+$/, "")}${pathAndQuery}`;
   let res;
@@ -47,7 +57,9 @@ async function forward(ctx, route, method, pathAndQuery, body, timeoutMs) {
     res = await ctx.fetch(url, {
       method,
       headers: { authorization: `Bearer ${route.token}`, "content-type": "application/json",
-                 [DEPTH_HEADER]: process.env[DEPTH_ENV] || "0" },
+                 [DEPTH_HEADER]: process.env[DEPTH_ENV] || "0",
+                 [PROFILE_HEADER]: isProfile(process.env[PROFILE_ENV]) ? process.env[PROFILE_ENV] : DEFAULT_PROFILE,
+                 ...(process.env[JOB_ID_ENV] ? { [JOB_ID_HEADER]: process.env[JOB_ID_ENV] } : {}) },
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -77,11 +89,11 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
   const route = resolveRoute(args.host, ctx.cfg);
   if (route.error) return { error: route.error, host: args.host ?? null, hostname: os.hostname() };
   if (route.kind === "local") return startLocal(args, ctx.cfg, ctx.startOptions);
-  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef } = args;
-  // sandbox/repo/baseRef are only sent when given, so a forwarded host-mode start's body is unchanged.
+  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile } = args;
+  // sandbox/repo/baseRef/profile are only sent when given, so a forwarded host-mode start's body is unchanged.
   const out = await forward(ctx, route, "POST", "/v1/start",
                             { host, prompt, workFolder, jobId, model, effort, intent, ...(sandbox ? { sandbox } : {}),
-                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}) },
+                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}), ...(profile ? { profile } : {}) },
                             FORWARD_TIMEOUT_MS);
   return { host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
@@ -210,6 +222,13 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
       baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
                   "(default: the repo's default branch). The job works on a new branch and opens a PR."),
+      profile: z.enum(PROFILES).optional().describe("Host accident protection, NOT a hostile-job or secret boundary. " +
+                  "Use container jobs for untrusted work with limited credentials, mounts and network. " +
+                  "Default code. readonly requires safe host permissions and excludes ambient approvals: " +
+                  "no editing tools, general interpreters, raw git or raw HTTP; selected helpers and inspection tools only. " +
+                  "WebSearch has network egress, gh auth status contacts GitHub, and git objects are not secret-aware. " +
+                  "code allows editing/interpreters/raw git and can be widened by project/local approvals. " +
+                  "Nested checks are accident guards, not authorization; unknown parent records are rejected, including cross-host."),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 

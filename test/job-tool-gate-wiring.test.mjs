@@ -131,7 +131,12 @@ test("safePermissions: true switches to --permission-mode dontAsk with an allow/
     "mkdir must be allowed -- a false-deny found in the rehearsal blocked routine scaffolding");
   // Bash and PowerShell must carry the same dev-tool allow/deny set (rehearsal: PowerShell-only
   // `uv run pytest` was denied while the identical Bash invocation was allowed).
-  for (const prefix of ["git status*", "git add *", "git commit *", "git checkout *",
+  // "git status" (bare command) and "git status *" (with args) are both listed separately
+  // (safe-mode-profiles 2026-11-12 word-boundary fix): a single no-space "git status*" prefix is
+  // boundary-unsafe (it would also match an unrelated command sharing the same text prefix), but
+  // simply adding the space would stop matching the extremely common bare `git status` invocation
+  // -- see job-core.mjs's buildSafePermissionsSettings() comment for the full reasoning.
+  for (const prefix of ["git status", "git status *", "git add *", "git commit *", "git checkout *",
     "git worktree *", "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"]) {
     assert.ok(settings.permissions.allow.includes(`PowerShell(${prefix})`),
       `PowerShell(${prefix}) must be allowed to match its Bash equivalent`);
