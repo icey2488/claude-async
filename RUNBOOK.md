@@ -530,14 +530,14 @@ read-only guarantee (see docs/container-jobs.md's own caveats on what the contai
 and does not cover).
 
 **Decision B (`ops` was removed).** An earlier draft of this feature (2026-11-09/2026-11-12) added a
-third profile, `ops`, backed by `ops-actions/run.mjs` (a fixed registry of two named operational
+third profile, `ops`, backed by a dedicated runner (a fixed registry of two named operational
 actions: `hostapi-restart`, `agentglass-update-restart`). Two adversarial reviews (2026-11-13) found
 it unsound as designed: it had no server-held job identity (anyone able to set
 `CLAUDE_ASYNC_JOB_PROFILE=ops` in a process's own environment satisfies its one self-check), no
 hardcoded action config (`AGENTGLASS_*` env vars reached straight into `execFile`/`spawnSync` calls),
 audit storage inside the job's own write access (so a job could tamper with its own audit trail), and
 string interpolation into a PowerShell `-Command` (a real injection surface). `ops` and
-`ops-actions/run.mjs` were removed from this PR rather than patched piecemeal. **`guard.mjs`'s
+its runner were removed from this PR. **`guard.mjs`'s
 `PROFILES` is exactly `["readonly", "code"]`; a request for `profile: "ops"` is refused explicitly**
 (`checkProfile`'s `invalid profile` error), never silently mapped to `code` or to anything else. The
 `ops` runner will be redesigned later with server-held job identity, hardcoded action config, audit
@@ -680,14 +680,8 @@ an absolute deadline and a byte cap it ABORTS on rather than merely truncates. `
 own allow rule, now correctly word-boundary-safe (`"ollama list"`/`"ollama list *"`/`"ollama ps"`/
 `"ollama ps *"` — the OLD rule's `.map(p => p + "*")` pass produced boundary-UNSAFE `"ollama
 list*"`/`"ollama ps*"` because it was applied uniformly to every entry in the old allow array
-regardless of whether that entry's string already ended in a space). **Known blocked gap:**
-`hooks/ollama-guard-hook.mjs` was supposed to be updated in this same change to recognize
-`node <path-to-ollama-generate.mjs> ...` as a safe shape (its command text contains the word
-"ollama", so the hook's own `looksLikeOllamaAttempt()` catches it, and without that recognition it
-falls through to the hook's final deny) — this session's tool permissions deny editing ANY path
-under a `hooks/` directory, so that edit could not be made; see
-`test/ollama-guard-hook.test.mjs`'s "KNOWN GAP" test, which documents the current (undesired) deny
-with a real assertion, and the PR report for what to do about it.
+regardless of whether that entry's string already ended in a space). The Ollama guard passes the repository helper with named arguments and the standalone
+`ollama list` and `ollama ps` commands. It denies raw curl and PowerShell HTTP calls that mention Ollama.
 
 **Nested-profile accident guard, fixed for cross-host dispatch (fix 5).** Same shape as the existing
 dispatch-depth guard (`CLAUDE_ASYNC_DEPTH`): a nested job (one a running job itself dispatches,
@@ -755,8 +749,7 @@ reversed, in "code"'s raw git); `git remote` (bare, listing) is read-only-safe, 
 `git remote *` (needed for `remote add`) also admits `remote remove`/`set-url`, unchanged from
 before this profile split. `tools/git-ro.mjs`'s own residual gap: its secret-pattern/containment
 checks guard pathspecs and `REV:path` arguments, not a committed blob's CONTENT (see "Read-only git
-wrapper" above). The `hooks/ollama-guard-hook.mjs` update for fix 2's wrapper shape is BLOCKED (see
-above), not merely undocumented. Verification of every check above against a real `claude` process
+wrapper" above). Verification of every check above against a real `claude` process
 is tracked separately (see the PR report's VERIFIED/ESTABLISHED/UNTESTED lists) — this document
 describes the design, not by itself a live-tested guarantee for every claim.
 

