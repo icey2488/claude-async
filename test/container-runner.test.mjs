@@ -132,6 +132,29 @@ test("container job: output captured, exit.json written, cleanup by label confir
   assert.ok(!fs.existsSync(j.tokenFile) && !fs.existsSync(path.dirname(j.tokenFile)), "the creds dir is deleted on finish");
 });
 
+// Review point #1: a container job's CLI runs inside an isolated container whose own
+// ~/.claude/projects the host can never see, so no session id is ever discoverable for it -- the
+// runner must post nothing at all for a container job, never even a row it then can't clear, even
+// when a real, reachable Lantern destination is configured for it.
+test("Lantern: container jobs post nothing, even with a reachable loopback server configured", { skip: SKIP }, async () => {
+  const j = setup();
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => { try { requests.push(JSON.parse(raw)); } catch { requests.push(null); } res.writeHead(200); res.end("ok"); });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const specObj = JSON.parse(fs.readFileSync(j.spec, "utf8"));
+  specObj.lanternServer = `http://127.0.0.1:${port}`;
+  fs.writeFileSync(j.spec, JSON.stringify(specObj));
+  const r = runSync(j);
+  await new Promise((resolve) => server.close(resolve));
+  assert.equal(r.status, 0);
+  assert.equal(requests.length, 0, "a container job never posts to Lantern, even when a reachable destination is configured");
+});
+
 // ------------------------------------------------------------ GitHub App token delivery ---
 // The runner mints the App's installation token before `docker run`, keeps it in <jobdir>/creds/token
 // (0700 dir, 0600 file; the argv mounts the dir read-only at /run/claude-async/creds), rewrites it IN
