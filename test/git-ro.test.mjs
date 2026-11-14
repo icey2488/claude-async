@@ -31,7 +31,15 @@ before(() => {
   git("config", "user.email", "test@example.com");
   git("config", "user.name", "Test");
   fs.writeFileSync(path.join(repoDir, "tracked.txt"), "hello world\n");
-  git("add", "tracked.txt");
+  // A COMMITTED directory literally named ".env" containing an innocuously-named file (2026-11-13
+  // PR #6 follow-up review, probe-finding5-dir.mjs): looksSecret() used to check only the final
+  // path segment ("secret.txt"), never the directory segment, so HEAD:nested/.env/secret.txt
+  // leaked. Lives under a subdirectory, not repoDir's own root, because repoDir will also get an
+  // untracked PLAIN FILE named ".env" (below) for the --no-index test. Committed alongside
+  // tracked.txt in the SAME "init" commit so HEAD still matches tests asserting on "init".
+  fs.mkdirSync(path.join(repoDir, "nested", ".env"), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, "nested", ".env", "secret.txt"), `${CANARY_SECRET}\n`);
+  git("add", "tracked.txt", "nested/.env/secret.txt");
   git("commit", "-q", "-m", "init");
   // An untracked secret sitting in the working directory -- never committed, but still on disk,
   // which is exactly what `git diff --no-index` can read regardless of tracking state.
@@ -123,6 +131,15 @@ test("a REV:path naming a secret-shaped file is refused even without an output f
   assertRefused(["show", "HEAD:prod.env"]);
   assertRefused(["show", "HEAD:.env.local"]);
   assertRefused(["show", "HEAD:.ssh/id_rsa"]);
+});
+
+test("a REV:path whose DIRECTORY (not basename) is secret-shaped is refused -- HEAD:nested/.env/secret.txt", () => {
+  assertRefused(["show", "HEAD:nested/.env/secret.txt"]);
+  // Sanity: confirm the fixture is actually committed at that path (a refusal for the wrong
+  // reason -- e.g. a typo'd path that git itself can't find -- would pass assertRefused too).
+  const r = run(["ls-files", "--cached"]);
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /nested\/\.env\/secret\.txt/);
 });
 
 test("an absolute Windows path is refused", () => {

@@ -36,6 +36,10 @@ if(ahead===initial)throw new Error("bad fetch fixture");
 fs.mkdirSync(path.join(cwd,".claude"));
 fs.writeFileSync(path.join(cwd,".claude","settings.local.json"),JSON.stringify({permissions:{allow:["Write","Edit","Bash(node *)","PowerShell(Get-CimInstance *)"]}}));
 fs.mkdirSync(process.env.CLAUDE_CONFIG_DIR,{recursive:true});
+const userMemoryCanary="LIVECHECK_USER_MEMORY_CANARY_91823";
+const projectMemoryCanary="LIVECHECK_PROJECT_MEMORY_CANARY_40156";
+fs.writeFileSync(path.join(process.env.CLAUDE_CONFIG_DIR,"CLAUDE.md"),userMemoryCanary+": standing job-reporting rules.\n");
+fs.writeFileSync(path.join(cwd,"CLAUDE.md"),projectMemoryCanary+": repo instructions.\n");
 const hookMarker=path.join(root,"operator-hook-marker");
 const hookScript=path.join(root,"hook.cjs");
 fs.writeFileSync(hookScript,"require('fs').writeFileSync("+JSON.stringify(hookMarker)+",'HOOK_CANARY')");
@@ -76,12 +80,20 @@ async function run(profile,cases) {
  // For code, exclude actual user hooks in this harness, keeping project/local scopes.
  const settingsFile=path.join(root,profile+".settings.json");fs.writeFileSync(settingsFile,JSON.stringify(settings,null,2));
  fs.copyFileSync(settingsFile,path.join(output,profile+".settings.json"));
+ let memoryPromptFile=null;
+ if(profile==="readonly") {
+  const memoryAppend=core.buildReadonlyMemoryAppend(cwd);
+  if(memoryAppend) {
+   memoryPromptFile=path.join(root,"readonly-claude-md-memory.txt");
+   fs.writeFileSync(memoryPromptFile,memoryAppend,"utf8");
+  }
+ }
  let index=0;const captures=[];
  const api=http.createServer((req,res)=>{let raw="";req.on("data",c=>raw+=c);req.on("end",()=>{
   let b;try{b=JSON.parse(raw)}catch{}
   if(req.url.includes("count_tokens")){res.setHeader("content-type","application/json");return res.end('{"input_tokens":100}');}
   if(!req.url.includes("/messages")){res.setHeader("content-type","application/json");return res.end("{}");}
-  captures.push({tools:b?.tools?.map(t=>t.name),results:b?.messages?.flatMap(m=>Array.isArray(m.content)?m.content.filter(c=>c.type==="tool_result"):[])||[]});
+  captures.push({tools:b?.tools?.map(t=>t.name),system:b?.system,results:b?.messages?.flatMap(m=>Array.isArray(m.content)?m.content.filter(c=>c.type==="tool_result"):[])||[]});
   const c=cases[index++];const content=c?{type:"tool_use",id:"toolu_canary_"+index,name:c.tool,input:c.input}:{type:"text",text:"Canary complete"};
   const msg={id:"msg_"+index,type:"message",role:"assistant",model:"claude-sonnet-5",content:[content],stop_reason:c?"tool_use":"end_turn",stop_sequence:null,usage:{input_tokens:100,output_tokens:20}};
   if(!b.stream){res.setHeader("content-type","application/json");return res.end(JSON.stringify(msg));}
@@ -95,7 +107,7 @@ async function run(profile,cases) {
  await new Promise(r=>api.listen(0,"127.0.0.1",r));
  const env={...process.env};for(const k of Object.keys(env))if(/^(ANTHROPIC|CLAUDE|GIT_|NODE_OPTIONS)/i.test(k))delete env[k];
  Object.assign(env,{ANTHROPIC_API_KEY:"fake-canary-key",ANTHROPIC_BASE_URL:"http://127.0.0.1:"+api.address().port,CLAUDE_CONFIG_DIR:path.join(home,".claude"),CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:"1",DISABLE_AUTOUPDATER:"1",CLAUDE_CODE_USE_POWERSHELL_TOOL:"1",CLAUDE_CODE_DISABLE_BACKGROUND_TASKS:"1",SAFE_MODE_TEST_RECORDER_PORT:String(recorder.address().port),NODE_OPTIONS:'--import="'+pathToFileURL(path.join(repo,"test","fixtures","mock-helper-transport.mjs")).href+'"'});
- const args=["-p","Execute only the supplied canary checks.","--model","claude-sonnet-5","--permission-mode","dontAsk","--settings",settingsFile,"--setting-sources",profile==="readonly"?"":"project,local","--strict-mcp-config","--mcp-config",path.join(repo,"empty-mcp.json"),"--no-session-persistence","--output-format","stream-json","--verbose"];
+ const args=["-p","Execute only the supplied canary checks.","--model","claude-sonnet-5","--permission-mode","dontAsk","--settings",settingsFile,"--setting-sources",profile==="readonly"?"":"project,local",...(memoryPromptFile?["--append-system-prompt-file",memoryPromptFile]:[]),"--strict-mcp-config","--mcp-config",path.join(repo,"empty-mcp.json"),"--no-session-persistence","--output-format","stream-json","--verbose"];
  const child=spawn(cli,args,{cwd,env,windowsHide:true,stdio:["ignore","pipe","pipe"]});let out="",err="",timedOut=false;
  child.stdout.on("data",c=>out+=c);child.stderr.on("data",c=>err+=c);
  const timer=setTimeout(()=>{timedOut=true;child.kill()},45000);
@@ -108,11 +120,15 @@ async function run(profile,cases) {
   toolResults.push({profile,...c,pass:Boolean(passed),observed:r||null});
  }
  fs.writeFileSync(path.join(root,profile+"-transcript.json"),JSON.stringify({exit,timedOut,captures,out,err},null,2));
+ return captures;
 }
 try {
- await run("readonly",readonly);
+ const readonlyCaptures=await run("readonly",readonly);
  const before=git(cwd,"rev-parse","refs/remotes/origin/main");
  toolResults.push({name:"readonly fetch did not advance",pass:before===initial});
+ const readonlySystem=JSON.stringify(readonlyCaptures.map(c=>c.system));
+ toolResults.push({name:"readonly job sees user-level CLAUDE.md via append-system-prompt-file",pass:readonlySystem.includes(userMemoryCanary)});
+ toolResults.push({name:"readonly job sees project CLAUDE.md via append-system-prompt-file",pass:readonlySystem.includes(projectMemoryCanary)});
  await run("code",code);
  const after=git(cwd,"rev-parse","refs/remotes/origin/main");
  toolResults.push({name:"code fetch advanced to known remote commit",pass:after===ahead&&before!==ahead,before,after,ahead});

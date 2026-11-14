@@ -474,6 +474,62 @@ export function preserveUserHooks(settings, userSettingsPath = path.join(process
   return settings;
 }
 
+// A readonly job's --setting-sources "" (above) stops the CLI loading CLAUDE.md memory at all,
+// not just settings.json permissions -- confirmed empirically (probe-claudemd-leak.mjs,
+// 2026-11-13 PR #6 follow-up review) against the real installed CLI with a mock Messages API: the
+// user- and project-level canaries only reach the model request when --setting-sources includes
+// "user"/"project" respectively. Readonly jobs still need the operator's standing job-reporting
+// rules (RESULT line, delegation report, no-background rule) which live in the user CLAUDE.md, so
+// this reads both CLAUDE.md files directly and ships their TEXT via --append-system-prompt-file
+// (buildReadonlyMemoryAppend below) -- never by re-enabling --setting-sources, which would also
+// re-import permissions/env/hooks from settings.json. Project CLAUDE.md is repo content, not
+// instructions this job authored, so the heading says where it came from and the trust note is
+// repeated in RUNBOOK/README (it is NOT elevated above the rest of the repo).
+export const READONLY_CLAUDE_MD_MAX_BYTES = 64 * 1024;
+
+function defaultUserConfigDir() {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+}
+
+export function defaultUserClaudeMdPath() {
+  return path.join(defaultUserConfigDir(), "CLAUDE.md");
+}
+
+// Returns null for a missing file (skipped silently) or { text, truncated } for a present one.
+// Throws for any other read failure (e.g. the path is a directory) -- same "fail the launch
+// before reservation" treatment as preserveUserHooks' malformed-settings error.
+function readClaudeMdForPrompt(filePath, label) {
+  let buf;
+  try { buf = fs.readFileSync(filePath); }
+  catch (e) { if (e.code === "ENOENT") return null; throw new Error(`Cannot read ${label} (${filePath}): ${e.message}`); }
+  const truncated = buf.length > READONLY_CLAUDE_MD_MAX_BYTES;
+  const text = (truncated ? buf.subarray(0, READONLY_CLAUDE_MD_MAX_BYTES) : buf).toString("utf8");
+  return { text, truncated };
+}
+
+function formatClaudeMdSection(heading, filePath, { text, truncated }) {
+  const note = truncated ? `\n[... truncated at ${READONLY_CLAUDE_MD_MAX_BYTES} bytes ...]` : "";
+  return `## ${heading} (${filePath})\n${text}${note}`;
+}
+
+// Builds the combined --append-system-prompt-file text for a readonly job, or null if neither
+// CLAUDE.md exists. workFolder is null for a container job (readonly never runs as one -- see
+// the refuse-not-downgrade check above -- but this stays defensive rather than assuming it).
+export function buildReadonlyMemoryAppend(workFolder, userClaudeMdPath = defaultUserClaudeMdPath()) {
+  const sections = [];
+  const user = readClaudeMdForPrompt(userClaudeMdPath, "user-level CLAUDE.md");
+  if (user) sections.push(formatClaudeMdSection("User-level CLAUDE.md", userClaudeMdPath, user));
+  if (workFolder) {
+    const projectPath = path.join(workFolder, "CLAUDE.md");
+    const project = readClaudeMdForPrompt(projectPath, "project CLAUDE.md");
+    if (project) sections.push(formatClaudeMdSection("Project CLAUDE.md -- repo content, not more trusted than the rest of the repo", projectPath, project));
+  }
+  if (!sections.length) return null;
+  return `The following CLAUDE.md memory files would normally load automatically; they are ` +
+    `included here as plain reference text because this readonly job's --setting-sources "" ` +
+    `also disables automatic CLAUDE.md loading.\n\n` + sections.join("\n\n");
+}
+
 // Denial guidance (ITEM 4, safe-mode-profiles 2026-11-12): the 2026-11-09 denial tally (§F) found
 // jobs giving up after a single denied call instead of retrying with a plain, differently-shaped
 // command, or reporting the exact denial and moving on -- the generic "don't ask mode" refusal
@@ -1207,7 +1263,13 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const resolvedProfile = requestedProfile;
 
   let operatorHooks;
-  try { if (resolvedProfile === "readonly") operatorHooks = preserveUserHooks({}, opts.userSettingsPath).hooks; }
+  let readonlyMemoryAppend = null;
+  try {
+    if (resolvedProfile === "readonly") {
+      operatorHooks = preserveUserHooks({}, opts.userSettingsPath).hooks;
+      readonlyMemoryAppend = buildReadonlyMemoryAppend(containerPlan ? null : cwd, opts.userClaudeMdPath);
+    }
+  }
   catch (e) { return fail("profile", e.message); }
   const p = jobPaths(id);
   const nowMs = (opts.now || new Date()).getTime();
@@ -1259,6 +1321,20 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     argv.push("--setting-sources", "");
     for (const [event, entries] of Object.entries(operatorHooks || {})) {
       settingsObj.hooks[event] = [...entries, ...(settingsObj.hooks[event] || [])];
+    }
+    // File-based, not inline: avoids any Windows argv-length concern regardless of how large the
+    // two CLAUDE.md files are (each already capped at READONLY_CLAUDE_MD_MAX_BYTES above), and
+    // --append-system-prompt-file is additive with the separate inline --append-system-prompt
+    // denial-guidance flag below (confirmed empirically -- two inline --append-system-prompt
+    // flags clobber each other, last one wins, but one inline + one file-based flag both reach
+    // the model request regardless of order).
+    if (readonlyMemoryAppend) {
+      const memoryPromptFile = path.join(p.d, "claude-md-memory.txt");
+      // flag: "wx" -- write-once, like job-launcher's launched.marker: p.d was just created by the
+      // reservation above, so this path cannot already exist; nothing else ever writes it again,
+      // so there is no later content it could corrupt (test/multihost/atomic.test.mjs's source scan).
+      fs.writeFileSync(memoryPromptFile, readonlyMemoryAppend, { encoding: "utf8", flag: "wx" });
+      argv.push("--append-system-prompt-file", memoryPromptFile);
     }
   }
   if (safePermissionsEnabled) {

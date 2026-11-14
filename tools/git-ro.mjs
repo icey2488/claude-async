@@ -44,13 +44,21 @@ const SUBCOMMANDS = {
   "worktree list": { gitArgs: ["worktree", "list"], allowedFlags: [], positionals: false, textconv: false },
 };
 
-// Courtesy basename/directory checks only. Objects/history are not secret-aware.
+// Courtesy path-segment checks only. Objects/history are not secret-aware. Checks EVERY segment,
+// not just the basename -- a committed directory literally named ".env" containing secret.txt
+// (HEAD:.env/secret.txt) must be refused even though "secret.txt" itself looks harmless
+// (probe-finding5-dir.mjs, 2026-11-13 PR #6 follow-up review). Each segment has trailing dots and
+// spaces stripped before matching: Windows silently strips those from a name when resolving it,
+// so ".env." or ".env " on disk can behave as plain ".env".
 export function looksSecret(rawPath) {
   const norm = String(rawPath).replace(/\\/g, "/");
-  const base = norm.split("/").filter(Boolean).pop() || "";
-  if (/^\.env$/i.test(base)) return true; // .env
-  if (/\.env$/i.test(base)) return true; // *.env (prod.env, etc.)
-  if (/^\.env\./i.test(base)) return true; // .env.*  (.env.local, etc.)
+  const segments = norm.split("/").filter(Boolean);
+  for (const raw of segments) {
+    const seg = raw.replace(/[. ]+$/, "");
+    if (/^\.env$/i.test(seg)) return true; // .env
+    if (/\.env$/i.test(seg)) return true; // *.env (prod.env, etc.)
+    if (/^\.env\./i.test(seg)) return true; // .env.*  (.env.local, etc.)
+  }
   if (/(^|\/)\.ssh(\/|$)/i.test(norm)) return true; // .ssh/ anywhere in the path
   return false;
 }

@@ -19,7 +19,8 @@ delete process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS; // pin the env-var default
 
 const core = await import("../job-core.mjs");
 const guard = await import("../guard.mjs");
-const { startJob, buildSafePermissionsSettings, buildDenialGuidanceText } = core;
+const { startJob, buildSafePermissionsSettings, buildDenialGuidanceText, buildReadonlyMemoryAppend,
+        READONLY_CLAUDE_MD_MAX_BYTES } = core;
 const { PROFILES, DEFAULT_PROFILE, PROFILE_ENV, JOB_ID_ENV, isProfile, checkProfile } = guard;
 
 const WORK_FOLDER = os.tmpdir();
@@ -368,4 +369,102 @@ test("invalid operator hooks fail before reserving a readonly job", async () => 
  const id=jid("bad-hooks"); const capture=[];
  const r=await startJob({prompt:"canary",workFolder:WORK_FOLDER,jobId:id,profile:"readonly"},{claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:config,caps:{maxStartsPerMinute:1000}});
  assert.equal(r.errorCode,"profile");assert.equal(capture.length,0);assert.ok(!fs.existsSync(path.join(tmpJobRoot,id)));
+});
+
+// ----------------------------------------------- buildReadonlyMemoryAppend (PR #6 follow-up: a
+// readonly job's --setting-sources "" also skips CLAUDE.md memory entirely -- see job-core.mjs's
+// comment above buildReadonlyMemoryAppend for the probe that found this).
+
+test("buildReadonlyMemoryAppend: returns null when neither file exists", () => {
+ const missingUser=path.join(tmpJobRoot,"no-such-user-claude.md");
+ assert.equal(buildReadonlyMemoryAppend(path.join(tmpJobRoot,"no-such-project-dir"),missingUser),null);
+});
+
+test("buildReadonlyMemoryAppend: includes both files under clear, distinct headings", () => {
+ const userMd=path.join(tmpJobRoot,"memory-user.md"); fs.writeFileSync(userMd,"USER_CANARY_1\n");
+ const projectDir=path.join(tmpJobRoot,"memory-project-dir"); fs.mkdirSync(projectDir,{recursive:true});
+ fs.writeFileSync(path.join(projectDir,"CLAUDE.md"),"PROJECT_CANARY_1\n");
+ const text=buildReadonlyMemoryAppend(projectDir,userMd);
+ assert.match(text,/USER_CANARY_1/); assert.match(text,/PROJECT_CANARY_1/);
+ assert.match(text,/User-level CLAUDE\.md/); assert.match(text,/Project CLAUDE\.md.*not more trusted than the rest of the repo/);
+ assert.ok(text.indexOf("User-level")<text.indexOf("USER_CANARY_1"),"heading must precede its own file's content");
+});
+
+test("buildReadonlyMemoryAppend: missing project file is skipped, user file alone still included", () => {
+ const userMd=path.join(tmpJobRoot,"memory-user-only.md"); fs.writeFileSync(userMd,"USER_CANARY_2\n");
+ const text=buildReadonlyMemoryAppend(path.join(tmpJobRoot,"no-such-project-dir-2"),userMd);
+ assert.match(text,/USER_CANARY_2/); assert.ok(!text.includes("Project CLAUDE.md"));
+});
+
+test("buildReadonlyMemoryAppend: null workFolder (container-shaped call) skips project file, not just missing", () => {
+ const userMd=path.join(tmpJobRoot,"memory-user-null-wf.md"); fs.writeFileSync(userMd,"USER_CANARY_3\n");
+ const text=buildReadonlyMemoryAppend(null,userMd);
+ assert.match(text,/USER_CANARY_3/);
+});
+
+test("buildReadonlyMemoryAppend: truncates an oversized file at the cap and says so", () => {
+ const userMd=path.join(tmpJobRoot,"memory-user-big.md");
+ fs.writeFileSync(userMd,"A".repeat(READONLY_CLAUDE_MD_MAX_BYTES+500));
+ const text=buildReadonlyMemoryAppend(path.join(tmpJobRoot,"no-such-project-dir-3"),userMd);
+ assert.match(text,/truncated at \d+ bytes/);
+ assert.ok(text.includes("A".repeat(READONLY_CLAUDE_MD_MAX_BYTES)),"must keep exactly the capped byte count");
+ assert.ok(!text.includes("A".repeat(READONLY_CLAUDE_MD_MAX_BYTES+1)),"must not exceed the cap");
+});
+
+test("buildReadonlyMemoryAppend: an unreadable (directory-shaped) CLAUDE.md throws instead of silently skipping", () => {
+ const userMdAsDir=path.join(tmpJobRoot,"memory-user-is-a-dir.md"); fs.mkdirSync(userMdAsDir,{recursive:true});
+ assert.throws(()=>buildReadonlyMemoryAppend(path.join(tmpJobRoot,"no-such-project-dir-4"),userMdAsDir),/Cannot read user-level CLAUDE\.md/);
+});
+
+test("startJob: readonly job's argv carries both CLAUDE.md files via --append-system-prompt-file, additive with denial guidance", async () => {
+ const userMd=path.join(tmpJobRoot,"wired-user.md"); fs.writeFileSync(userMd,"WIRED_USER_CANARY\n");
+ const projectDir=path.join(tmpJobRoot,"wired-project-dir"); fs.mkdirSync(projectDir,{recursive:true});
+ fs.writeFileSync(path.join(projectDir,"CLAUDE.md"),"WIRED_PROJECT_CANARY\n");
+ const operatorSettings=path.join(tmpJobRoot,"wired-operator-settings.json"); fs.writeFileSync(operatorSettings,"{}");
+ const id=jid("memory-wired"); const capture=[];
+ const r=await startJob({prompt:"canary",workFolder:projectDir,jobId:id,profile:"readonly"},
+   {claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:operatorSettings,
+    userClaudeMdPath:userMd,caps:{maxStartsPerMinute:1000,maxConcurrent:1000}});
+ assert.ok(!r.error,JSON.stringify(r));
+ const argv=capture[0].argv;
+ const fileIdx=argv.indexOf("--append-system-prompt-file");
+ assert.ok(fileIdx!==-1,"must pass the memory text via --append-system-prompt-file: "+JSON.stringify(argv));
+ const memoryFileContent=fs.readFileSync(argv[fileIdx+1],"utf8");
+ assert.match(memoryFileContent,/WIRED_USER_CANARY/); assert.match(memoryFileContent,/WIRED_PROJECT_CANARY/);
+ // Additive, not a replacement: the separate inline denial-guidance flag must still be present too.
+ const inlineIdx=argv.indexOf("--append-system-prompt");
+ assert.ok(inlineIdx!==-1); assert.match(argv[inlineIdx+1],/profile: "readonly"/);
+ assert.notEqual(inlineIdx,fileIdx);
+});
+
+test("startJob: readonly job with no CLAUDE.md files anywhere never pushes --append-system-prompt-file", async () => {
+ const emptyWorkFolder=path.join(tmpJobRoot,"memory-wired-empty-dir"); fs.mkdirSync(emptyWorkFolder,{recursive:true});
+ const noUserMd=path.join(tmpJobRoot,"no-such-user-claude-2.md");
+ const operatorSettings=path.join(tmpJobRoot,"wired-operator-settings-2.json"); fs.writeFileSync(operatorSettings,"{}");
+ const id=jid("memory-empty"); const capture=[];
+ const r=await startJob({prompt:"canary",workFolder:emptyWorkFolder,jobId:id,profile:"readonly"},
+   {claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:operatorSettings,
+    userClaudeMdPath:noUserMd,caps:{maxStartsPerMinute:1000,maxConcurrent:1000}});
+ assert.ok(!r.error,JSON.stringify(r));
+ assert.equal(capture[0].argv.indexOf("--append-system-prompt-file"),-1);
+});
+
+test("startJob: code profile never passes --append-system-prompt-file even if CLAUDE.md files exist", async () => {
+ const projectDir=path.join(tmpJobRoot,"code-profile-project-dir"); fs.mkdirSync(projectDir,{recursive:true});
+ fs.writeFileSync(path.join(projectDir,"CLAUDE.md"),"SHOULD_NOT_BE_READ_SEPARATELY\n");
+ const id=jid("code-no-file-flag"); const capture=[];
+ const r=await startJob({prompt:"canary",workFolder:projectDir,jobId:id,profile:"code"},
+   {claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,caps:{maxStartsPerMinute:1000,maxConcurrent:1000}});
+ assert.ok(!r.error,JSON.stringify(r));
+ assert.equal(capture[0].argv.indexOf("--append-system-prompt-file"),-1);
+});
+
+test("startJob: an unreadable user CLAUDE.md fails a readonly launch before reserving the job", async () => {
+ const userMdAsDir=path.join(tmpJobRoot,"startjob-user-claude-is-dir"); fs.mkdirSync(userMdAsDir,{recursive:true});
+ const operatorSettings=path.join(tmpJobRoot,"wired-operator-settings-3.json"); fs.writeFileSync(operatorSettings,"{}");
+ const id=jid("unreadable-memory"); const capture=[];
+ const r=await startJob({prompt:"canary",workFolder:WORK_FOLDER,jobId:id,profile:"readonly"},
+   {claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:operatorSettings,
+    userClaudeMdPath:userMdAsDir,caps:{maxStartsPerMinute:1000,maxConcurrent:1000}});
+ assert.equal(r.errorCode,"profile"); assert.equal(capture.length,0); assert.ok(!fs.existsSync(path.join(tmpJobRoot,id)));
 });
