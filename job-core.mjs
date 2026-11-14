@@ -30,6 +30,7 @@ import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage
          redactSecrets, readRedactedTail, checkHttpBridgeLocked, resolveGitIdentity, CONTAINER_JOB_LABEL, CREDS_DIR_NAME,
          writeContainerModeMarker, containerModeMarkerPath } from "./container.mjs";
 import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
+import { withLanternPreamble } from "./lantern-preamble.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -1305,7 +1306,12 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const jobHermesHome = hermesHomeIsolationEnabled && !containerPlan ? path.join(p.d, "hermes_home") : null;
   if (jobHermesHome) fs.mkdirSync(jobHermesHome, { recursive: true });
 
-  const argv = ["-p", prompt, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
+  // promptForCli (not `prompt` itself): mintCard()'s card title and meta.json's displayed prompt
+  // preview below both use the original `prompt` -- the Lantern line is for the CLI's eyes only,
+  // never shown to a person. See lantern-preamble.mjs. safePermissionsEnabled is already resolved
+  // above (fix 4's refuse-not-downgrade check), reused here unchanged.
+  const promptForCli = withLanternPreamble(prompt);
+  const argv = ["-p", promptForCli, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   argv.push(...(safePermissionsEnabled ? ["--permission-mode", "dontAsk"] : ["--dangerously-skip-permissions"]));
   const resolvedModel = model || DEFAULT_MODEL;
   argv.push("--model", resolvedModel);
@@ -1440,7 +1446,8 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const launchExtra = {};
   if (containerPlan) {
     const effortArgv = eff === "ultracode" ? ["--effort", "xhigh"] : FLAG_EFFORT.has(eff) ? ["--effort", eff] : [];
-    const cliArgv = buildContainerCliArgv({ prompt, model: resolvedModel, effortArgv,
+    // promptForCli, same reasoning as the host argv above.
+    const cliArgv = buildContainerCliArgv({ prompt: promptForCli, model: resolvedModel, effortArgv,
                                             settings: buildContainerSettings({ ultracode: eff === "ultracode" }) });
     launchArgv = buildDockerRunArgv({ plan: containerPlan, cliArgv, extraEnv });
     launchCommand = containerPlan.dockerBin;

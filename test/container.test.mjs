@@ -27,6 +27,7 @@ after(() => { try { fs.rmSync(TMP, { recursive: true, force: true }); } catch {}
 
 const c = await import("../container.mjs");
 const core = await import("../job-core.mjs");
+const { withLanternPreamble } = await import("../lantern-preamble.mjs");
 const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 // The GitHub App that container jobs act as (github-app.mjs): a throwaway key per test run.
@@ -602,8 +603,10 @@ test("startJob: with container mode off (default), argv/command/env are what the
   assert.ok(!a[0].argv.includes("run") && !a[0].argv.includes("--rm"));
   assert.deepEqual(a[0].launchExtra, {}, "no container record for host jobs");
   // The literal pre-container argv shape for this input (prompt/model/effort/settings layout).
+  // The prompt itself now carries the Lantern preamble (see lantern-preamble.mjs) -- the CLI's
+  // own eyes only, never shown on the card or in meta.json's prompt preview.
   const i = a[0].argv.indexOf("--settings");
-  assert.deepEqual(a[0].argv.slice(0, i), ["-p", "hello", "--strict-mcp-config", "--mcp-config",
+  assert.deepEqual(a[0].argv.slice(0, i), ["-p", withLanternPreamble("hello"), "--strict-mcp-config", "--mcp-config",
     path.join(REPO_DIR, "empty-mcp.json"), "--dangerously-skip-permissions", "--model", "claude-sonnet-5", "--effort", "medium"]);
   assert.equal(a[0].argv.length, i + 2);
   const meta = JSON.parse(fs.readFileSync(path.join(a[0].p.d, "meta.json"), "utf8"));
@@ -671,7 +674,7 @@ test("startJob: sandbox:\"container\" launches docker with the container argv an
   assert.equal(cwd, p.d, "the docker client runs in the job dir, never in a repo");
   assert.equal(argv[0], "run");
   assert.equal(valueAfter(argv, "--name"), `claude-async-${id}`);
-  assert.equal(argv.at(-1), "--version do it");
+  assert.equal(argv.at(-1), withLanternPreamble("--version do it"));
   assert.equal(argv.at(-2), "--");
   assert.ok(argv.includes("--model=claude-opus-4-8"));
   assert.equal(argv[argv.indexOf("--effort") + 1], "xhigh");

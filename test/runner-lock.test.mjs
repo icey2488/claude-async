@@ -94,7 +94,10 @@ function hostJob() {
                  cwd: dir, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code") };
   fs.writeFileSync(path.join(dir, "spec.json"), JSON.stringify(spec));
   fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ jobId: `job${seq}`, pid: 1 }));
-  const env = { ...process.env, CLAUNKER_JOBCARD_CMD: JSON.stringify(["__no_such_jobcard_binary__"]), HOME: path.join(TMP, "home"), USERPROFILE: path.join(TMP, "home") };
+  // CLAUDE_ASYNC_TEST: belt-and-suspenders alongside lantern-notify.mjs's own NODE_TEST_CONTEXT
+  // detection -- this job-runner.mjs child must never reach AgentGlass's real default port with
+  // a fake job named `job${seq}` (see lantern-notify.mjs's "Test isolation" header note).
+  const env = { ...process.env, CLAUDE_ASYNC_TEST: "1", CLAUNKER_JOBCARD_CMD: JSON.stringify(["__no_such_jobcard_binary__"]), HOME: path.join(TMP, "home"), USERPROFILE: path.join(TMP, "home") };
   const run = () => new Promise((resolve) => { const c = spawn(process.execPath, [RUNNER, path.join(dir, "spec.json")], { env, stdio: "ignore" }); c.on("exit", (code) => resolve(code)); });
   const runs = () => { try { return fs.readFileSync(ran, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
   return { dir, run, runs, lock: path.join(dir, "runner.lock") };
