@@ -127,10 +127,9 @@ export function checkDepth(depth) {
 }
 
 // Job profiles (safe-mode-profiles, 2026-11-09/2026-11-12/2026-11-13): same accident-guard nature
-// as depth above -- a nested job (depth > 0) is refused a profile BROADER than the one its own
-// environment carries (CLAUDE_ASYNC_JOB_PROFILE, set by job-core.mjs's startJob() into the launched
-// process's env), so a job cannot escalate its own blast radius by dispatching a child with a wider
-// profile than it was given. Like depth, this is enforced against a value the dispatcher controls
+// as depth above. Local/API resolution supplies the recorded parent profile; unknown nested
+// parents are refused. This reduces accidental dispatch with a wider profile than the parent.
+// Like depth, the identity is still based on values the dispatcher controls
 // and a child could in principle misreport if it fabricated its own environment before calling back
 // in -- it stops an accidental or naive escalation, not a determined adversary. Profiles only affect
 // anything when safe mode (CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) is on; see job-core.mjs's
@@ -146,9 +145,10 @@ export const DEFAULT_PROFILE = "code"; // matches the only profile that existed 
 export const PROFILE_ENV = "CLAUDE_ASYNC_JOB_PROFILE";
 // Self-reported by the CALLING process when it forwards a start request to another host's
 // host-api.mjs (dispatch.mjs's forward(), mirroring DEPTH_HEADER) -- same accident-guard caveat as
-// depth: a determined caller can lie about either header. host-api.mjs prefers the AUTHORITATIVE
-// profile recorded in the parent job's own meta.json (looked up via JOB_ID_HEADER) when that job id
-// resolves to a job on the receiving host, and falls back to this header only when it doesn't.
+// depth: a determined caller can lie about either header. host-api.mjs uses the recorded
+// profile in the parent job's own meta.json (looked up via JOB_ID_HEADER) when that job id
+// resolves to a job on the receiving host; unknown nested parents are rejected. The profile
+// header is retained for compatibility but cannot substitute for a missing record.
 export const PROFILE_HEADER = "x-claude-async-profile";
 export const JOB_ID_HEADER = "x-claude-async-parent-job-id";
 // Set on every launched job's own process (host and container alike) so it can name itself when it
@@ -170,7 +170,8 @@ export function checkProfile(depth, requestedProfile, env = process.env) {
   if (!isProfile(requestedProfile)) return `invalid profile ${JSON.stringify(requestedProfile)} (must be one of ${PROFILES.join(", ")})`;
   if (depth > 0) {
     const parentRaw = env[PROFILE_ENV];
-    const parent = isProfile(parentRaw) ? parentRaw : DEFAULT_PROFILE;
+    if (!isProfile(parentRaw)) return "nested job has no known parent profile; no job started";
+    const parent = parentRaw;
     if (PROFILE_RANK[requestedProfile] > PROFILE_RANK[parent]) {
       return `nested job (dispatch depth ${depth}) may not request profile "${requestedProfile}", broader ` +
         `than its parent's profile "${parent}"; no job started`;

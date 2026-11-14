@@ -46,12 +46,10 @@ test("validateLoopbackUrl: refuses userinfo, https, and a query string/fragment"
   assert.ok(validateLoopbackUrl("http://127.0.0.1:9999/ok#frag", targets).error);
 });
 
-test("the real production allowlist contains exactly the three verified pairs", async () => {
+test("the real production allowlist contains only the bridge health route", async () => {
   const mod = await import("../tools/http-get-loopback.mjs");
   assert.deepEqual(mod.ALLOWED_TARGETS, [
     { port: 7842, path: "/healthz" },
-    { port: 11434, path: "/api/tags" },
-    { port: 11434, path: "/api/ps" },
   ]);
 });
 
@@ -85,7 +83,7 @@ test("getLoopback(): refuses a target not in the allowlist, never connects", asy
   }
 });
 
-test("getLoopback(): follows a redirect only while it stays within the allowlist", async () => {
+test("getLoopback(): never follows even an allowlisted redirect", async () => {
   const server = await startServer((req, res) => {
     if (req.url === "/healthz") { res.writeHead(302, { location: `/api/tags` }); res.end(); return; }
     res.writeHead(200, { "content-type": "text/plain" });
@@ -94,9 +92,9 @@ test("getLoopback(): follows a redirect only while it stays within the allowlist
   try {
     const targets = [{ port: portOf(server), path: "/healthz" }, { port: portOf(server), path: "/api/tags" }];
     const out = await getLoopback(`http://127.0.0.1:${portOf(server)}/healthz`, { allowedTargets: targets });
-    assert.equal(out.status, 200);
-    assert.equal(out.body, "final");
-    assert.equal(out.redirects.length, 1);
+    assert.equal(out.status, 302);
+    assert.equal(out.body, "");
+    assert.equal(out.redirects.length, 0);
   } finally {
     await stopServer(server);
   }

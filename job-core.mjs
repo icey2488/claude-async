@@ -276,14 +276,15 @@ const bothSlashSpellings = (p) => [p, p.replace(/\\/g, "/")];
 //     a "code" job can already run arbitrary node/python, so a tighter git wrapper buys nothing
 //     there), and the write-capable git subcommands.
 // NOT a substitute for the job-tool-gate hook's per-call review; the two are complementary layers
-// (see docs/publishing.md's rollout section). The deny list (the SAME for every profile -- it is
-// the floor, never loosened by profile) is deliberately the belt to the gate hook's suspenders: a
+// (see docs/publishing.md's rollout section). The deny list has a shared floor and extra readonly
+// denies. As defense in depth for the tool permissions, a
 // static deny rule can never be overridden by a PreToolUse hook's "allow" (confirmed against the
 // current permissions docs -- "deny rules... evaluated regardless of what a PreToolUse hook
 // returns"), so these hold even if the gate hook is disabled, missing, or buggy. `//` anchors at
 // the filesystem root so the rule holds regardless of which workFolder/worktree a job runs in.
 export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
-  const resolvedProfile = isProfile(profile) ? profile : DEFAULT_PROFILE;
+  if (!isProfile(profile)) throw new TypeError("invalid profile " + JSON.stringify(profile));
+  const resolvedProfile = profile;
 
   // Raw git for "code" only (2026-11-13 review round: a reviewer-demonstrated set of raw `git ...`
   // allow rules -- including ones that LOOK read-only, like `git log -1 --output=file`,
@@ -358,21 +359,13 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   ];
   const forShells = (prefixes) => prefixes.flatMap((p) => [`Bash(${p})`, `PowerShell(${p})`]);
 
-  // Read-only PowerShell cmdlets (safe-mode-profiles ITEM 1, 2026-11-09 denial tally §F: these were
-  // badly underprovisioned -- Get-ScheduledTask/Get-NetTCPConnection/Get-CimInstance alone accounted
-  // for 3 of 13 tallied denials). Every one of these only reads state; none can write a file or run
-  // arbitrary code. Available in every profile, including readonly. `Get-Content` is NOT in this
-  // list (ITEM 2 -- it returns file CONTENTS, which must go through the Read tool's own deny rules
-  // instead). `Get-Item`/`Get-ChildItem` are ALSO deliberately absent (2026-11-13 review round,
-  // fix 3): `Get-Item Env:NAME` / `Get-ChildItem Env:` print environment variable VALUES (including
-  // secrets), which is metadata in the filesystem-path sense these cmdlets were allow-listed for
-  // but not in the sense that matters here. Glob/Read already cover directory listing and file
-  // metadata for a safe-mode job; neither can print an environment variable's value.
+  // Inspection cmdlets remain subject to CLI argument checks. These are accident guards,
+  // not a confidentiality boundary. CIM environment reads are code-only.
   const READONLY_CMDLETS = [
     "Get-ScheduledTask", "Get-ScheduledTaskInfo", "Get-NetTCPConnection",
     "Get-CimInstance", "Get-Process", "Get-Service", "Test-Path", "Get-Date", "Get-FileHash", "Resolve-Path",
   ];
-  const READONLY_CMDLET_ALLOW = READONLY_CMDLETS.flatMap((c) => [`PowerShell(${c})`, `PowerShell(${c} *)`]);
+  const READONLY_CMDLET_ALLOW = READONLY_CMDLETS.filter(c => resolvedProfile !== "readonly" || c !== "Get-CimInstance").flatMap((c) => [`PowerShell(${c})`, `PowerShell(${c} *)`]);
 
   // Version/auth-status-only checks (ITEM 1, denial tally §F: invoking `gh`/`claude` at all matched
   // no allow rule, so even a harmless `--version` was denied). Exact strings only -- NOT prefixes --
@@ -425,6 +418,9 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
     permissions: {
       allow,
       deny: [
+        ...(resolvedProfile === "readonly" ? ["Edit", "Write", "MultiEdit", "NotebookEdit", "ScheduleWakeup", "ReportFindings",
+          ...forShells(["git", "git *", "curl", "curl *", "wget", "wget *"]),
+          ...["Invoke-RestMethod", "Invoke-WebRequest", "irm", "iwr"].flatMap(c => ["PowerShell(" + c + ")", "PowerShell(" + c + " *)"])] : []),
         ...forShells(SHELL_DENY_PREFIXES),
         "Edit(//**/CLAUDE.md)", "Edit(//**/hooks/**)", "Edit(//**/.claude/settings*.json)",
         "Edit(//**/config.yaml)", "Edit(//**/scheduled-tasks/**)",
@@ -432,24 +428,12 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
         // .git/ (hooks, config, refs) is never a normal file-editing need and is easy to reach by
         // accident via a broad Edit(//**) glob a job constructs itself.
         "Edit(//**/.git/**)",
-        // ITEM 2 (shell secret-read hole, safe-mode-profiles 2026-11-12): Read(//**/.env) below
-        // denies the Claude Code READ tool against a secret file, but it has no effect on a
-        // PowerShell `Get-Content .env` call -- that is a wholly different permission namespace
-        // (a Bash/PowerShell command-prefix match, not a file-path check), so the blanket
-        // `PowerShell(Get-Content *)` allow rule that existed before this change let any job read
-        // ANY file's contents, secrets included, straight past the Read-tool deny below. Fixed by
-        // removing that allow rule entirely (every profile) rather than attempting a path-glob-
-        // shaped deny for it: this permission surface only supports a literal command-text prefix
-        // (optionally with a trailing wildcard), which cannot express "unless the path looks like
-        // an env file" -- a job that genuinely needs a file's contents uses the Read tool, which
-        // the three rules right below already govern. (ITEM 2 also covers "and similar" shell
-        // reads: no other read-only PowerShell cmdlet in READONLY_CMDLETS above returns file
-        // CONTENTS -- Get-Item is metadata-only -- so Get-Content was the one gap.)
-        //
-        // Secret files (keep both forms, plus the bare filename -- all anchored with //**/ so they
-        // match in nested directories too, e.g. sub/.env, sub/prod.env, sub/.env.local):
+        // Courtesy secret-file denies; not secret-aware process confinement.
         "Read(//**/.env)", "Read(//**/*.env)", "Read(//**/.env.*)",
         "Read(//**/.ssh/**)",
+        // Literal-colon patterns did not match ADS in CLI 2.1.325. Conservative
+        // env-prefix patterns block the tested aliases (and names such as .environment).
+        "Read(//**/.env*)", "Read(//**/*.env*)",
         // 2026-10-21 safe-permissions rehearsal gap (D:\code\reviews\safe-permissions-rehearsal-
         // 20261021.md): none of the rules above match a path shaped like the live chassis
         // (D:\claunker\**, e.g. D:\claunker\hermes\plugins.py) -- a decoy probe confirmed Edit was
@@ -474,6 +458,22 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   };
 }
 
+// Exclude ambient permissions while preserving trusted operator hooks, including AgentGlass.
+// This is operator configuration, not a defense against a hostile user account.
+export function preserveUserHooks(settings, userSettingsPath = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json")) {
+  let user;
+  try { user = JSON.parse(fs.readFileSync(userSettingsPath, "utf8")); }
+  catch (e) { if (e.code === "ENOENT") return settings; throw new Error("Cannot preserve user hooks: " + e.message); }
+  if (user.hooks !== undefined && (!user.hooks || typeof user.hooks !== "object" || Array.isArray(user.hooks))) throw new Error("Invalid user hooks configuration");
+  const generated = settings.hooks || {};
+  for (const [event, entries] of Object.entries(user.hooks || {})) {
+    if (!Array.isArray(entries)) throw new Error("Invalid user hook entries for " + event);
+    generated[event] = [...structuredClone(entries), ...(generated[event] || [])];
+  }
+  settings.hooks = generated;
+  return settings;
+}
+
 // Denial guidance (ITEM 4, safe-mode-profiles 2026-11-12): the 2026-11-09 denial tally (§F) found
 // jobs giving up after a single denied call instead of retrying with a plain, differently-shaped
 // command, or reporting the exact denial and moving on -- the generic "don't ask mode" refusal
@@ -482,8 +482,9 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
 // when safe permissions are actually on, so a --dangerously-skip-permissions job's prompt is
 // unchanged. Mirrors the same "stop and report, do not route around a denial" rule this very job
 // was launched under.
-export function buildDenialGuidanceText(profile) {
-  const resolvedProfile = isProfile(profile) ? profile : DEFAULT_PROFILE;
+export function buildDenialGuidanceText(profile = DEFAULT_PROFILE) {
+  if (!isProfile(profile)) throw new TypeError("invalid profile " + JSON.stringify(profile));
+  const resolvedProfile = profile;
   return `Safe mode is on for this job (profile: "${resolvedProfile}", --permission-mode dontAsk). ` +
     `A denied tool call means it matched no allow rule, or an explicit deny rule won -- it is not a ` +
     `transient error, and retrying the exact same command will be denied again. Do not look for a ` +
@@ -969,7 +970,7 @@ export function isSafeJobId(id) {
 // launch -- never from a self-reported header, which a caller can simply lie about. Returns the
 // recorded profile (one of guard.mjs's PROFILES) if `id` names a real job on THIS host with a
 // valid recorded profile, else null (unknown job, unreadable meta.json, or a meta.json predating
-// this field) -- callers fall back to a self-reported profile header in that case.
+// this field). Nested callers without a resolvable record are rejected.
 export function readJobProfile(id) {
   if (!isSafeJobId(id)) return null;
   try {
@@ -1133,6 +1134,7 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // refuse-not-downgrade check runs before anything is written. requestedProfile/safePermissionsEnabled
   // are reused unchanged further down -- there is exactly one source of truth for each in this function.
   const requestedProfile = profile === undefined ? DEFAULT_PROFILE : profile;
+  if (!isProfile(requestedProfile)) return fail("profile", "invalid profile " + JSON.stringify(requestedProfile));
   const safePermissionsEnabled = opts.safePermissions !== undefined ? Boolean(opts.safePermissions) : SAFE_PERMISSIONS_ENV_DEFAULT;
   // Refuse, never downgrade (2026-11-13 review round, fix 4): "readonly" only means anything under
   // --permission-mode dontAsk on the HOST -- a container job always runs the CLI inside the
@@ -1197,13 +1199,16 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // from it are host-only today (buildSafePermissionsSettings() is never consulted on the container
   // path). opts.profileEnv (fix 5, nested dispatch): the AUTHORITATIVE env to read the caller's own
   // profile from, when the caller is known (host-api.mjs resolves it from the parent job's own
-  // meta.json, or falls back to a self-reported header) -- defaults to this process's own env,
-  // which is only meaningful when startJob() is itself running inside the calling job's process
+  // meta.json; missing records are refused) -- local production calls also resolve the job ID,
+  // which is only meaningful when startJob() runs inside the calling job's process
   // (never true for a request that arrived over HTTP).
-  const profileError = checkProfile(d.depth, requestedProfile, opts.profileEnv || process.env);
+  const profileError = checkProfile(d.depth, requestedProfile, opts.profileEnv || { [PROFILE_ENV]: readJobProfile(process.env[JOB_ID_ENV]) });
   if (profileError) return fail("profile", profileError);
   const resolvedProfile = requestedProfile;
 
+  let operatorHooks;
+  try { if (resolvedProfile === "readonly") operatorHooks = preserveUserHooks({}, opts.userSettingsPath).hooks; }
+  catch (e) { return fail("profile", e.message); }
   const p = jobPaths(id);
   const nowMs = (opts.now || new Date()).getTime();
   const caps = resolveCaps(opts.caps);
@@ -1250,6 +1255,12 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   // whichever of ultracode/hooks lost that race).
   const toolGateEnabled = opts.toolGate !== undefined ? Boolean(opts.toolGate) : JOB_TOOL_GATE_ENV_DEFAULT;
   const settingsObj = buildNoBackgroundHookSettings({ toolGate: toolGateEnabled, liveHermesHome, ollamaGuard: safePermissionsEnabled });
+  if (resolvedProfile === "readonly") {
+    argv.push("--setting-sources", "");
+    for (const [event, entries] of Object.entries(operatorHooks || {})) {
+      settingsObj.hooks[event] = [...entries, ...(settingsObj.hooks[event] || [])];
+    }
+  }
   if (safePermissionsEnabled) {
     Object.assign(settingsObj, buildSafePermissionsSettings(resolvedProfile));
     // Denial guidance (ITEM 4): additive system-prompt text, only when safe permissions are

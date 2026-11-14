@@ -180,7 +180,7 @@ test("depth accident guard: depth > 1 rejected, malformed rejected, job gets dep
   const ok0 = await dispatch.startLocal({ prompt: "p" }, cfg, { launch: fakeLaunch });
   assert.ok(!ok0.error);
   assert.equal(readTicket(ok0.jobId).envOverrides.CLAUDE_ASYNC_DEPTH, "1");
-  const ok1 = await dispatch.startLocal({ prompt: "p" }, cfg, { launch: fakeLaunch, depth: "1" });
+  const ok1 = await dispatch.startLocal({ prompt: "p" }, cfg, { launch: fakeLaunch, depth: "1", profileEnv: { CLAUDE_ASYNC_JOB_PROFILE: "code" } });
   assert.ok(!ok1.error);
   assert.equal(readTicket(ok1.jobId).envOverrides.CLAUDE_ASYNC_DEPTH, "2");
   completeAll();

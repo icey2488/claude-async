@@ -74,13 +74,8 @@ test("guard.mjs: checkProfile allows a nested job requesting its parent's own pr
   assert.equal(checkProfile(1, "readonly", { [PROFILE_ENV]: "code" }), null);
 });
 
-test("guard.mjs: checkProfile treats a missing/invalid parent profile as DEFAULT_PROFILE (code)", () => {
-  // code is DEFAULT_PROFILE, so a parent that reads as code (missing, or an unrecognized string)
-  // is never "broader" than code -- there is nothing broader than DEFAULT_PROFILE left to request
-  // since "ops" was removed, so this only has a positive case to assert now.
-  assert.equal(checkProfile(1, "code", {}), null);
-  assert.equal(checkProfile(1, "code", { [PROFILE_ENV]: "bogus" }), null);
-  assert.equal(checkProfile(1, "readonly", {}), null);
+test("missing or invalid nested parent profile is refused", () => {
+  for (const profile of PROFILES) for (const env of [{}, { [PROFILE_ENV]: "bogus" }]) assert.match(checkProfile(1, profile, env), /no known parent/);
 });
 
 // ------------------------------------------------------- job-core.mjs: buildSafePermissionsSettings
@@ -144,12 +139,7 @@ test("code adds file editing, raw git, and the dev-tool runners on top of readon
   assert.ok(code.has("Bash(git commit *)") && code.has("Bash(git checkout *)"));
 });
 
-test("ops is not a recognized profile: buildSafePermissionsSettings falls back to code for it", () => {
-  assert.deepEqual(buildSafePermissionsSettings("ops").permissions.allow, buildSafePermissionsSettings("code").permissions.allow);
-  for (const profile of PROFILES) {
-    assert.ok(![...allowSet(profile)].some((r) => r.includes("ops-actions")), `ops-actions must be absent from ${profile} (the runner was removed)`);
-  }
-});
+test("ops is rejected by the internal settings builder", () => { assert.throws(() => buildSafePermissionsSettings("ops"), /invalid profile/); });
 
 test("Get-Content, Get-Item, and Get-ChildItem are absent from every profile's allow list (fix 3: env/file-content read hole)", () => {
   for (const profile of PROFILES) {
@@ -204,14 +194,17 @@ test("code accident guards (fix 7): .git/** edits and forced worktree-remove/che
   }
 });
 
-test("the deny floor is identical across both profiles (never loosened per profile)", () => {
-  const denies = PROFILES.map((p) => JSON.stringify(buildSafePermissionsSettings(p).permissions.deny.slice().sort()));
-  assert.equal(denies[0], denies[1]);
+test("readonly adds write denies to the shared floor", () => {
+ const ro = new Set(buildSafePermissionsSettings("readonly").permissions.deny);
+ for (const deny of buildSafePermissionsSettings("code").permissions.deny) assert.ok(ro.has(deny));
+ for (const tool of ["Write","Edit","MultiEdit","NotebookEdit","ScheduleWakeup"]) assert.ok(ro.has(tool));
 });
 
-test("an unrecognized profile string falls back to DEFAULT_PROFILE (code)'s allow list", () => {
-  assert.deepEqual(buildSafePermissionsSettings("not-a-real-profile").permissions.allow, buildSafePermissionsSettings(DEFAULT_PROFILE).permissions.allow);
-  assert.deepEqual(buildSafePermissionsSettings(undefined).permissions.allow, buildSafePermissionsSettings(DEFAULT_PROFILE).permissions.allow);
+test("internal profile helpers reject unknown profiles", () => {
+ for (const p of ["ops", "bogus", null]) {
+  assert.throws(() => buildSafePermissionsSettings(p), /invalid profile/);
+  assert.throws(() => buildDenialGuidanceText(p), /invalid profile/);
+ }
 });
 
 // ------------------------------------------------------------------------- buildDenialGuidanceText
@@ -350,7 +343,29 @@ test("startJob: safe permissions on builds permission settings matching the reso
   );
   assert.ok(!res.error, JSON.stringify(res));
   const settings = settingsFromArgv(capture[0].argv);
+  assert.equal(capture[0].argv[capture[0].argv.indexOf("--setting-sources") + 1], "");
   assert.ok(!settings.permissions.allow.includes("Edit"), "readonly job's settings must not allow Edit");
   assert.ok(!settings.permissions.allow.includes("Bash(git fetch)"), "readonly job's settings must NOT allow raw git fetch");
   assert.ok(settings.permissions.allow.some((r) => r.includes("git-ro.mjs")), "readonly job's settings must allow the git-ro.mjs wrapper");
+});
+
+test("readonly isolates settings sources and preserves operator hooks only", () => {
+ const p = path.join(tmpJobRoot, "operator-settings.json");
+ fs.writeFileSync(p, JSON.stringify({permissions:{allow:["Bash(node *)"]}, hooks:{PreToolUse:[{matcher:"*",hooks:[{type:"command",command:"echo telemetry-canary"}]}]}}));
+ const settings = {hooks:{PreToolUse:[{matcher:"*",hooks:[{type:"command",command:"echo job-hook"}]}]}};
+ core.preserveUserHooks(settings,p);
+ assert.equal(settings.hooks.PreToolUse.length,2);
+ assert.equal(settings.permissions,undefined);
+});
+
+test("readonly excludes CIM but code retains it", () => {
+ assert.ok(!allowSet("readonly").has("PowerShell(Get-CimInstance *)"));
+ assert.ok(allowSet("code").has("PowerShell(Get-CimInstance *)"));
+});
+
+test("invalid operator hooks fail before reserving a readonly job", async () => {
+ const config=path.join(tmpJobRoot,"bad-operator.json"); fs.writeFileSync(config,"{");
+ const id=jid("bad-hooks"); const capture=[];
+ const r=await startJob({prompt:"canary",workFolder:WORK_FOLDER,jobId:id,profile:"readonly"},{claudeBin:process.execPath,launch:fakeLaunch(capture),safePermissions:true,userSettingsPath:config,caps:{maxStartsPerMinute:1000}});
+ assert.equal(r.errorCode,"profile");assert.equal(capture.length,0);assert.ok(!fs.existsSync(path.join(tmpJobRoot,id)));
 });

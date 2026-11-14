@@ -222,17 +222,13 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "the container, as \"owner/repo\". Must be in the executing host's CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS."),
       baseRef: z.string().optional().describe("Container jobs only: branch, tag or commit to start from " +
                   "(default: the repo's default branch). The job works on a new branch and opens a PR."),
-      profile: z.enum(PROFILES).optional().describe(`A host-side tool allowlist, NOT a sandbox -- a ` +
-                  `"code" job can run node/python, which can read any file and reach any network ` +
-                  `endpoint that process can, regardless of this setting (untrusted work belongs in ` +
-                  `sandbox:"container" instead). Only affects jobs run under safe permissions ` +
-                  `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1) on sandbox:"host"; ignored/refused otherwise. ` +
-                  `Default "${DEFAULT_PROFILE}". "readonly": no file edits, no raw git, no ` +
-                  `interpreters/code-runners -- investigation only; requesting it without safe ` +
-                  `permissions on a host job is refused outright, never silently downgraded. "code": ` +
-                  `the above plus file editing, raw git, and the dev-tool runners (the historical, ` +
-                  `unrestricted-ish default). A nested job (one this job itself dispatches) may not ` +
-                  `request a profile broader than its own.`),
+      profile: z.enum(PROFILES).optional().describe("Host accident protection, NOT a hostile-job or secret boundary. " +
+                  "Use container jobs for untrusted work with limited credentials, mounts and network. " +
+                  "Default code. readonly requires safe host permissions and excludes ambient approvals: " +
+                  "no editing tools, general interpreters, raw git or raw HTTP; selected helpers and inspection tools only. " +
+                  "WebSearch has network egress, gh auth status contacts GitHub, and git objects are not secret-aware. " +
+                  "code allows editing/interpreters/raw git and can be widened by project/local approvals. " +
+                  "Nested checks are accident guards, not authorization; unknown parent records are rejected, including cross-host."),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 

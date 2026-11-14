@@ -24,7 +24,8 @@
  *
  * Usage: node ollama-generate.mjs --model <name> --prompt <text> [--system <text>] [--format <value>]
  */
-import http from "node:http";
+import { boundedRequest } from "./http-bounded.mjs";
+import { LOCAL_MODELS } from "./local-models.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -56,52 +57,8 @@ export function parseArgs(argv) {
   if (!out.model) return { error: "--model is required" };
   if (!out.prompt) return { error: "--prompt is required" };
   if (!MODEL_RE.test(out.model)) return { error: `--model ${JSON.stringify(out.model)} does not look like a valid model name` };
+  if (!LOCAL_MODELS.includes(out.model)) return { error: "--model must be an operator-allowlisted local model: " + LOCAL_MODELS.join(", ") };
   return { args: out };
-}
-
-// doRequest: connects to the LITERAL host/port (HOST/PORT above by default -- never resolved from
-// a caller-supplied value or an environment variable; the {host,port,path} override exists ONLY so
-// this script's own tests can point it at a local ephemeral-port test server instead of the real
-// Ollama daemon, a function-parameter seam a job can never reach). Never follows a redirect (the
-// http module never auto-follows; we just report whatever comes back), and aborts the response the
-// instant BODY_MAX_BYTES is exceeded rather than merely discarding the overflow while letting the
-// server keep streaming.
-function doRequest(body, deadlineMs, { host = HOST, port = PORT, path: reqPath = PATH_ } = {}) {
-  return new Promise((resolve, reject) => {
-    const payload = Buffer.from(body, "utf8");
-    // Settle the promise the instant the byte cap is hit, synchronously, inside the 'data' handler
-    // itself -- then destroy the socket purely to stop the server sending more. Waiting for
-    // destroy()'s own 'error'/'close' event to resolve is unreliable: destroy() with no error arg
-    // does not reliably emit 'error' at all (confirmed empirically: the request just hung to the
-    // deadline instead), and destroying `res` can also surface an 'error' on `req` itself racing
-    // req's own unconditional reject() below.
-    let settled = false;
-    const settle = (fn) => { if (!settled) { settled = true; fn(); } };
-    const chunks = [];
-    let total = 0;
-    const req = http.request({
-      host, port, path: reqPath, method: "POST",
-      headers: { "content-type": "application/json", "content-length": payload.length },
-      timeout: deadlineMs,
-    }, (res) => {
-      res.on("data", (c) => {
-        if (total >= BODY_MAX_BYTES) return;
-        const take = c.subarray(0, BODY_MAX_BYTES - total);
-        chunks.push(take);
-        total += take.length;
-        if (total >= BODY_MAX_BYTES) {
-          settle(() => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8"), truncated: true }));
-          res.destroy();
-        }
-      });
-      res.on("end", () => settle(() => resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString("utf8") })));
-      res.on("error", () => { /* only reachable after a deliberate destroy() above; already settled */ });
-    });
-    req.on("timeout", () => req.destroy(new Error(`request timed out after ${deadlineMs}ms`)));
-    req.on("error", (e) => settle(() => reject(e)));
-    req.write(payload);
-    req.end();
-  });
 }
 
 export async function generate(args, { deadlineMs = DEADLINE_MS, host, port, path: reqPath } = {}) {
@@ -109,19 +66,11 @@ export async function generate(args, { deadlineMs = DEADLINE_MS, host, port, pat
   if (parsed.error) return { ok: false, exitCode: EXIT.USAGE, error: parsed.error };
   const { model, prompt, system, format } = parsed.args;
   const body = JSON.stringify({ model, prompt, stream: false, ...(system ? { system } : {}), ...(format ? { format } : {}) });
-  const deadline = Date.now() + deadlineMs;
-  let timer;
   try {
-    const result = await Promise.race([
-      doRequest(body, deadlineMs, { host, port, path: reqPath }),
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("deadline exceeded")), Math.max(0, deadline - Date.now())); }),
-    ]);
-    return { ok: true, exitCode: EXIT.OK, status: result.status, body: result.body, truncated: Boolean(result.truncated) };
+    const result = await boundedRequest({ host: host ?? HOST, port: port ?? PORT, path: reqPath ?? PATH_, method: "POST", body, deadlineMs, maxBytes: BODY_MAX_BYTES });
+    return { ok: true, exitCode: EXIT.OK, ...result };
   } catch (e) {
-    const isDeadline = /deadline exceeded|timed out/i.test(e.message || "");
-    return { ok: false, exitCode: isDeadline ? EXIT.DEADLINE_EXCEEDED : EXIT.TRANSPORT_FAILED, error: e.message };
-  } finally {
-    clearTimeout(timer); // never leave this timer armed once either side of the race has settled
+    return { ok: false, exitCode: /deadline/i.test(e.message) ? EXIT.DEADLINE_EXCEEDED : EXIT.TRANSPORT_FAILED, error: e.message };
   }
 }
 

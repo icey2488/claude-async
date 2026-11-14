@@ -131,17 +131,13 @@ test("an absolute Windows path is refused", () => {
 
 // --- Normal, legitimate use still works ---------------------------------------------------------
 
-test("git status works normally and reflects an uncommitted change", () => {
-  fs.writeFileSync(path.join(repoDir, "tracked.txt"), "hello world\nmore\n");
-  const r = run(["status", "--short"]);
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /tracked\.txt/);
-});
+test("status is no longer exposed", () => { assertRefused(["status", "--short"]); });
 
-test("git diff works normally and shows the uncommitted change", () => {
-  const r = run(["diff"]);
-  assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /\+more/);
+test("diff requires two commits and excludes working tree changes", () => {
+ fs.writeFileSync(path.join(repoDir, "tracked.txt"), "UNCOMMITTED_CANARY");
+ assertRefused(["diff"]); assertRefused(["diff", "HEAD"]);
+ const r = run(["diff", "HEAD", "HEAD"]);
+ assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout, "");
 });
 
 test("git log works normally and shows the commit", () => {
@@ -173,6 +169,6 @@ test("branch list / remote -v / worktree list all work and admit no extra argume
 
 test("the main-module guard runs the CLI whether invoked with backslashes or forward slashes", () => {
   const forwardSlash = SCRIPT.replace(/\\/g, "/");
-  const r = spawnSync(process.execPath, [forwardSlash, "status"], { cwd: repoDir, encoding: "utf8" });
+  const r = spawnSync(process.execPath, [forwardSlash, "log", "--oneline"], { cwd: repoDir, encoding: "utf8" });
   assert.equal(r.status, 0, `forward-slash invocation must still run the CLI: stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
 });

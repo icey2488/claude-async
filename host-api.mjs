@@ -41,7 +41,7 @@ import { fileURLToPath } from "node:url";
 import { checkJob, listJobs, cancelJob, readJobProfile } from "./job-core.mjs";
 import { startLocal } from "./dispatch.mjs";
 import { loadHostsConfig, apiConfigPath, parseHostPrefix } from "./hosts.mjs";
-import { DEPTH_HEADER, PROFILE_HEADER, JOB_ID_HEADER, PROFILES, PROFILE_ENV, DEFAULT_PROFILE, isProfile } from "./guard.mjs";
+import { DEPTH_HEADER, JOB_ID_HEADER, PROFILES, PROFILE_ENV, DEFAULT_PROFILE, parseDepth, checkDepth } from "./guard.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
 
 export const DEFAULT_PORT = 7850;
@@ -185,22 +185,18 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
         if (body.profile !== undefined && body.profile !== null && !PROFILE_SET.has(body.profile)) {
           return send(res, 400, { error: `invalid profile ${JSON.stringify(body.profile)} (must be one of ${PROFILES.join(", ")})`, hostname });
         }
-        // Fix 5 (nested dispatch, 2026-11-13 review round): the caller's own profile, for
-        // guard.mjs's checkProfile() to compare the REQUESTED profile against when depth > 0.
-        // checkProfile() used to default to reading THIS PROCESS's (the host-api.mjs daemon's) own
-        // process.env, which never carries any individual request's caller's profile -- so a
-        // "readonly" job that forwarded a start request here with a self-reported depth header
-        // could request (and get) "code" for the child, because the daemon's own env has no
-        // CLAUDE_ASYNC_JOB_PROFILE set and checkProfile silently treated that as the most
-        // permissive default. Prefer the AUTHORITATIVE value recorded in the parent job's own
-        // meta.json (readJobProfile, keyed by JOB_ID_HEADER) when that job id resolves to a real
-        // job on THIS host; fall back to the self-reported PROFILE_HEADER (same accident-guard
-        // caveat as the depth header) only when it doesn't.
+        // Unknown nested parents are rejected, including cross-host parents.
+        // Headers remain self-reported: this is accident protection, not authorization.
+        const parsedDepth = parseDepth(req.headers[DEPTH_HEADER]);
+        const depthError = parsedDepth.error || checkDepth(parsedDepth.depth);
+        if (depthError) return send(res, 400, { error: depthError, errorCode: "depth", hostname });
         const parentJobIdHeader = req.headers[JOB_ID_HEADER];
         const recordedParentProfile = typeof parentJobIdHeader === "string" ? readJobProfile(parentJobIdHeader) : null;
-        const reportedParentProfile = req.headers[PROFILE_HEADER];
-        const parentProfile = recordedParentProfile
-          || (isProfile(reportedParentProfile) ? reportedParentProfile : DEFAULT_PROFILE);
+        // Self-reported identity remains an accident guard, not authorization.
+        if (parsedDepth.depth > 0 && !recordedParentProfile) {
+          return send(res, 400, { error: "nested parent record not found on this host; no job started", errorCode: "profile", hostname });
+        }
+        const parentProfile = recordedParentProfile || DEFAULT_PROFILE;
         const out = await startLocal(
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
             model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,

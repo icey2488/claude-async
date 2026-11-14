@@ -92,7 +92,7 @@ test("the same real readonly parent allows a child requesting readonly (its own 
   assert.equal(r.body.profile, "readonly");
 });
 
-test("without a resolvable parent job id, falls back to the self-reported PROFILE_HEADER", async () => {
+test("without a resolvable parent job id, rejects even a readonly header", async () => {
   const { port } = await startServer();
   const r = await post(port, "/v1/start",
     { host: LOCAL_HOST, prompt: "child", jobId: jid("header-only") },
@@ -103,7 +103,7 @@ test("without a resolvable parent job id, falls back to the self-reported PROFIL
   assert.equal(r.body.errorCode, "profile");
 });
 
-test("an unresolvable (unknown) parent job id falls back to the self-reported header, not to a trusted default", async () => {
+test("an unresolvable parent is rejected, including cross-host identity", async () => {
   const { port } = await startServer();
   const r = await post(port, "/v1/start",
     { host: LOCAL_HOST, prompt: "child", jobId: jid("unknown-parent"), profile: "code" },
@@ -112,12 +112,13 @@ test("an unresolvable (unknown) parent job id falls back to the self-reported he
   assert.equal(r.body.errorCode, "profile");
 });
 
-test("with no profile/job-id headers at all, depth>0 defaults the parent to DEFAULT_PROFILE (code) -- unchanged baseline behavior", async () => {
+test("with no parent headers, depth>0 is rejected", async () => {
   const { port } = await startServer();
   const r = await post(port, "/v1/start",
     { host: LOCAL_HOST, prompt: "child", jobId: jid("no-headers"), profile: "code" },
     { [DEPTH_HEADER]: "1" });
-  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.status, 400, JSON.stringify(r.body));
+  assert.equal(r.body.errorCode, "profile");
 });
 
 test("depth 0 (a direct top-level caller) may request any profile regardless of headers", async () => {
