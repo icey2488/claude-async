@@ -103,7 +103,7 @@ import { closeCard } from "./card-hook.mjs";
 import { sanitizeEnvForWin32, logIfPathextSanitized, pidAlive, isOurProcess, findDockerClientsForJob } from "./job-core.mjs";
 import { createSelfMembershipQuerier } from "./tools/jobMembership.mjs";
 import { writeJsonAtomic } from "./atomic.mjs";
-import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker } from "./discord-notify.mjs";
+import { notifyJobFinished, loadCompletenessConfig, hasCompletenessMarker, isTestMode } from "./discord-notify.mjs";
 import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG, DEFAULT_MAX_RUNTIME_MS, readEnvFileSecretValues,
          redactSecrets, secretEncodings, CREDS_DIR_NAME, CREDS_TOKEN_NAME, CONTAINER_USER, listJobContainers,
          classifyClientExit, buildCredsDirIcaclsArgv } from "./container.mjs";
@@ -265,6 +265,16 @@ const errFd = fs.openSync(err, "a");
 // and the very first failure (connection refused when AgentGlass isn't running, a timeout, ...)
 // silences every later call for this job -- one quiet attempt per job on a machine without
 // AgentGlass, not a repeated one per status change. CLAUDE_ASYNC_LANTERN=0 disables it entirely.
+//
+// No row this runner cannot clear: AgentGlass's done path requires the same session id a status
+// post was last made with (agentboard.ts's forgetAgent, keyed on name AND session), and a
+// container job's CLI runs inside an isolated container whose ~/.claude/projects the host can
+// never see (lantern-session.mjs's header) -- so neither a container job nor a host job that never
+// gets a session id resolved can ever clear a row the old code would have posted blind. The first
+// post for a job is therefore held back until lanternSession is known; a job that never resolves
+// one gets no row at all (never posted, nothing to clear), logged once at exit so the reason is on
+// disk. Container jobs never even watch for a session (none is ever discoverable), so they post
+// nothing, full stop.
 const metaPath = path.join(path.dirname(specPath), "meta.json");
 // Host jobs: the job dir's own name (job-core.mjs's `path.basename(p.d)`, e.g.
 // "claunker.fix-bug-20260925-k3v9x0qa") -- already the short, recognizable kebab slug the board
@@ -275,38 +285,52 @@ const lanternName = containerSpec ? (containerSpec.jobId || path.basename(path.d
 // Test-only escape hatch: a job's own spec.json, never an env var, so it can never leak to a job
 // this runner wasn't told about. job-core.mjs (the only production writer of spec.json) never
 // sets this field; only test harnesses that author their own spec.json directly do (see
-// lantern-notify.mjs's "Test isolation" header note). undefined for every real job.
+// lantern-notify.mjs's "Test isolation" header note). undefined for every real job. Validated
+// against loopback-only destinations by lantern-notify.mjs itself (isLoopbackHost), no matter
+// where this value came from -- a job's own files are not a trusted source for a network target.
 const lanternServer = typeof spec.lanternServer === "string" ? spec.lanternServer : undefined;
+// Only host jobs with a real cwd can ever resolve a session id (see the header above); container
+// jobs post nothing, ever.
+const lanternCanTrack = !containerSpec && Boolean(cwd);
+// Mirrors lantern-notify.mjs's own blockedRealSendInTestMode: a test-spawned job with no explicit
+// lanternServer would have every real post silently skipped anyway (see its header's "Test
+// isolation" note) -- so the diagnostic logs below must stay silent for it too, exactly as quiet
+// as a job that "never heard of Lantern" always was. A test that DOES pass an explicit lanternServer
+// (opting in on purpose) still gets the real diagnostics.
+const lanternTestModeInert = !lanternServer && isTestMode();
 let lanternAlive = lanternEnabled();
 let lanternSession = "";
 let lanternDoing = "";
+let lanternPosted = false; // true once the first (session-bearing) status row has actually been posted
 let stopLanternIntentWatch = null;
 let stopLanternSessionWatch = null;
 function lanternLog(msg) { try { fs.writeSync(errFd, `\n[job-runner] ${msg}\n`); } catch {} }
 // Fire-and-forget: must never delay job start or exit. postLanternStatus/postLanternDone never
-// reject (every failure is caught inside them), so this never needs a .catch of its own.
+// reject (every failure is caught inside them), so this never needs a .catch of its own. No-op
+// until lanternSession is known -- see the header's "No row this runner cannot clear" note.
 function lanternPost() {
-  if (!lanternAlive) return;
+  if (!lanternAlive || !lanternSession) return;
+  lanternPosted = true;
   postLanternStatus({
-    name: lanternName, doing: lanternDoing,
-    worktree: containerSpec ? "" : (cwd || ""),
+    name: lanternName, doing: lanternDoing, worktree: cwd || "",
     session: lanternSession, server: lanternServer, logLine: lanternLog,
   }).then((r) => { if (!r.ok) lanternAlive = false; });
 }
 if (lanternAlive) {
-  lanternPost(); // the start post -- doing/session are usually still unknown at this point
-  // meta.json's `intent` (job-core writes meta.json only after launching this runner and minting
-  // a card, so it is very often not there yet): repost once it appears, carrying whatever doing
-  // text the dispatcher gave this job.
-  stopLanternIntentWatch = pollUntil(() => readIntentFromMeta(metaPath), { intervalMs: 300, timeoutMs: 8000,
-    onFound: (intent) => { lanternDoing = intent; lanternPost(); } });
-  // The CLI's own session id, when this is a host job with a real cwd (see lantern-session.mjs's
-  // header for why container jobs can never get one: their CLI runs inside an isolated container
-  // whose ~/.claude/projects the host can't see). Started here, BEFORE `child = spawn(...)` below
-  // (container jobs mint a token first; host jobs spawn immediately after this), so its directory
-  // snapshot predates the file the CLI is about to create.
-  if (!containerSpec && cwd) {
+  if (lanternCanTrack) {
+    // meta.json's `intent` (job-core writes meta.json only after launching this runner and minting
+    // a card, so it is very often not there yet): once it appears, it is carried into the first
+    // post if that hasn't happened yet, or triggers a repost if it has.
+    stopLanternIntentWatch = pollUntil(() => readIntentFromMeta(metaPath), { intervalMs: 300, timeoutMs: 8000,
+      onFound: (intent) => { lanternDoing = intent; lanternPost(); } });
+    // The CLI's own session id. Started here, BEFORE `child = spawn(...)` below (container jobs
+    // mint a token first; host jobs spawn immediately after this), so its directory snapshot
+    // predates the file the CLI is about to create. Finding it fires the job's first-ever post.
     stopLanternSessionWatch = watchForSessionId({ cwd, onFound: (id) => { lanternSession = id; lanternPost(); } });
+  } else if (!lanternTestModeInert) {
+    lanternLog(containerSpec
+      ? "lantern: container jobs have no discoverable CLI session id, so no status row is posted for this job"
+      : "lantern: this job has no working directory, so no status row is posted for this job");
   }
 }
 
@@ -722,20 +746,21 @@ async function finish(code) {
     });
   } catch {}
   // Lantern: stop both watchers (a found session/intent after this point would just be wasted
-  // work) and clear this job's line. Every exit path reaches here through this one finish(), so
-  // this covers completed, failed, spawn-error, signal, and every container stop reason the same
-  // way the Discord ping above does. Awaited (its own LANTERN_TIMEOUT_MS bounds the wait) so the
-  // process does not exit mid-request, same reasoning as the Discord ping; nothing here can
-  // change `code` or any file already written above.
+  // work) and clear this job's line -- only if one was ever actually posted (see the header's "No
+  // row this runner cannot clear" note: lanternPosted is true only once lanternSession was known,
+  // and done always carries that exact same session). Every exit path reaches here through this
+  // one finish(), so this covers completed, failed, spawn-error, signal, and every container stop
+  // reason the same way the Discord ping above does. Awaited (its own LANTERN_TIMEOUT_MS bounds
+  // the wait) so the process does not exit mid-request, same reasoning as the Discord ping;
+  // nothing here can change `code` or any file already written above.
   if (stopLanternIntentWatch) stopLanternIntentWatch();
   if (stopLanternSessionWatch) stopLanternSessionWatch();
   if (lanternAlive) {
-    if (lanternSession) {
+    if (lanternPosted) {
       try { await postLanternDone({ name: lanternName, session: lanternSession, server: lanternServer, logLine: lanternLog }); } catch {}
-    } else {
-      lanternLog("lantern: no session id was resolved for this job, so its Lantern line cannot be " +
-        "cleared (the board's done path requires one); it will age out on its own after 14 days, or a " +
-        "person can clear it by hand");
+    } else if (lanternCanTrack && !lanternTestModeInert) {
+      lanternLog("lantern: no session id was resolved for this job before it exited, so no status " +
+        "row was ever posted for it (nothing to clear)");
     }
   }
   try { fs.closeSync(outFd); } catch {}

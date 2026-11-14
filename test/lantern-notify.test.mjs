@@ -11,7 +11,7 @@ import path from "node:path";
 import {
   LANTERN_HOST, DEFAULT_LANTERN_PORT,
   lanternEnabled, agentglassPortFilePath, readPublishedPort, resolveLanternPort, lanternServerUrl,
-  postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta,
+  postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta, isLoopbackHost,
 } from "../lantern-notify.mjs";
 
 // Isolates every env var this module reads, restored after each test so other test files (run in
@@ -113,6 +113,28 @@ test("postLanternStatus: an explicit `server` parameter is the only thing that s
   await close(server);
   assert.equal(r.ok, true);
   assert.equal(requests.length, 1, "an explicit server parameter is never blocked, even in test mode");
+});
+
+// ---------------------------------------------------------------------------
+// Loopback-only destinations (review point #2: refuse any server, from any source, that is not
+// a literal loopback address, no matter whether it's the resolved default or an explicit `server`)
+// ---------------------------------------------------------------------------
+
+test("isLoopbackHost: only the literal loopback hostnames pass", () => {
+  assert.equal(isLoopbackHost("127.0.0.1"), true);
+  assert.equal(isLoopbackHost("::1"), true);
+  assert.equal(isLoopbackHost("[::1]"), true);
+  assert.equal(isLoopbackHost("203.0.113.10"), false);
+  assert.equal(isLoopbackHost("localhost"), false, "a hostname that merely resolves to loopback is not itself the literal address");
+  assert.equal(isLoopbackHost("127.0.0.1.evil.example.com"), false);
+});
+
+test("postLanternStatus: an explicit `server` pointed at a non-loopback host is refused, not dialed", async () => {
+  const throwingHttp = { request: () => { throw new Error("must never dial a non-loopback destination"); } };
+  const logs = [];
+  const r = await postLanternStatus({ name: "job-x", server: "http://203.0.113.10:4000", httpImpl: throwingHttp, logLine: (m) => logs.push(m) });
+  assert.equal(r.ok, false);
+  assert.ok(logs.some((l) => /not a loopback destination/.test(l)));
 });
 
 // ---------------------------------------------------------------------------

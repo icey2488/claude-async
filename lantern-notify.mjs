@@ -105,6 +105,15 @@ export function lanternServerUrl(fsImpl = fs) {
   return `http://${LANTERN_HOST}:${resolveLanternPort(fsImpl)}`;
 }
 
+// True only for the literal loopback hostnames node:http will ever dial for a Lantern post --
+// never a hostname that merely *resolves* to loopback (dns lookups are not attempted here; this
+// is a string check against the URL's own hostname). Guards every call in this module, no matter
+// where a `server`/`url` argument came from (an explicit test server, the default destination, or
+// a per-job spec.json field a job's own files could have written) -- see postJson() below.
+export function isLoopbackHost(hostname) {
+  return hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
 // Single bounded POST over node:http (see the header for why not fetch()). Never throws, never
 // rejects. No redirect is ever followed -- http.request() has no such behavior to opt out of; a
 // 3xx response is just reported as !ok, the same as any other non-2xx status.
@@ -114,6 +123,11 @@ function postJson(url, body, { timeoutMs = LANTERN_TIMEOUT_MS, logLine, httpImpl
     try { u = new URL(url); } catch (e) {
       try { logLine && logLine(`lantern: ${url} is not a valid URL (${e.message})`); } catch {}
       resolve({ ok: false, error: "bad url" });
+      return;
+    }
+    if (!isLoopbackHost(u.hostname)) {
+      try { logLine && logLine(`lantern: refusing to post to ${url} -- not a loopback destination`); } catch {}
+      resolve({ ok: false, error: "non-loopback destination refused" });
       return;
     }
     const payload = JSON.stringify(body);

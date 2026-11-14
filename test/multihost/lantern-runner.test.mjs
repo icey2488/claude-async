@@ -13,7 +13,6 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP } from "./_setup.mjs";
 import { projectDirNameForCwd, claudeProjectsDir } from "../../lantern-session.mjs";
-import { LANTERN_HOST, resolveLanternPort } from "../../lantern-notify.mjs";
 
 after(cleanupTmp);
 
@@ -110,7 +109,7 @@ test("off switch: CLAUDE_ASYNC_LANTERN=0 means no requests are ever made", async
   assert.equal(fs.readFileSync(path.join(dir, "exit_code"), "utf8"), "0");
 });
 
-test("on + reachable: start post, session discovered mid-run, done clears the line, only allowed fields", async () => {
+test("no row the runner cannot clear: no post before a session id, exactly one status post once it's found, done clears that same session", async () => {
   // Generous margins (plenty of slack past job-runner's own 400ms session-poll interval): this
   // test is part of a full-suite run spawning many concurrent child processes, where Windows
   // process-creation contention can stretch a tight window past its budget.
@@ -120,14 +119,14 @@ test("on + reachable: start post, session discovered mid-run, done clears the li
   const sessionId = "11111111-2222-3333-4444-555555555555";
   setLanternServer(dir, `http://127.0.0.1:${port}`);
   const runnerDone = spawnRunner(dir, {});
-  // Give the start post a moment to land before planting the transcript, so the test also
-  // exercises the "doing/session still unknown" shape of the very first post.
-  await new Promise((r) => setTimeout(r, 500));
+  // Give the (now session-gated) first post every chance to fire too early before asserting it
+  // didn't -- this window is well past the 400ms session-poll interval, with no transcript planted.
+  await new Promise((r) => setTimeout(r, 900));
+  assert.equal(requests.length, 0, "no row is posted until a session id is actually known");
   plantTranscript(cwd, sessionId);
   const { code } = await runnerDone;
   await close(server);
   assert.equal(code, 0);
-  assert.ok(requests.length >= 2, `expected at least a start post and a session repost, got ${requests.length}`);
 
   for (const body of requests) {
     assert.ok(body, "every request must have a valid JSON body");
@@ -137,25 +136,47 @@ test("on + reachable: start post, session discovered mid-run, done clears the li
   }
 
   const statusPosts = requests.filter((b) => b.done === undefined);
-  assert.ok(statusPosts.some((b) => b.worktree === cwd), "at least one status post names this job's own cwd");
-  assert.ok(statusPosts.some((b) => b.session === sessionId), "a status post repeats once the session id is found");
+  assert.equal(statusPosts.length, 1, "exactly one status post: the first post is held back until the session id is known");
+  assert.deepEqual(statusPosts[0], { name: jobId, doing: "", worktree: cwd, session: sessionId });
 
   const donePosts = requests.filter((b) => b.done === true);
-  assert.equal(donePosts.length, 1, "exactly one done post");
+  assert.equal(donePosts.length, 1, "exactly one done post, matching the posted session");
   assert.deepEqual(donePosts[0], { name: jobId, done: true, session: sessionId });
 });
 
-test("meta.json's intent, written after the runner starts, is picked up and reposted", async () => {
-  const { dir } = prepareJob({ sleepMs: 3000, exitCode: 0 });
+test("meta.json's intent, discovered before the session, is carried into the job's only post rather than getting its own", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 3000, exitCode: 0 });
   const { server, requests } = startServer();
   const port = await listen(server);
+  const sessionId = "22222222-3333-4444-5555-666666666666";
   setLanternServer(dir, `http://127.0.0.1:${port}`);
   const runnerDone = spawnRunner(dir, {});
   await new Promise((r) => setTimeout(r, 400));
   addIntent(dir, "investigate the flaky test");
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(requests.filter((b) => b.done === undefined).length, 0, "the intent alone never triggers a post -- no session id yet");
+  plantTranscript(cwd, sessionId);
   await runnerDone;
   await close(server);
-  assert.ok(requests.some((b) => b && b.doing === "investigate the flaky test"));
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.equal(statusPosts.length, 1);
+  assert.equal(statusPosts[0].doing, "investigate the flaky test");
+  assert.equal(statusPosts[0].session, sessionId);
+});
+
+test("no session id is ever resolved: no status row is posted, and the job dir logs why instead of leaving a row AgentGlass can never clear", async () => {
+  // Short enough that the session watcher (400ms poll interval) never gets a single tick before
+  // the job exits, and no transcript is ever planted -- a session id is simply never discovered.
+  const { dir } = prepareJob({ sleepMs: 200, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const { code } = await spawnRunner(dir, {});
+  await close(server);
+  assert.equal(code, 0);
+  assert.equal(requests.length, 0, "nothing is ever posted without a session id -- not a status row, not a done");
+  const err = fs.readFileSync(path.join(dir, "err.log"), "utf8");
+  assert.match(err, /no session id was resolved.*no status.*row was ever posted/i);
 });
 
 test("connection refused is silent: job still completes, nothing lantern-related reaches stdout", async () => {
@@ -163,9 +184,12 @@ test("connection refused is silent: job still completes, nothing lantern-related
   await new Promise((r) => probe.listen(0, "127.0.0.1", r));
   const port = probe.address().port;
   await new Promise((r) => probe.close(r));
-  const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
+  const { dir, cwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
   setLanternServer(dir, `http://127.0.0.1:${port}`);
-  const { code } = await spawnRunner(dir, {});
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, "33333333-4444-5555-6666-777777777777");
+  const { code } = await runnerDone;
   assert.equal(code, 0);
   const out = fs.readFileSync(path.join(dir, "out.log"), "utf8");
   assert.doesNotMatch(out, /lantern/i, "a telemetry failure must never reach the job's own stdout");
@@ -173,39 +197,42 @@ test("connection refused is silent: job still completes, nothing lantern-related
   assert.match(err, /lantern/i, "the failure is still visible in the job dir's own diagnostic log");
 });
 
-// 2026-11-13 live-board incident guard: a fake job spawned exactly like a test that has never
-// heard of Lantern (no lanternServer in spec.json, no CLAUDE_ASYNC_LANTERN* env) must never reach
-// the port AgentGlass's own default would resolve to -- a decoy listener stands in for the real
-// board and must receive zero requests. If something on this machine already owns that port
-// (most likely the real local AgentGlass, exactly the thing this guard exists to protect), the
-// bind itself fails and this test is skipped rather than silently passing or risking a false pass
-// against the real board.
-test("decoy-listener guard: a job that never configured Lantern at all makes zero requests to the default destination", async () => {
-  const port = resolveLanternPort();
-  const decoy = http.createServer((req, res) => { res.writeHead(200); res.end("ok"); });
-  let bound = true;
-  await new Promise((resolve) => {
-    decoy.once("error", () => { bound = false; resolve(); });
-    decoy.listen(port, LANTERN_HOST, resolve);
-  });
-  if (!bound) {
-    console.log(`SKIP: something is already listening on ${LANTERN_HOST}:${port} (likely the real ` +
-      "AgentGlass) -- can't bind the decoy, so this run relies solely on the structural fix " +
-      "(no fallthrough to the default destination in test mode without an explicit server).");
-    return;
-  }
-  const decoyHits = [];
-  decoy.on("request", (req) => decoyHits.push(req.url));
-  try {
-    const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
-    // No setLanternServer call, no CLAUDE_ASYNC_LANTERN* env -- exactly the shape of every other
-    // test in this repo that spawns job-runner.mjs without ever thinking about Lantern.
-    const { code } = await spawnRunner(dir, {});
-    assert.equal(code, 0);
-    assert.equal(decoyHits.length, 0, `expected zero requests to the default Lantern destination, got ${decoyHits.length}`);
-  } finally {
-    await new Promise((r) => decoy.close(r));
-  }
+// 2026-11-13 live-board incident guard, reworked: the old version of this test bound the REAL
+// default Lantern port (resolveLanternPort(), almost always 4000) to prove nothing arrives there --
+// but that port is held by a real AgentGlass on any machine that runs one, including this one, so
+// the bind always failed and the test always skipped itself, silently proving nothing on this
+// machine. Instead of depending on 4000 being free, this test injects what the default resolves to
+// via CLAUDE_ASYNC_LANTERN_PORT (the one documented operator override -- see resolveLanternPort()),
+// pointing it at an ephemeral port this test owns outright, then asserts the test-mode block (no
+// fallthrough to the default destination without an explicit `server` -- see lantern-notify.mjs's
+// blockedRealSendInTestMode) still holds even though the resolved destination is now reachable. A
+// second job, given the SAME ephemeral-port mechanism but as an explicit `server`, proves requests
+// really do flow over it -- so the zero-request result above isn't just a runner that posts nothing.
+test("decoy-listener guard: a job with no explicit server sends nothing to the (injected) default destination; the identical explicit path still delivers", async () => {
+  const { server: defaultDecoy, requests: defaultHits } = startServer();
+  const defaultPort = await listen(defaultDecoy);
+  const { dir: implicitDir, cwd: implicitCwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
+  // No setLanternServer call: the only way this job could ever reach defaultDecoy is by falling
+  // through to the default destination, which CLAUDE_ASYNC_LANTERN_PORT here points right at it.
+  const implicitRunnerDone = spawnRunner(implicitDir, { CLAUDE_ASYNC_LANTERN_PORT: String(defaultPort) });
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(implicitCwd, "44444444-5555-6666-7777-888888888888");
+  const { code: implicitCode } = await implicitRunnerDone;
+  await close(defaultDecoy);
+  assert.equal(implicitCode, 0);
+  assert.equal(defaultHits.length, 0, "zero requests reach the destination the default resolution would have picked");
+
+  const { server: explicitDecoy, requests: explicitHits } = startServer();
+  const explicitPort = await listen(explicitDecoy);
+  const { dir: explicitDir, cwd: explicitCwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
+  setLanternServer(explicitDir, `http://127.0.0.1:${explicitPort}`);
+  const explicitRunnerDone = spawnRunner(explicitDir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(explicitCwd, "55555555-6666-7777-8888-999999999999");
+  const { code: explicitCode } = await explicitRunnerDone;
+  await close(explicitDecoy);
+  assert.equal(explicitCode, 0);
+  assert.ok(explicitHits.length >= 1, "the identical mechanism delivers once the destination is given explicitly");
 });
 
 test("a redirect from the Lantern server is never followed", async () => {
@@ -216,12 +243,32 @@ test("a redirect from the Lantern server is never followed", async () => {
     res.end();
   });
   const port = await listen(server);
-  const { dir } = prepareJob({ sleepMs: 50, exitCode: 0 });
+  const { dir, cwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
   setLanternServer(dir, `http://127.0.0.1:${port}`);
-  const { code } = await spawnRunner(dir, {});
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, "66666666-7777-8888-9999-000000000000");
+  const { code } = await runnerDone;
   await close(server);
   await close(targetServer);
   assert.equal(code, 0);
   assert.ok(requests.length >= 1, "the redirecting server still receives the attempt");
   assert.equal(targetRequests.length, 0, "the redirect target must never be contacted");
+});
+
+// Review point #2: the runner must refuse any Lantern destination that isn't a literal loopback
+// address, no matter where the value came from -- including a job's own spec.json, which a job
+// itself can write files into (the field is never set by job-core.mjs in production, but nothing
+// stops a job process from editing its own spec.json). 203.0.113.10 is an RFC 5737 TEST-NET-3
+// address: guaranteed non-routable, so even if the refusal somehow failed, no real host is dialed.
+test("a non-loopback lanternServer in spec.json is refused: no request is ever sent", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
+  setLanternServer(dir, "http://203.0.113.10:4000");
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, "77777777-8888-9999-0000-111111111111");
+  const { code } = await runnerDone;
+  assert.equal(code, 0);
+  const err = fs.readFileSync(path.join(dir, "err.log"), "utf8");
+  assert.match(err, /refusing to post.*not a loopback destination/i);
 });
