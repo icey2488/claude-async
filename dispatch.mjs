@@ -36,8 +36,8 @@ export function defaultCtx() {
 export function startLocal(args, cfg, startOptions = {}) {
   const jobId = mintJobId({ host: cfg.localHost, descriptor: args.jobId, now: startOptions.now,
                             ...(startOptions.suffix ? { suffix: startOptions.suffix() } : {}) });
-  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef, profile } = args;
-  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile },
+  const { prompt, workFolder, model, effort, intent, sandbox, repo, baseRef, profile, extraDirs } = args;
+  return startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile, extraDirs },
                   { caps: cfg.caps, ...startOptions, host: cfg.localHost });
 }
 
@@ -89,11 +89,12 @@ export async function dispatchStart(args, ctx = defaultCtx()) {
   const route = resolveRoute(args.host, ctx.cfg);
   if (route.error) return { error: route.error, host: args.host ?? null, hostname: os.hostname() };
   if (route.kind === "local") return startLocal(args, ctx.cfg, ctx.startOptions);
-  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile } = args;
-  // sandbox/repo/baseRef/profile are only sent when given, so a forwarded host-mode start's body is unchanged.
+  const { host, prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile, extraDirs } = args;
+  // sandbox/repo/baseRef/profile/extraDirs are only sent when given, so a forwarded host-mode start's body is unchanged.
   const out = await forward(ctx, route, "POST", "/v1/start",
                             { host, prompt, workFolder, jobId, model, effort, intent, ...(sandbox ? { sandbox } : {}),
-                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}), ...(profile ? { profile } : {}) },
+                              ...(repo ? { repo } : {}), ...(baseRef ? { baseRef } : {}), ...(profile ? { profile } : {}),
+                              ...(extraDirs ? { extraDirs } : {}) },
                             FORWARD_TIMEOUT_MS);
   return { host, ...out, forwardedBy: forwardedBy(ctx.cfg) };
 }
@@ -229,6 +230,14 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                   "WebSearch has network egress, gh auth status contacts GitHub, and git objects are not secret-aware. " +
                   "code allows editing/interpreters/raw git and can be widened by project/local approvals. " +
                   "Nested checks are accident guards, not authorization; unknown parent records are rejected, including cross-host."),
+      extraDirs: z.array(z.string()).max(8).optional().describe("Host jobs only (a container job refuses it): " +
+                  "absolute paths to EXTRA directories, beyond workFolder, this job may read (Claude Code's --add-dir). " +
+                  "Each must exist and be a directory, resolved before checking; a job's own workFolder duplicated here " +
+                  "is refused, as is anything in a protected location (credential/config stores, the live Spine data " +
+                  "dir) in any profile, and -- for profile \"code\" only -- anything under a live prod checkout " +
+                  "(D:\\claunker\\); \"readonly\" may read those. Intended for READING: in profile \"code\" an " +
+                  "Edit/Write/NotebookEdit call into one of these is denied, but a shell command can still write " +
+                  "there (accident protection, not a boundary) -- see claude_check's extraDirs field."),
     },
   }, async (args) => ok(await dispatchStart(args, getCtx())));
 
@@ -258,7 +267,9 @@ export function registerTools(server, { getCtx = defaultCtx } = {}) {
                  "A job whose CLI printed its own \"Background tasks still running after ...s; terminating\" " +
                  "line (its background-task wait ceiling fired mid-job, killing backgrounded work half done) " +
                  "always reports status \"failed\" with exit.exitReason \"bg_tasks_terminated\", even though " +
-                 "exitCode is 0 -- see CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in RUNBOOK.md. `reportIncomplete`: " +
+                 "exitCode is 0 -- see CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS in RUNBOOK.md. `extraDirs`, when " +
+                 "present, lists the extra directories (beyond workFolder) this job was granted at launch. " +
+                 "`reportIncomplete`: " +
                  "true (plus a `warning` string) means the job ended without ever writing a final report (no " +
                  "DELEGATION-METRICS marker in stdout) -- it may have stopped early, e.g. by handing a task " +
                  "off to a background subagent and ending its turn; an otherwise-clean exit (0, not " +
