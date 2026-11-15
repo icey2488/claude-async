@@ -12,6 +12,7 @@ import {
   LANTERN_HOST, DEFAULT_LANTERN_PORT,
   lanternEnabled, agentglassPortFilePath, readPublishedPort, resolveLanternPort, lanternServerUrl,
   postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta, isLoopbackHost,
+  resolveLanternWorktree,
 } from "../lantern-notify.mjs";
 
 // Isolates every env var this module reads, restored after each test so other test files (run in
@@ -238,6 +239,53 @@ test("non-2xx response is reported through logLine, not thrown", async () => {
   await close(server);
   assert.equal(r.ok, false);
   assert.ok(logs.some((l) => /HTTP 500/.test(l)));
+});
+
+// ---------------------------------------------------------------------------
+// resolveLanternWorktree (AgentGlass's agentboard.ts compares a posted `worktree` against
+// `git worktree list --porcelain`'s own output by exact string equality and by a forward-slash-
+// only prefix test -- a raw Windows-style cwd never matches. spawnSyncImpl is a fake here, never
+// a real git process, so this never depends on (or shells out from) the actual repo this test
+// runs in.)
+// ---------------------------------------------------------------------------
+
+test("resolveLanternWorktree: a Windows-style cwd is passed to git as-is, and git's own forward-slash answer is returned unchanged", () => {
+  const calls = [];
+  const fake = (cmd, args) => { calls.push({ cmd, args }); return { status: 0, stdout: "D:/code/claude-async\n" }; };
+  const r = resolveLanternWorktree("D:\\code\\claude-async", { spawnSyncImpl: fake });
+  assert.equal(r, "D:/code/claude-async");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, "git");
+  assert.deepEqual(calls[0].args, ["-C", "D:\\code\\claude-async", "rev-parse", "--show-toplevel"]);
+});
+
+test("resolveLanternWorktree: a cwd inside a subfolder of a checkout resolves to the checkout's own root, not the subfolder", () => {
+  const fake = (cmd, args) => {
+    assert.deepEqual(args, ["-C", "D:\\code\\claude-async\\test\\multihost", "rev-parse", "--show-toplevel"]);
+    return { status: 0, stdout: "D:/code/claude-async\n" }; // git's own answer: the checkout root
+  };
+  const r = resolveLanternWorktree("D:\\code\\claude-async\\test\\multihost", { spawnSyncImpl: fake });
+  assert.equal(r, "D:/code/claude-async", "must be the checkout root git names, never the subfolder passed in");
+});
+
+test("resolveLanternWorktree: a cwd that is not a git checkout returns null", () => {
+  const fake = () => ({ status: 128, stdout: "", stderr: "fatal: not a git repository (or any of the parent directories): .git" });
+  assert.equal(resolveLanternWorktree("C:\\Users\\someone\\Desktop", { spawnSyncImpl: fake }), null);
+});
+
+test("resolveLanternWorktree: a POSIX-style cwd/answer passes through unchanged", () => {
+  const fake = (cmd, args) => {
+    assert.deepEqual(args, ["-C", "/home/erick/code/claude-async", "rev-parse", "--show-toplevel"]);
+    return { status: 0, stdout: "/home/erick/code/claude-async\n" };
+  };
+  assert.equal(resolveLanternWorktree("/home/erick/code/claude-async", { spawnSyncImpl: fake }), "/home/erick/code/claude-async");
+});
+
+test("resolveLanternWorktree: git missing/erroring/timed out, or a blank answer, is null rather than thrown", () => {
+  assert.equal(resolveLanternWorktree("C:\\x", { spawnSyncImpl: () => { throw new Error("ENOENT"); } }), null);
+  assert.equal(resolveLanternWorktree("C:\\x", { spawnSyncImpl: () => ({ status: null, error: new Error("ETIMEDOUT") }) }), null);
+  assert.equal(resolveLanternWorktree("C:\\x", { spawnSyncImpl: () => ({ status: 0, stdout: "" }) }), null);
+  assert.equal(resolveLanternWorktree("", { spawnSyncImpl: () => { throw new Error("must never be called for an empty cwd"); } }), null);
 });
 
 // ---------------------------------------------------------------------------

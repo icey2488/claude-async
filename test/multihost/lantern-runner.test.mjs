@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP } from "./_setup.mjs";
 import { projectDirNameForCwd, claudeProjectsDir } from "../../lantern-session.mjs";
@@ -19,16 +19,20 @@ after(cleanupTmp);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(here, "..", "..", "job-runner.mjs");
 const FAKE = path.join(here, "lantern-fake-cli.mjs");
+const REPO_ROOT = path.join(here, "..", "..");
 let seq = 0;
 
 // Prepares a job dir + spec.json + meta.json (no `intent` unless the test adds one later) with a
-// FRESH cwd dir standing in for the job's workFolder, without running the runner yet.
-function prepareJob({ sleepMs = 0, exitCode = 0, extraArgv = [] } = {}) {
+// FRESH cwd dir standing in for the job's workFolder, without running the runner yet. `cwdOverride`
+// lets one test point the job at a real git checkout (this repo) instead of the usual
+// not-a-git-checkout TMP dir, to prove the worktree-resolution fix end to end, through the real
+// job-runner.mjs and a real `git`, not a fake.
+function prepareJob({ sleepMs = 0, exitCode = 0, extraArgv = [], cwdOverride } = {}) {
   const id = ++seq;
   const dir = path.join(TMP, `lantern-job-${id}`);
-  const cwd = path.join(TMP, `lantern-cwd-${id}`);
+  const cwd = cwdOverride || path.join(TMP, `lantern-cwd-${id}`);
   fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(cwd, { recursive: true });
+  if (!cwdOverride) fs.mkdirSync(cwd, { recursive: true });
   const spec = {
     command: process.execPath, argv: [FAKE, "--sleep-ms", String(sleepMs), "--exit", String(exitCode), ...extraArgv],
     cwd, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
@@ -376,6 +380,33 @@ test("heartbeat repost: test mode without an explicit server still sends nothing
   await close(decoy);
   assert.equal(code, 0);
   assert.equal(decoyHits.length, 0, "the test-mode block covers heartbeat reposts exactly as it covers the first post");
+});
+
+// Lantern working-state fix, runner-side half: a job whose cwd is a REAL git checkout (this repo,
+// not a TMP dir) must have its posted worktree match exactly what `git worktree list --porcelain`
+// prints for it -- the form AgentGlass's agentboard.ts compares by exact string equality
+// (stillThere) and by a forward-slash-only prefix test (under()). Goes through the real
+// job-runner.mjs and a real `git rev-parse --show-toplevel`, not a fake, to prove the fix holds
+// end to end on whatever OS this suite actually runs on (forward slashes already on POSIX, so this
+// is a no-op assertion there; the Windows-backslash case is what regressed before this fix).
+test("a job whose cwd is a real git checkout posts the worktree in the exact form `git worktree list --porcelain` prints", async () => {
+  const want = spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(want, "this suite must itself be running inside a git checkout for this test to mean anything");
+  const { dir, jobId } = prepareJob({ sleepMs: 1200, exitCode: 0, cwdOverride: REPO_ROOT });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  const sessionId = "ffffffff-0000-1111-2222-333333333333";
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(REPO_ROOT, sessionId);
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.equal(statusPosts.length, 1);
+  assert.equal(statusPosts[0].worktree, want, "the posted worktree must byte-for-byte match git's own worktree-list form, not the raw cwd string");
+  assert.deepEqual(statusPosts[0], { name: jobId, doing: "", worktree: want, session: sessionId });
 });
 
 test("heartbeat repost: a failed post disables lantern for the rest of the job, so no repost and no done follow it", async () => {
