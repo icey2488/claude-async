@@ -13,7 +13,7 @@
  *   D--code--worktrees-claude-async-lantern\a23d2871-7da2-45fa-9749-c04eccefb5f5.jsonl
  * whose first line is {"sessionId":"a23d2871-...",...} -- filename stem and sessionId agree.
  * Checked against three more real examples on the same machine (D:\code\claude-async,
- * C:\Users\Raide\code\gemini-mcp, C:\WINDOWS\system32), the escaping rule that fits all four
+ * C:\Users\example\code\gemini-mcp, C:\WINDOWS\system32), the escaping rule that fits all four
  * (including the drive-letter colon, every path separator, AND the literal underscore in
  * "_worktrees" each becoming their own "-", with no collapsing of adjacent separators) is:
  * replace every character that is not [A-Za-z0-9-] with "-". This is NOT documented upstream
