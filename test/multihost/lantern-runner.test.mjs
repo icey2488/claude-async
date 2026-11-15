@@ -303,3 +303,91 @@ test("readonly-shaped argv (--setting-sources \"\", --append-system-prompt, --ap
   assert.equal(donePosts.length, 1, "a readonly-shaped launch still gets a done post clearing the same session");
   assert.deepEqual(donePosts[0], { name: jobId, done: true, session: sessionId });
 });
+
+// Lantern working-state fix: job-runner.mjs's 60s heartbeat loop now reposts the same status line
+// (see job-runner.mjs's hbInterval), so AgentGlass's agentboard.ts:306 FRESH_MS staleness window
+// never trips for a job that is still actually running. CLAUDE_ASYNC_HEARTBEAT_MS overrides the
+// production 60s interval so these tests observe several ticks in well under a second.
+test("heartbeat repost: the same status line is posted again on every heartbeat tick while the job runs", async () => {
+  const { dir, cwd, jobId } = prepareJob({ sleepMs: 1500, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  const sessionId = "99999999-0000-1111-2222-333333333333";
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  // The session watcher snapshots the transcript directory at start, so the file must appear
+  // AFTER spawn, not before -- 400ms gives the runner's own startup plenty of margin (same
+  // delay the other tests in this file use), leaving the rest of the 1500ms sleep for the fast
+  // heartbeat below to repost into.
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, sessionId);
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.ok(statusPosts.length > 1, `expected more than one status post, got ${statusPosts.length}`);
+  for (const body of statusPosts) assert.deepEqual(body, { name: jobId, doing: "", worktree: cwd, session: sessionId });
+  const donePosts = requests.filter((b) => b.done === true);
+  assert.equal(donePosts.length, 1, "still exactly one done post regardless of how many reposts preceded it");
+});
+
+test("heartbeat repost: no post is sent on any tick before a session id is known", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 900, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  // Several 100ms heartbeat ticks fire in this window with no session known yet.
+  await new Promise((r) => setTimeout(r, 650));
+  assert.equal(requests.length, 0, "heartbeat ticks before a session id is known must never post");
+  plantTranscript(cwd, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.ok(requests.length >= 1, "a post still happens once the session id is found");
+});
+
+test("heartbeat repost: no repost ever lands after the done post clears the row", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 1500, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, "bbbbbbbb-cccc-dddd-eeee-ffffffffffff");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.ok(requests.length > 2, "expected at least one repost between the first post and done");
+  assert.equal(requests[requests.length - 1].done, true, "the done post must be the last request received, with nothing racing in after it");
+});
+
+test("heartbeat repost: test mode without an explicit server still sends nothing, even across many fast ticks", async () => {
+  const { server: decoy, requests: decoyHits } = startServer();
+  const decoyPort = await listen(decoy);
+  const { dir, cwd } = prepareJob({ sleepMs: 900, exitCode: 0 });
+  // No setLanternServer: the only way this job could reach the decoy is by falling through to the
+  // default destination, which CLAUDE_ASYNC_LANTERN_PORT here points right at (see the
+  // decoy-listener test above for why this is the only way to prove the test-mode block holds).
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(decoyPort), CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, "cccccccc-dddd-eeee-ffff-000000000000");
+  const { code } = await runnerDone;
+  await close(decoy);
+  assert.equal(code, 0);
+  assert.equal(decoyHits.length, 0, "the test-mode block covers heartbeat reposts exactly as it covers the first post");
+});
+
+test("heartbeat repost: a failed post disables lantern for the rest of the job, so no repost and no done follow it", async () => {
+  const { server, requests } = startServer((req, res) => { res.writeHead(500); res.end("nope"); });
+  const port = await listen(server);
+  const { dir, cwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, "dddddddd-eeee-ffff-0000-111111111111");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.equal(requests.length, 1, "the first failed post must disable lanternAlive, so neither a heartbeat repost nor the done post is attempted again");
+});

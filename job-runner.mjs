@@ -780,6 +780,14 @@ const HEARTBEAT_MS = Number(process.env.CLAUDE_ASYNC_HEARTBEAT_MS) || 60_000;
 hbInterval = setInterval(() => {
   writeHeartbeat();
   writeJobMembership().catch(() => {});
+  // Lantern: repost the same status line on every heartbeat tick, not just once at start. A
+  // headless job's own `saidAt` would otherwise never advance after the first post, which is
+  // the scenario AgentGlass's agentboard.ts:306 FRESH_MS staleness window is built to catch --
+  // this keeps it from ever triggering for a job that is still actually running. Already a
+  // no-op before a session id is known and after lanternPost() has disabled itself on a failed
+  // send (both via lanternPost()'s own guard); `finish()` clears this interval before posting
+  // done, so a repost can never race a cleared row back to "working".
+  if (lanternAlive && lanternSession) lanternPost();
 }, HEARTBEAT_MS);
 hbInterval.unref();
 
