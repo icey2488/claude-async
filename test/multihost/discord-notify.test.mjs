@@ -125,7 +125,7 @@ test("boundHeadline: real example 2 (cut inside an inline-code span) is now sent
 // Regression: a report opening "## Report" / "**1. Git -- `C:\...`**" used to put the bold,
 // path-bearing section label on the phone as the headline.
 test("extractHeadline: skips a bold numbered section label carrying a Windows path (real regression)", () => {
-  const stdout = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`";
+  const stdout = "## Report\n\n**1. Git — `C:\\Users\\example\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`";
   const headline = extractHeadline(stdout.split("\n"));
   assert.equal(headline, "- Branch: `main`");
   assert.ok(!containsPath(headline), "headline must not carry a path");
@@ -150,8 +150,8 @@ test("extractHeadline: emphasis around content (sentence or key: value) is still
 });
 
 test("containsPath: Windows drive, UNC, and absolute POSIX paths; not URLs or ordinary slashes", () => {
-  for (const p of ["see C:\\Users\\x", "wrote D:/code/repo", "at \\\\server\\share", "cwd /home/raide/x",
-                   "in `/c/Users/Raide`", "bin /usr/local/bin", "(/tmp/job/out.log)"]) {
+  for (const p of ["see C:\\Users\\x", "wrote D:/code/repo", "at \\\\server\\share", "cwd /home/user/x",
+                   "in `/c/Users/example`", "bin /usr/local/bin", "(/tmp/job/out.log)"]) {
     assert.ok(containsPath(p), `should detect a path in ${JSON.stringify(p)}`);
   }
   for (const s of ["https://example.com/a/b", "and/or", "3/4 tests passed", "ratio 1:2", "Verdict: all good.",
@@ -161,7 +161,7 @@ test("containsPath: Windows drive, UNC, and absolute POSIX paths; not URLs or or
 });
 
 test("extractHeadline: path-bearing lines are skipped in the tail too; none qualifying means no headline", () => {
-  const tail = ["Wrote C:\\Users\\Raide\\out.txt", "done in /home/raide/work/", "**Report**"];
+  const tail = ["Wrote C:\\Users\\example\\out.txt", "done in /home/user/work/", "**Report**"];
   assert.equal(extractHeadline(tail), null);
   assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], tail)), null);
   assert.equal(boundHeadline(chooseHeadlineLines(["## Report"], [...tail, "Tail verdict ok"])), "Tail verdict ok");
@@ -615,7 +615,7 @@ test("headline source: a markdown heading as the first line of out.log is skippe
 });
 
 test("headline source: a report opening with a bold path-bearing section label never puts the path on the ping", async () => {
-  const stdoutText = "## Report\n\n**1. Git — `C:\\Users\\Raide\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`\n";
+  const stdoutText = "## Report\n\n**1. Git — `C:\\Users\\example\\OneDrive\\Desktop\\CC bridge\\claude-async`**\n- Branch: `main`\n";
   const dir = prepareJob({ exitCode: 0, stdoutText });
   const { server, requests } = startServer(dir);
   const url = await listen(server);

@@ -148,7 +148,7 @@ await test("mintCard omits --model/--effort when not provided (absent means abse
 await test("mintCard passes the prompt's intent summary as --description (first sentence)", () => {
   // A realistic dispatch prompt: a >200-char first line (intent sentence + boilerplate),
   // so the rule extracts just the opening sentence rather than keeping the whole line.
-  const prompt = "Give the chip a vendor-keyed color. You are on native Windows as Raide. Repo lives on main which auto-deploys, gh.exe authed as icey2488, one-shot git-credential, never store creds, secret-scan every staged diff before committing.";
+  const prompt = "Give the chip a vendor-keyed color. You are on native Windows as the operator. Repo lives on main which auto-deploys, gh.exe authed as icey2488, one-shot git-credential, never store creds, secret-scan every staged diff before committing.";
   mintCard("job-desc1", REPO, null, null, prompt);
   const fields = readLog().trim().split("\t");
   const body = fields[fields.indexOf("--description") + 1];
