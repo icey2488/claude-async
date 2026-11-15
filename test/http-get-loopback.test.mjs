@@ -2,7 +2,7 @@
 // getLoopback()/validateLoopbackUrl() against local HTTP test servers on EPHEMERAL ports, with the
 // allowlist injected through getLoopback()'s `allowedTargets` function parameter (never an
 // environment variable a job could set itself) so these tests never depend on anything actually
-// listening on 7842/11434.
+// listening on 7850/11434.
 // Run: node --test test/http-get-loopback.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -46,10 +46,10 @@ test("validateLoopbackUrl: refuses userinfo, https, and a query string/fragment"
   assert.ok(validateLoopbackUrl("http://127.0.0.1:9999/ok#frag", targets).error);
 });
 
-test("the real production allowlist contains only the bridge health route", async () => {
+test("the real production allowlist contains only the host API's health route", async () => {
   const mod = await import("../tools/http-get-loopback.mjs");
   assert.deepEqual(mod.ALLOWED_TARGETS, [
-    { port: 7842, path: "/healthz" },
+    { port: 7850, path: "/healthz" },
   ]);
 });
 

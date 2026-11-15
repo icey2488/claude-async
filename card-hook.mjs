@@ -13,10 +13,34 @@
  * debug line on stderr and no error, so the start response carries no UNCARDED note.
  * Every other failure (an explicit CLAUNKER_JOBCARD_CMD that fails, ENOENT included;
  * non-zero exit; timeout) is a real misconfiguration and still surfaces as an error.
+ *
+ * Test isolation (2026-11-13 fixture-card incident: three test files called startJob() in-process
+ * with no jobcard override at all -- test/host-api-nested-profile.test.mjs, test/job-tool-gate-
+ * wiring.test.mjs, test/job-hermes-home-isolation.test.mjs -- and each filed a real "hi"/"parent"/
+ * "child"/"top-level" card on Erick's live Spine board, because this checkout's default
+ * CLAUNKER_HERMES_HOME resolves to the real prod jobcard.py; recurred 2026-11-13/14 as 400+ junk
+ * cards because every claude-async job session's OWN ambient environment already has
+ * CLAUNKER_JOBCARD_CMD set, pointed at the real D:\claunker\spine\jobcard.py -- so "an explicit
+ * CLAUNKER_JOBCARD_CMD is a deliberate opt-in" was false: an inherited one is indistinguishable
+ * from a deliberate one by that test alone):
+ *
+ * runJobcard() refuses to run ANY jobcard command under test mode (CLAUDE_ASYNC_TEST/
+ * NODE_TEST_CONTEXT, isTestMode(), imported from discord-notify.mjs -- mirrors its and
+ * lantern-notify.mjs's own belt) UNLESS BOTH (a) CLAUNKER_JOBCARD_CMD is set AND (b)
+ * CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD is set to the EXACT SAME string (see
+ * jobcardCmdAllowedInTest()). CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD is a dedicated, test-only
+ * signal: nothing else in this codebase, no job session, and no ambient shell ever sets it, so it
+ * cannot be present by accident the way an inherited CLAUNKER_JOBCARD_CMD can -- a test must
+ * deliberately repeat its own stub command into this second variable to opt in. The default for
+ * every in-process call and every spawned child that merely inherits process.env (NODE_TEST_
+ * CONTEXT propagates to a child the same way CLAUDE_ASYNC_TEST does) is "skip", whether or not
+ * that test has ever heard of jobcard, and regardless of what CLAUNKER_JOBCARD_CMD happens to be
+ * set to in the inherited environment.
  */
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { classifyFinalStatus } from "./job-status.mjs";
+import { isTestMode } from "./discord-notify.mjs";
 
 const DEFAULT_HERMES_HOME = "D:\\claunker\\spine";
 
@@ -48,10 +72,28 @@ export function resolveJobcard() {
   return [...defaultJobcard(), false];
 }
 
+// True only when CLAUNKER_JOBCARD_CMD is set AND CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD is set to
+// that EXACT SAME string. See the header's "Test isolation" note: this is the one signal that
+// lets runJobcard() actually run a command under test mode. An inherited CLAUNKER_JOBCARD_CMD
+// alone (e.g. a claude-async job session's own ambient environment, pointed at the real
+// jobcard.py) is never enough by itself -- nothing sets CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD
+// except a test that deliberately opts in.
+export function jobcardCmdAllowedInTest() {
+  const raw = process.env.CLAUNKER_JOBCARD_CMD;
+  return typeof raw === "string" && raw.length > 0 &&
+    process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD === raw;
+}
+
 // Returns { ok: true, stdout }, { ok: false, error }, or { ok: false, skipped: true } (quiet
 // mode, see header). Never throws.
 function runJobcard(args) {
   const [exe, baseArgs, explicit] = resolveJobcard();
+  // See the header's "Test isolation" note: under test mode, ANY jobcard command (explicit or
+  // default) is refused unless the dedicated CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD opt-in matches.
+  if (isTestMode() && !(explicit && jobcardCmdAllowedInTest())) {
+    try { process.stderr.write(`card-hook: test mode (CLAUDE_ASYNC_TEST/NODE_TEST_CONTEXT) without a matching CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD opt-in; skipping card\n`); } catch {}
+    return { ok: false, skipped: true };
+  }
   let result;
   try {
     result = spawnSync(exe, [...baseArgs, ...args], { encoding: "utf8", timeout: 10_000 });

@@ -193,14 +193,20 @@ function getMockCallCount() {
 }
 
 function withMock(fail, fn) {
-  const save = { cmd: process.env.CLAUNKER_JOBCARD_CMD, fail: process.env.MOCK_FAIL, cf: process.env.MOCK_CALLS_FILE };
-  process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify([process.execPath, MOCK_SCRIPT]);
+  const save = { cmd: process.env.CLAUNKER_JOBCARD_CMD, allow: process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD, fail: process.env.MOCK_FAIL, cf: process.env.MOCK_CALLS_FILE };
+  const cmd = JSON.stringify([process.execPath, MOCK_SCRIPT]);
+  process.env.CLAUNKER_JOBCARD_CMD = cmd;
+  // card-hook.mjs's strict test-mode guard requires this dedicated opt-in, set to the EXACT
+  // SAME string as CLAUNKER_JOBCARD_CMD, before the mock jobcard above will actually be invoked.
+  process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = cmd;
   process.env.MOCK_CALLS_FILE = MOCK_CALLS_FILE;
   process.env.MOCK_FAIL = fail ? "1" : "0";
   try { return fn(); }
   finally {
     if (save.cmd === undefined) delete process.env.CLAUNKER_JOBCARD_CMD;
     else process.env.CLAUNKER_JOBCARD_CMD = save.cmd;
+    if (save.allow === undefined) delete process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD;
+    else process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = save.allow;
     if (save.fail === undefined) delete process.env.MOCK_FAIL;
     else process.env.MOCK_FAIL = save.fail;
     if (save.cf === undefined) delete process.env.MOCK_CALLS_FILE;

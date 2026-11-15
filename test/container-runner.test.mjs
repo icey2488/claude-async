@@ -429,8 +429,11 @@ test("container job: the card close never runs host git, even with a startHead i
   fs.writeFileSync(path.join(bin, "git"), `#!/bin/sh\necho "$PWD $*" >> "${log}"\necho 0000000000000000000000000000000000000001\n`);
   fs.chmodSync(path.join(bin, "git"), 0o755);
   // A jobcard command that always succeeds, so closeCard gets as far as its delivery check.
+  // card-hook.mjs's strict test-mode guard requires CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD to be set
+  // to the EXACT SAME string as CLAUNKER_JOBCARD_CMD before this stub will actually be invoked.
   const okCard = JSON.stringify([process.execPath, "-e", "process.stdout.write('card-1')"]);
   const env = { PATH: `${bin}${path.delimiter}${process.env.PATH}`, CLAUNKER_JOBCARD_CMD: okCard,
+                CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD: okCard,
                 FAKE_DOCKER_STDOUT: "DELEGATION-METRICS: zero calls" };
   const j = setup(env, { meta: { cardId: "card-1", startHead: "ffffffffffffffffffffffffffffffffffffffff" } });
   runSync(j);

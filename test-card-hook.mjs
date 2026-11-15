@@ -61,6 +61,10 @@ const MOCK_CMD  = JSON.stringify([process.execPath, MOCK_SCRIPT]);
 const ERROR_CMD = JSON.stringify([process.execPath, ERROR_SCRIPT]);
 
 process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
+// card-hook.mjs's strict test-mode guard (2026-11-13/14 incidents) requires this dedicated
+// opt-in, set to the EXACT SAME string as CLAUNKER_JOBCARD_CMD, before any jobcard stub here
+// will actually be invoked -- see card-hook.mjs's header "Test isolation" note.
+process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = MOCK_CMD;
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 process.env.CLAUDE_CLI_PATH = process.execPath; // node as "claude" — exits fast with unknown flags
 // startJob() here spawns a REAL job-runner.mjs, which pings Discord on finish() -- never read the
@@ -307,22 +311,26 @@ await test("fail on nonzero exit", () => {
 
 await test("UNCARDED: mintCard with bad cmd returns {error, cardId:null} without throwing", () => {
   process.env.CLAUNKER_JOBCARD_CMD = ERROR_CMD;
+  process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = ERROR_CMD;
   try {
     const { cardId, error } = mintCard("job-t5a", REPO);
     assert(cardId === null, `expected null cardId, got ${JSON.stringify(cardId)}`);
     assert(error !== null && error.length > 0, `expected an error string, got ${JSON.stringify(error)}`);
   } finally {
     process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
+    process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = MOCK_CMD;
   }
 });
 
 await test("UNCARDED: startJob still dispatches when jobcard errors (note prefixed UNCARDED:)", async () => {
   process.env.CLAUNKER_JOBCARD_CMD = ERROR_CMD;
+  process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = ERROR_CMD;
   let result;
   try {
     result = await startJob({ prompt: "test", workFolder: REPO, jobId: "job-t5b" });
   } finally {
     process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
+    process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = MOCK_CMD;
   }
   assert(result && result.pid, "startJob should return a job record with a pid");
   assert(result.note.startsWith("UNCARDED:"),
@@ -341,12 +349,14 @@ const EMPTY_HOME = path.join(TMP, "empty-home");
 fs.mkdirSync(EMPTY_HOME, { recursive: true });
 
 async function withJobcardEnv(cmd, fn) {
-  const saved = { cmd: process.env.CLAUNKER_JOBCARD_CMD, home: process.env.CLAUNKER_HERMES_HOME };
-  if (cmd === undefined) delete process.env.CLAUNKER_JOBCARD_CMD; else process.env.CLAUNKER_JOBCARD_CMD = cmd;
+  const saved = { cmd: process.env.CLAUNKER_JOBCARD_CMD, allow: process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD, home: process.env.CLAUNKER_HERMES_HOME };
+  if (cmd === undefined) { delete process.env.CLAUNKER_JOBCARD_CMD; delete process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD; }
+  else { process.env.CLAUNKER_JOBCARD_CMD = cmd; process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = cmd; }
   process.env.CLAUNKER_HERMES_HOME = EMPTY_HOME;
   try { return await fn(); }
   finally {
     process.env.CLAUNKER_JOBCARD_CMD = saved.cmd;
+    process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = saved.allow;
     if (saved.home === undefined) delete process.env.CLAUNKER_HERMES_HOME; else process.env.CLAUNKER_HERMES_HOME = saved.home;
   }
 }

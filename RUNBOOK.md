@@ -582,9 +582,13 @@ egress filter. Standalone ollama list and ollama ps remain subject to the Ollama
 ### Settings and hooks
 
 Readonly launches use the supported --setting-sources "" option to exclude **user, project and
-local settings**. Their generated settings explicitly deny Edit, Write, MultiEdit, NotebookEdit,
+local settings**. Their generated settings explicitly deny Edit, Write, NotebookEdit,
 ScheduleWakeup and ReportFindings (the latter two persist scheduled/review state in the tested
-2.1.325 inventory). The operator's user hooks object is copied from CLAUDE_CONFIG_DIR/settings.json,
+2.1.325 inventory). MultiEdit was dropped from both the allow and deny lists (2026-11-14): CLI
+2.1.325 no longer exposes it as its own tool at all (folded into Edit), so a bare "MultiEdit" rule
+named a tool the CLI could not resolve and produced a startup warning for no actual protection --
+Edit's own rules already cover whatever MultiEdit used to mean, same as the path-scoped
+Write/MultiEdit/NotebookEdit rules below. The operator's user hooks object is copied from CLAUDE_CONFIG_DIR/settings.json,
 or ~/.claude/settings.json, into the job settings. No user permissions, environment settings
 or project hooks are imported by that copy. Invalid user hook JSON fails rather than silently
 dropping telemetry.
@@ -616,11 +620,14 @@ References: [CLI setting sources](https://code.claude.com/docs/en/cli-reference)
 ### Git inspection
 
 tools/git-ro.mjs accepts log, show, diff **between two named commit revisions**, rev-parse,
-branch list, remote -v, worktree list, and ls-files --cached. The last four list metadata/index
-names; not all output comes from committed objects. It refuses status, describe, worktree/index
-diffs, ls-files --others/--ignored/--stage and index-object shorthand. Both diff operands are
-verified and replaced with commit IDs. The cwd must be inside a Git worktree, preventing the
-previous implicit no-index comparison from a non-repository folder.
+branch list, remote -v, worktree list, ls-files --cached, and status (2026-11-15: fixed to the
+single form `status --porcelain=v1 -b` — no caller flags or pathspecs admitted; GIT_OPTIONAL_LOCKS=0
+plus its own --no-optional-locks mean it never contends for the index lock). These five list
+metadata/index names; not all output comes from committed objects. It refuses describe,
+worktree/index diffs, ls-files --others/--ignored/--stage, index-object shorthand, and any other
+status form (e.g. a caller-supplied status flag). Both diff operands are verified and replaced
+with commit IDs. The cwd must be inside a Git worktree, preventing the previous implicit no-index
+comparison from a non-repository folder.
 
 The child environment is built from selected OS/search-path variables. Inherited GIT_* controls
 are excluded case-insensitively; terminal prompting, lazy fetch and optional locks are disabled.
@@ -637,7 +644,8 @@ not every possible Git configuration feature.
 
 ### Helpers, cmdlets and file reads
 
-tools/http-get-loopback.mjs only GETs http://127.0.0.1:7842/healthz and follows **no redirects**.
+tools/http-get-loopback.mjs only GETs http://127.0.0.1:7850/healthz (the host API's port) and
+follows **no redirects**.
 Ollama tags/ps targets were removed so its allowlist agrees with the Ollama guard; standalone
 ollama list / ollama ps remain available. Both HTTP helpers use absolute timers that destroy
 active requests/responses and clear on completion. Byte-cap exits also close streams. Trickle

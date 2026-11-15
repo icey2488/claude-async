@@ -197,13 +197,15 @@ test("control: no warnings key at all when nothing matches", () => {
   assert.equal("warnings" in exitRecord, false);
 });
 
-// card-hook.mjs's closeCard() only ever shells out to the jobcard command (CLAUNKER_JOBCARD_CMD,
-// pointed by _setup.mjs at "__no_such_jobcard_binary__" so this never reaches a real board/network)
-// and never writes meta.json itself -- job-core.mjs is meta.json's only writer. This test exercises
+// card-hook.mjs's closeCard() only ever shells out to the jobcard command, and under test mode
+// (set here) its own strict guard refuses to run ANY jobcard command -- including the
+// "__no_such_jobcard_binary__" _setup.mjs points CLAUNKER_JOBCARD_CMD at -- without a matching
+// CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD opt-in (never set here), so the call quietly no-ops; it
+// never writes meta.json itself -- job-core.mjs is meta.json's only writer. This test exercises
 // that closeCard path (non-null cardId/startHead) end-to-end through the real runner and confirms
 // it stays a safe no-op: meta.json is untouched (asserted inside runJob) and exit.json is still
 // written correctly.
-test("cardId present in meta.json: closeCard runs (fails open against the fake jobcard binary) without touching meta.json or exit.json", () => {
+test("cardId present in meta.json: closeCard runs (quietly no-ops under the test-mode guard) without touching meta.json or exit.json", () => {
   const { meta, exitRecord, dir } = runJob(process.execPath, [FAKE, "--exit", "0"], { cardId: "mock-card", startHead: "deadbeef" });
   assert.equal(meta.cardId, "mock-card");
   assert.equal(meta.startHead, "deadbeef");

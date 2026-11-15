@@ -13,7 +13,7 @@ const ALLOWED_RESPONSE_HEADERS = ["content-type", "content-length", "location", 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, REFUSED: 10, TRANSPORT_FAILED: 20 });
 
 export const ALLOWED_TARGETS = Object.freeze([
-  { port: 7842, path: "/healthz" },
+  { port: 7850, path: "/healthz" },
 ]);
 
 // allowedTargets is a seam (tests only) -- production always uses ALLOWED_TARGETS above.

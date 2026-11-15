@@ -148,7 +148,18 @@ test("an absolute Windows path is refused", () => {
 
 // --- Normal, legitimate use still works ---------------------------------------------------------
 
-test("status is no longer exposed", () => { assertRefused(["status", "--short"]); });
+test("status: no caller flags admitted -- only the fixed --porcelain=v1 -b form is exposed (2026-11-15 follow-up)", () => {
+  assertRefused(["status", "--short"]);
+  assertRefused(["status", "--porcelain"]);
+  assertRefused(["status", "tracked.txt"]); // no positionals admitted either
+});
+
+test("git status works normally, read-only, in the fixed --porcelain=v1 -b form", () => {
+  const r = run(["status"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /^## /m, "expect the -b branch header line");
+  assert.match(r.stdout, /^\?\? \.env$/m, "expect the untracked .env fixture as a porcelain line");
+});
 
 test("diff requires two commits and excludes working tree changes", () => {
  fs.writeFileSync(path.join(repoDir, "tracked.txt"), "UNCOMMITTED_CANARY");

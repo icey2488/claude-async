@@ -31,6 +31,7 @@ import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage
          writeContainerModeMarker, containerModeMarkerPath } from "./container.mjs";
 import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
 import { withLanternPreamble } from "./lantern-preamble.mjs";
+import { isTestMode } from "./discord-notify.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -250,6 +251,12 @@ function quotedPosixPath(p) {
   return `"${p.replace(/\\/g, "/")}"`;
 }
 
+// Same forward-slash conversion as quotedPosixPath, unquoted -- for naming a helper's path in
+// prose (denial-guidance text below), not as a shell argument.
+function forwardSlashPath(p) {
+  return p.replace(/\\/g, "/");
+}
+
 // Absolute path to the wrapper scripts a safe-mode job may call directly (tools/http-get-loopback.mjs,
 // tools/git-ro.mjs, tools/ollama-generate.mjs), in both path-separator spellings a job's own Bash or
 // PowerShell call might use (a literal backslash path, the way Windows shells render one, and the
@@ -267,7 +274,9 @@ const bothSlashSpellings = (p) => [p, p.replace(/\\/g, "/")];
 //     read-only git subcommands and flags -- see that file's header for why raw `git ...` prefixes
 //     cannot be allow-listed safely at all, even "read-only" ones), the read-only PowerShell
 //     cmdlets below, version-only gh/claude checks, the loopback GET helper, and the
-//     tools/ollama-generate.mjs wrapper. NO Edit/Write/MultiEdit/NotebookEdit, no raw `git`
+//     tools/ollama-generate.mjs wrapper. NO Edit/Write/NotebookEdit (MultiEdit no longer exists as
+//     its own tool in the installed CLI -- see the 2026-11-14 note by the allow/deny lists below),
+//     no raw `git`
 //     subcommand of any kind, and no interpreter/code-runner prefix (node/python/npm/pytest/uv/
 //     mkdir) -- see decision A above (and guard.mjs's header) for why this is a tool-level
 //     allowlist, not an OS sandbox: it is accident protection on this host, not a boundary against
@@ -327,6 +336,11 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
     // above -- added here rather than left out, since CLAUDE.md names it alongside checkout as a
     // normal branch operation a job should be able to do.
     "git switch *", "git branch *", "git remote *",
+    // git merge (2026-11-14 safe-mode-gaps follow-up): denied during PR #7's own review round,
+    // forcing Erick to merge by hand instead of the job doing it. A normal, non-destructive branch
+    // operation in the same risk class as checkout/switch above -- it only ever touches the job's
+    // own working folder/repo, never a remote. `git push` stays denied (SHELL_DENY_PREFIXES below).
+    "git merge *",
   ];
   // Interpreters/code-runners and mkdir ("code" only; ABSENT from readonly on purpose -- a
   // "readonly" profile should not get bare interpreter/runner access either, since those can write
@@ -336,7 +350,7 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   // scaffolding like `mkdir -p src tests docs && git status` needs its own allow rule).
   const DEV_TOOL_PREFIXES = ["pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"];
   const SHELL_DENY_PREFIXES = [
-    "git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*",
+    "git push *", "git rebase *", "git reset --hard *", "git clean -f*",
     // 2026-10-21 safe-perms-finish task 3 (known gap named in the rehearsal, D:\code\reviews\
     // safe-permissions-rehearsal-20261021.md §6): the broad "git branch*"/"git checkout *" allow
     // rules above also match their destructive forms -- `git branch -D`/`--delete --force` force-
@@ -409,7 +423,14 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
   ];
   const allow = resolvedProfile === "readonly" ? baseAllow : [
     ...baseAllow,
-    "Edit", "Write", "MultiEdit", "NotebookEdit",
+    // MultiEdit is gone (2026-11-14 safe-mode-gaps follow-up): CLI 2.1.325 no longer exposes it as
+    // a distinct tool at all (folded into Edit, which now does both single and multi-location
+    // edits) -- confirmed by its absence from this very CLI's own tool listing, consistent with the
+    // "Edit rules cover all file-editing tools" finding below. A bare "MultiEdit" allow/deny entry
+    // named a tool the CLI can no longer resolve, which is exactly what produced the startup
+    // warning; dropped cleanly rather than kept as dead weight, since Edit's own rules already
+    // cover whatever MultiEdit used to mean.
+    "Edit", "Write", "NotebookEdit",
     ...forShells(READ_GIT_PREFIXES),
     ...forShells(WRITE_GIT_PREFIXES),
     ...forShells(DEV_TOOL_PREFIXES),
@@ -419,7 +440,7 @@ export function buildSafePermissionsSettings(profile = DEFAULT_PROFILE) {
     permissions: {
       allow,
       deny: [
-        ...(resolvedProfile === "readonly" ? ["Edit", "Write", "MultiEdit", "NotebookEdit", "ScheduleWakeup", "ReportFindings",
+        ...(resolvedProfile === "readonly" ? ["Edit", "Write", "NotebookEdit", "ScheduleWakeup", "ReportFindings",
           ...forShells(["git", "git *", "curl", "curl *", "wget", "wget *"]),
           ...["Invoke-RestMethod", "Invoke-WebRequest", "irm", "iwr"].flatMap(c => ["PowerShell(" + c + ")", "PowerShell(" + c + " *)"])] : []),
         ...forShells(SHELL_DENY_PREFIXES),
@@ -539,16 +560,36 @@ export function buildReadonlyMemoryAppend(workFolder, userClaudeMdPath = default
 // when safe permissions are actually on, so a --dangerously-skip-permissions job's prompt is
 // unchanged. Mirrors the same "stop and report, do not route around a denial" rule this very job
 // was launched under.
+// Readonly-only (2026-11-14 safe-mode-gaps follow-up): --setting-sources "" (see
+// buildReadonlyMemoryAppend's header) means a readonly job never auto-loads CLAUDE.md, so without
+// this it has no way to even learn these three escape hatches exist. Named with the FORWARD-SLASH
+// absolute path of the checkout this bridge is actually running from (REPO_DIR, via
+// forwardSlashPath -- never a hardcoded D:\code path, which would be wrong for any other
+// checkout/worktree) because that is the spelling a Bash call must type verbatim for `node <path>`
+// to resolve (see quotedPosixPath's comment above for why).
+function readonlyHelperGuidance() {
+  return `This readonly job has no raw git, interpreter (node/python/...), or file-editing tools. ` +
+    `Three fixed-purpose helpers are allow-listed as escape hatches instead -- call them with ` +
+    `\`node <path> ...\`, from either Bash or PowerShell:\n` +
+    `- ${forwardSlashPath(GIT_RO_SCRIPT)} -- read-only git: log/show/diff between two named ` +
+    `revisions, rev-parse, branch/remote listing, worktree list, ls-files --cached, status.\n` +
+    `- ${forwardSlashPath(OLLAMA_GENERATE_SCRIPT)} -- generate text from a local Ollama model ` +
+    `(--model/--prompt, optional --system/--format); cloud model names are refused.\n` +
+    `- ${forwardSlashPath(LOOPBACK_HELPER_SCRIPT)} -- a single GET against the host API's own ` +
+    `loopback health endpoint; no other URL, host, or port is accepted.`;
+}
+
 export function buildDenialGuidanceText(profile = DEFAULT_PROFILE) {
   if (!isProfile(profile)) throw new TypeError("invalid profile " + JSON.stringify(profile));
   const resolvedProfile = profile;
-  return `Safe mode is on for this job (profile: "${resolvedProfile}", --permission-mode dontAsk). ` +
+  const base = `Safe mode is on for this job (profile: "${resolvedProfile}", --permission-mode dontAsk). ` +
     `A denied tool call means it matched no allow rule, or an explicit deny rule won -- it is not a ` +
     `transient error, and retrying the exact same command will be denied again. Do not look for a ` +
     `workaround (a different shell, --no-verify, sudo, piping through a second command, writing a ` +
     `helper script that does the same thing) to route around a denial. If the task genuinely needs a ` +
     `capability this profile does not grant, stop and say so in your final report with the exact ` +
     `denial text, rather than working around it.`;
+  return resolvedProfile === "readonly" ? `${base}\n\n${readonlyHelperGuidance()}` : base;
 }
 
 // Builds the --settings object every claude-async job launch gets (merged with any other
@@ -1075,6 +1116,51 @@ export function preflight({ claudeBin = CLAUDE_BIN, cwd, hostLabel }) {
   return { ok: PREFLIGHT_OK };
 }
 
+// Readonly's --append-system-prompt-file dependency (2026-11-14 safe-mode-gaps follow-up):
+// buildReadonlyMemoryAppend's header explains why readonly needs this flag at all (--setting-
+// sources "" disables CLAUDE.md's normal auto-load). The flag is UNDOCUMENTED -- absent from
+// `claude --help`'s own option list on the installed 2.1.325 CLI; it is only ever mentioned in
+// passing inside --bare's description. A CLI build that silently ignores an unrecognized flag
+// (rather than erroring on it) would launch a readonly job fine and just drop CLAUDE.md with no
+// visible error anywhere -- exactly the failure this check exists to catch before that happens.
+//
+// Probed once per claudeBin per process, not on every launch (resultsCache below): combine the
+// flag under test with --help, which always short-circuits before touching the network or opening
+// the file the flag names, so the probe is cheap and side-effect-free regardless of whether the
+// flag is supported. Treated as supported only if the probe still exits 0 and prints the normal
+// help banner -- a parse error, a missing banner, or a spawn failure (ENOENT on claudeBin itself;
+// preflight() above already covers that case for the real launch) all fail closed.
+//
+// Exported separately from checkAppendSystemPromptFileSupport (below) so a test can exercise this
+// exit-code/output logic directly against a controlled stand-in binary -- that function's own
+// isTestMode() shortcut exists for ITS callers (so a test's unrelated stand-in claudeBin, e.g.
+// process.execPath, never fails a check it isn't testing), not to make this probe untestable.
+export function probeAppendSystemPromptFileSupport(claudeBin) {
+  let supported = false;
+  try {
+    const probePath = path.join(os.tmpdir(), "claude-async-append-system-prompt-file-probe-does-not-exist.txt");
+    // A single pre-quoted command STRING, not a command+args array, with shell:true: claudeBin may
+    // be a .cmd/.bat shim (the common shape for an npm-installed CLI on Windows), which spawnSync
+    // cannot exec directly without a shell (EINVAL -- it is not a PE executable). Passing a
+    // separate args array alongside shell:true is what Node's own DEP0190 warns about (unescaped
+    // argument concatenation); quoting everything into one string ourselves (quotedPosixPath, same
+    // helper the hook commands above use) avoids that while still needing the shell for the shim.
+    const command = [claudeBin, "--append-system-prompt-file", probePath, "--help"].map(quotedPosixPath).join(" ");
+    const r = spawnSync(command, { encoding: "utf8", timeout: 10_000, shell: true });
+    supported = r.status === 0 && typeof r.stdout === "string" && /Usage:\s*claude\b/i.test(r.stdout);
+  } catch { supported = false; }
+  return supported;
+}
+
+const appendSystemPromptFileSupportCache = new Map();
+export function checkAppendSystemPromptFileSupport(claudeBin = CLAUDE_BIN) {
+  if (isTestMode()) return true;
+  if (appendSystemPromptFileSupportCache.has(claudeBin)) return appendSystemPromptFileSupportCache.get(claudeBin);
+  const supported = probeAppendSystemPromptFileSupport(claudeBin);
+  appendSystemPromptFileSupportCache.set(claudeBin, supported);
+  return supported;
+}
+
 // A job counts against the concurrency cap if it has no exit_code and either checkJob() calls it
 // running, or it has no meta.json yet (its dir was reserved by a start whose launch is still in
 // flight -- the task path can take up to TASK_RUNNER_PID_POLL_MS before meta.json lands).
@@ -1206,6 +1292,17 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
     return fail("profile", `profile "readonly" requires sandbox "host" and safe permissions on ` +
       `(CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS=1); refusing to start it as an unrestricted job instead ` +
       `(sandbox=${JSON.stringify(sb.mode)}, safePermissions=${safePermissionsEnabled}); no job started`);
+  }
+  // Checked here too (early, before any side effect), not just relied on at the --append-system-
+  // prompt-file push further down: see checkAppendSystemPromptFileSupport's header. Refuses the
+  // launch outright rather than silently proceeding without CLAUDE.md.
+  const appendSystemPromptFileCheck = opts.checkAppendSystemPromptFileSupport || checkAppendSystemPromptFileSupport;
+  if (requestedProfile === "readonly" && !appendSystemPromptFileCheck(opts.claudeBin || CLAUDE_BIN)) {
+    return fail("profile", `profile "readonly" requires the installed Claude Code CLI to accept ` +
+      `--append-system-prompt-file (used to ship CLAUDE.md memory, since --setting-sources "" ` +
+      `disables its normal auto-load) -- a probe against ${JSON.stringify(opts.claudeBin || CLAUDE_BIN)} ` +
+      `did not accept it; refusing to start readonly rather than launch it silently without CLAUDE.md; ` +
+      `no job started`);
   }
 
   // Container mode: validate the repo name, secrets file, config, docker binary and image now,

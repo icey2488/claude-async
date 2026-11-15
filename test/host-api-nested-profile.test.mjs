@@ -18,6 +18,11 @@ import crypto from "node:crypto";
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "host-api-nested-profile-"));
 process.env.CLAUDE_ASYNC_JOB_DIR = path.join(TMP, "jobs");
 delete process.env.CLAUDE_ASYNC_JOB_SAFE_PERMISSIONS;
+// Every test here calls startJob() in-process (real mintCard call). card-hook.mjs's own strict
+// test-mode guard already refuses any jobcard command without a matching
+// CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD opt-in (never set here), so mintCard quietly no-ops; this
+// nonexistent command is belt-and-suspenders in case that guard is ever loosened.
+process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
 
 const hostApi = await import("../host-api.mjs");
 const core = await import("../job-core.mjs");
