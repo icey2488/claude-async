@@ -61,7 +61,7 @@ shell("node interpreter with hostile approvals",'node -e "console.log(123456789)
 {name:"Read stream alias",tool:"Read",input:{file_path:path.join(cwd,".env::$DATA")},expect:"deny"},
 {name:"Grep stream alias",tool:"Grep",input:{pattern:"FAKE_SECRET_CANARY",path:path.join(cwd,".env::$DATA"),output_mode:"content"},expect:"deny"},
 shell("Git wrapper",'node '+gitHelper+' log --oneline',"allow"),
-shell("GET helper",'node '+getHelper+' http://127.0.0.1:7850/healthz',"allow"),
+shell("GET helper",'node '+getHelper+' http://127.0.0.1:4000/agents/board',"allow"),
 shell("local-model helper",'node '+modelHelper+' --model qwen3:8b --prompt canary',"allow"),
 shell("cloud model refused",'node '+modelHelper+' --model gpt-oss:120b-cloud --prompt canary',"deny"),
 shell("raw git fetch refused","git fetch origin main","deny"),
@@ -134,7 +134,7 @@ try {
  toolResults.push({name:"code fetch advanced to known remote commit",pass:after===ahead&&before!==ahead,before,after,ahead});
  toolResults.push({name:"readonly Write made no file",pass:!fs.existsSync(path.join(cwd,"forbidden.txt"))});
  toolResults.push({name:"preserved operator hook executed",pass:fs.existsSync(hookMarker)});
- toolResults.push({name:"helpers reached only fake recorder",pass:requests.some(r=>r.path==="/healthz")&&requests.some(r=>r.path==="/api/generate"),requests});
+ toolResults.push({name:"helpers reached only fake recorder",pass:requests.some(r=>r.path==="/agents/board")&&requests.some(r=>r.path==="/api/generate"),requests});
  const result={version:spawnSync(cli,["--version"],{encoding:"utf8"}).stdout.trim(),root,counts:{total:toolResults.length,pass:toolResults.filter(r=>r.pass).length,fail:toolResults.filter(r=>!r.pass).length},results:toolResults};
  fs.writeFileSync(path.join(output,"live-check-results.json"),JSON.stringify(result,null,2));
  console.log(JSON.stringify(result,null,2));process.exitCode=result.counts.fail?1:0;
