@@ -94,7 +94,7 @@ test("checkAppKeyFile: exists, regular, PEM private key; refuses group/world-rea
     // the mode check is skipped on win32, where the ACL is checked instead (icacls, round 3): with an
     // owner-and-SYSTEM ACL a file that is 0644 here passes
     const kf644 = keyFile(0o644);
-    const okAcl = () => ({ status: 0, stdout: `${kf644} NT AUTHORITY\\SYSTEM:(F)\r\n${" ".repeat(kf644.length)} CLAUNKER\\Raide:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n` });
+    const okAcl = () => ({ status: 0, stdout: `${kf644} NT AUTHORITY\\SYSTEM:(F)\r\n${" ".repeat(kf644.length)} CLAUNKER\\example:(F)\r\n\r\nSuccessfully processed 1 files; Failed processing 0 files\r\n` });
     assert.ok(!ga.checkAppKeyFile(kf644, { platform: "win32", icacls: okAcl }).error);
   }
   // never the key material in the result
@@ -325,8 +325,8 @@ const aclOut = (file, aces) => `${file} ${aces[0]}\r\n${aces.slice(1).map((a) =>
 test("R3: parseIcaclsAces / win32 key-file ACL check", () => {
   const f = keyFile(0o600);
   const run = (aces) => () => ({ status: 0, stdout: aclOut(f, aces) });
-  const good = ["NT AUTHORITY\\SYSTEM:(F)", "CLAUNKER\\Raide:(F)"];
-  assert.deepEqual(ga.parseIcaclsAces(aclOut(f, good), f), [{ principal: "NT AUTHORITY\\SYSTEM", rights: "(F)" }, { principal: "CLAUNKER\\Raide", rights: "(F)" }]);
+  const good = ["NT AUTHORITY\\SYSTEM:(F)", "CLAUNKER\\example:(F)"];
+  assert.deepEqual(ga.parseIcaclsAces(aclOut(f, good), f), [{ principal: "NT AUTHORITY\\SYSTEM", rights: "(F)" }, { principal: "CLAUNKER\\example", rights: "(F)" }]);
   assert.ok(!ga.checkAppKeyFile(f, { platform: "win32", icacls: run(good) }).error);
   for (const bad of ["Everyone:(R)", "BUILTIN\\Users:(I)(RX)", "NT AUTHORITY\\Authenticated Users:(I)(M)", "Users:(R)", "*S-1-1-0:(R)", "*S-1-5-32-545:(RX)"]) {
     const r = ga.checkAppKeyFile(f, { platform: "win32", icacls: run([...good, bad]) });

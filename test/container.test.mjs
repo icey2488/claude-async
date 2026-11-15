@@ -278,7 +278,7 @@ test("container settings: the no-background hook runs from the read-only hooks m
 test("toDockerMountSource: Windows drive paths become forward-slash paths Docker Desktop accepts", () => {
   assert.deepEqual(c.toDockerMountSource("D:\\code\\x", "win32"), { source: "D:/code/x" });
   assert.deepEqual(c.toDockerMountSource("D:\\code\\my repo\\sub", "win32"), { source: "D:/code/my repo/sub" });
-  assert.deepEqual(c.toDockerMountSource("C:/Users/Raide/repo", "win32"), { source: "C:/Users/Raide/repo" });
+  assert.deepEqual(c.toDockerMountSource("C:/Users/example/repo", "win32"), { source: "C:/Users/example/repo" });
   assert.ok(c.toDockerMountSource("\\\\server\\share\\repo", "win32").error, "UNC refused");
   assert.ok(c.toDockerMountSource("//server/share", "win32").error, "UNC (forward) refused");
   assert.ok(c.toDockerMountSource("code\\x", "win32").error, "relative refused");
@@ -1270,9 +1270,9 @@ test("B3 / Argon #1: live processes: a `docker ps --filter label=...` and a `doc
 
 // ------------------------------------------------------------ review round 3: Windows ACLs ---
 test("R3: buildCredsDirIcaclsArgv removes inheritance and grants only the user and SYSTEM (by SID)", () => {
-  assert.deepEqual(c.buildCredsDirIcaclsArgv("C:\\Users\\Raide\\.claude-async-jobs\\j1\\creds", { USERNAME: "Raide", USERDOMAIN: "CLAUNKER" }),
-    ["C:\\Users\\Raide\\.claude-async-jobs\\j1\\creds", "/inheritance:r", "/grant:r", "CLAUNKER\\Raide:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
-  assert.deepEqual(c.buildCredsDirIcaclsArgv("D:\\x", { USERNAME: "Raide" }), ["D:\\x", "/inheritance:r", "/grant:r", "Raide:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
+  assert.deepEqual(c.buildCredsDirIcaclsArgv("C:\\Users\\example\\.claude-async-jobs\\j1\\creds", { USERNAME: "example", USERDOMAIN: "CLAUNKER" }),
+    ["C:\\Users\\example\\.claude-async-jobs\\j1\\creds", "/inheritance:r", "/grant:r", "CLAUNKER\\example:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
+  assert.deepEqual(c.buildCredsDirIcaclsArgv("D:\\x", { USERNAME: "example" }), ["D:\\x", "/inheritance:r", "/grant:r", "example:(OI)(CI)F", "*S-1-5-18:(OI)(CI)F"]);
   assert.throws(() => c.buildCredsDirIcaclsArgv("D:\\x", {}), /USERNAME/);
   assert.throws(() => c.buildCredsDirIcaclsArgv("D:\\x", { USERNAME: "a:b" }), /USERNAME/);
 });

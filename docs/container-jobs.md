@@ -961,7 +961,7 @@ docker run --rm --pull=never --name claude-async-claunker.demo-20261101-abcd1234
   --security-opt no-new-privileges --cap-drop ALL
   --cpus 4 --memory 8g --memory-swap 8g --pids-limit 1024
   --network bridge --add-host host.docker.internal:host-gateway
-  --env-file C:\Users\Raide\.claude-async-secrets\container.env
+  --env-file %USERPROFILE%\.claude-async-secrets\container.env
   -e CLAUDE_ASYNC_JOB_ID=claunker.demo-20261101-abcd1234 -e CLAUDE_ASYNC_SANDBOX=container
   -e CLAUDE_ASYNC_REPO=icey2488/container-job-scratch
   -e CLAUDE_ASYNC_DEPTH=1 -e CLAUDE_ASYNC_JOB_EFFORT=medium
@@ -972,7 +972,7 @@ docker run --rm --pull=never --name claude-async-claunker.demo-20261101-abcd1234
   -e OLLAMA_HOST=http://host.docker.internal:11434 -e CLAUDE_ASYNC_OLLAMA_URL=http://host.docker.internal:11434
   --mount type=bind,source=D:/code/claude-async/container/CLAUDE.md,target=/home/agent/.claude/CLAUDE.md,readonly
   --mount type=bind,source=D:/code/claude-async/hooks,target=/opt/claude-async/hooks,readonly
-  --mount type=bind,source=C:/Users/Raide/.claude-async-jobs/claunker.demo-20261101-abcd1234/creds,target=/run/claude-async/creds,readonly
+  --mount type=bind,source=%USERPROFILE%/.claude-async-jobs/claunker.demo-20261101-abcd1234/creds,target=/run/claude-async/creds,readonly
   --workdir /workspace
   sha256:<64 hex>
   /usr/local/bin/claude-async-job-entry icey2488/container-job-scratch "" --
@@ -1120,9 +1120,9 @@ Do these in order on claunker. Each step says how to check it.
    ```
    CLAUDE_ASYNC_ALLOWED_SANDBOXES=host,container
    CLAUDE_ASYNC_CONTAINER_ALLOWED_REPOS=icey2488/container-job-scratch
-   CLAUDE_ASYNC_CONTAINER_ENV_FILE=C:\Users\Raide\.claude-async-secrets\container.env
+   CLAUDE_ASYNC_CONTAINER_ENV_FILE=%USERPROFILE%\.claude-async-secrets\container.env
    CLAUDE_ASYNC_GITHUB_APP_ID=<App ID from step 2>
-   CLAUDE_ASYNC_GITHUB_APP_KEY_FILE=C:\Users\Raide\.claude-async-secrets\github-app.pem
+   CLAUDE_ASYNC_GITHUB_APP_KEY_FILE=%USERPROFILE%\.claude-async-secrets\github-app.pem
    CLAUDE_ASYNC_DOCKER_BIN=C:\Program Files\Docker\Docker\resources\bin\docker.exe
    ```
 

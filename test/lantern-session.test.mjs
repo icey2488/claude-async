@@ -17,7 +17,7 @@ import {
 test("projectDirNameForCwd: matches real ~/.claude/projects directory names", () => {
   assert.equal(projectDirNameForCwd("D:\\code\\claude-async"), "D--code-claude-async");
   assert.equal(projectDirNameForCwd("D:\\code\\_worktrees\\claude-async-lantern"), "D--code--worktrees-claude-async-lantern");
-  assert.equal(projectDirNameForCwd("C:\\Users\\Raide\\code\\gemini-mcp"), "C--Users-Raide-code-gemini-mcp");
+  assert.equal(projectDirNameForCwd("C:\\Users\\example\\code\\gemini-mcp"), "C--Users-example-code-gemini-mcp");
   assert.equal(projectDirNameForCwd("C:\\WINDOWS\\system32"), "C--WINDOWS-system32");
 });
 
