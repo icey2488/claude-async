@@ -572,7 +572,7 @@ function readonlyHelperGuidance() {
     `Three fixed-purpose helpers are allow-listed as escape hatches instead -- call them with ` +
     `\`node <path> ...\`, from either Bash or PowerShell:\n` +
     `- ${forwardSlashPath(GIT_RO_SCRIPT)} -- read-only git: log/show/diff between two named ` +
-    `revisions, rev-parse, branch/remote listing, worktree list, ls-files --cached.\n` +
+    `revisions, rev-parse, branch/remote listing, worktree list, ls-files --cached, status.\n` +
     `- ${forwardSlashPath(OLLAMA_GENERATE_SCRIPT)} -- generate text from a local Ollama model ` +
     `(--model/--prompt, optional --system/--format); cloud model names are refused.\n` +
     `- ${forwardSlashPath(LOOPBACK_HELPER_SCRIPT)} -- a single GET against the host API's own ` +

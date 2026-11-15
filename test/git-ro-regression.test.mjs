@@ -28,7 +28,12 @@ test("committed inspection does not execute clean filters, index hooks, or lazy-
   git("config","core.hooksPath",hooks.replaceAll("\\","/"));
   const calls=[["log","-p"],["show","HEAD"],["diff","HEAD","HEAD"],["rev-parse","--verify","HEAD"],["branch","list"],["remote","-v"],["worktree","list"],["ls-files","--cached"]];
   for(const a of calls){const r=await runCli(a,repo);assert.equal(r.exitCode,0,r.stderr);assert.ok(!r.stdout.includes("UNCOMMITTED_CANARY"));assert.ok(!fs.existsSync(marker),a.join(" "));}
-  for(const a of [["status"],["describe","--dirty"],["diff"],["diff","--cached"],["ls-files","--others"],["ls-files","--ignored"],["ls-files","--stage"],["show",":tracked.txt"]])assert.notEqual((await runCli(a,repo)).exitCode,0,a.join(" "));
+  // "status" (bare, fixed --porcelain=v1 -b form) is now exposed (2026-11-15 follow-up) -- its own
+  // read-only-ness is covered by test/git-ro.test.mjs; here only the shapes that stay refused
+  // regardless -- including a caller-supplied status flag -- are checked.
+  for(const a of [["status","--short"],["describe","--dirty"],["diff"],["diff","--cached"],["ls-files","--others"],["ls-files","--ignored"],["ls-files","--stage"],["show",":tracked.txt"]])assert.notEqual((await runCli(a,repo)).exitCode,0,a.join(" "));
+  const statusCall=await runCli(["status"],repo);
+  assert.equal(statusCall.exitCode,0,statusCall.stderr);assert.ok(!statusCall.stdout.includes("UNCOMMITTED_CANARY"));assert.ok(!fs.existsSync(marker),"status");
   const ssh=path.join(root,"ssh.cjs");fs.writeFileSync(ssh,"require('fs').writeFileSync("+JSON.stringify(marker)+",'ran');process.exit(1)");
   git("config","remote.origin.url","ssh://127.0.0.1/canary");
   git("config","remote.origin.promisor","true");git("config","core.repositoryformatversion","1");git("config","extensions.partialClone","origin");

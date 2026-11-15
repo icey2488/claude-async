@@ -620,11 +620,14 @@ References: [CLI setting sources](https://code.claude.com/docs/en/cli-reference)
 ### Git inspection
 
 tools/git-ro.mjs accepts log, show, diff **between two named commit revisions**, rev-parse,
-branch list, remote -v, worktree list, and ls-files --cached. The last four list metadata/index
-names; not all output comes from committed objects. It refuses status, describe, worktree/index
-diffs, ls-files --others/--ignored/--stage and index-object shorthand. Both diff operands are
-verified and replaced with commit IDs. The cwd must be inside a Git worktree, preventing the
-previous implicit no-index comparison from a non-repository folder.
+branch list, remote -v, worktree list, ls-files --cached, and status (2026-11-15: fixed to the
+single form `status --porcelain=v1 -b` — no caller flags or pathspecs admitted; GIT_OPTIONAL_LOCKS=0
+plus its own --no-optional-locks mean it never contends for the index lock). These five list
+metadata/index names; not all output comes from committed objects. It refuses describe,
+worktree/index diffs, ls-files --others/--ignored/--stage, index-object shorthand, and any other
+status form (e.g. a caller-supplied status flag). Both diff operands are verified and replaced
+with commit IDs. The cwd must be inside a Git worktree, preventing the previous implicit no-index
+comparison from a non-repository folder.
 
 The child environment is built from selected OS/search-path variables. Inherited GIT_* controls
 are excluded case-insensitively; terminal prompting, lazy fetch and optional locks are disabled.

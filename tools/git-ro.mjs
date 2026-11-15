@@ -37,6 +37,14 @@ const SUBCOMMANDS = {
   show: { gitArgs: ["show"], allowedFlags: ["--stat", "--name-only", "--name-status", "--no-color"], positionals: true, textconv: true },
   "rev-parse": { gitArgs: ["rev-parse"], allowedFlags: ["--abbrev-ref", "--short", "--verify", "--is-inside-work-tree", "--show-toplevel"], positionals: true, textconv: false },
   "ls-files": { gitArgs: ["ls-files"], allowedFlags: ["--cached"], positionals: true, textconv: false },
+  // Fixed to --porcelain=v1 -b (never the caller's own flags, no pathspecs): a stable, scriptable
+  // format that can never prompt, never invoke a pager/external diff/textconv filter, and never
+  // enumerate ignored files (which "status" sans --porcelain can, depending on config). "git
+  // status" writes refreshed stat info into the index by default (not a working-tree mutation, but
+  // still a write) -- GIT_OPTIONAL_LOCKS=0 (gitEnv(), applied to every call already) plus this
+  // module's own --no-optional-locks (the `fixed` argv below) turn that off, so a concurrent writer
+  // holding the index lock is skipped rather than raced.
+  status: { gitArgs: ["status", "--porcelain=v1", "-b"], allowedFlags: [], positionals: false, textconv: false },
   // branch/remote/worktree: the caller's SECOND token must be exactly this literal word (checked in
   // parseArgs below); no other flags or positionals are admitted for these three at all.
   "branch list": { gitArgs: ["branch", "--list"], allowedFlags: [], positionals: false, textconv: false },
@@ -195,7 +203,7 @@ export async function runCli(argv, repoRoot = process.cwd()) {
 
 async function cliMain(argv) {
   if (argv.length === 0) {
-    process.stderr.write("usage: git-ro.mjs <diff REV1 REV2|log|show|rev-parse|ls-files --cached|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
+    process.stderr.write("usage: git-ro.mjs <diff REV1 REV2|log|show|rev-parse|ls-files --cached|status|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
     process.exitCode = EXIT.USAGE;
     return;
   }
