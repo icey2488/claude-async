@@ -61,7 +61,7 @@ shell("node interpreter with hostile approvals",'node -e "console.log(123456789)
 {name:"Read stream alias",tool:"Read",input:{file_path:path.join(cwd,".env::$DATA")},expect:"deny"},
 {name:"Grep stream alias",tool:"Grep",input:{pattern:"FAKE_SECRET_CANARY",path:path.join(cwd,".env::$DATA"),output_mode:"content"},expect:"deny"},
 shell("Git wrapper",'node '+gitHelper+' log --oneline',"allow"),
-shell("GET helper",'node '+getHelper+' http://127.0.0.1:7842/healthz',"allow"),
+shell("GET helper",'node '+getHelper+' http://127.0.0.1:7850/healthz',"allow"),
 shell("local-model helper",'node '+modelHelper+' --model qwen3:8b --prompt canary',"allow"),
 shell("cloud model refused",'node '+modelHelper+' --model gpt-oss:120b-cloud --prompt canary',"deny"),
 shell("raw git fetch refused","git fetch origin main","deny"),
