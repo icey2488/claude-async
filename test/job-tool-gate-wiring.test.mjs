@@ -21,6 +21,10 @@ const tmpJobRoot = path.join(os.tmpdir(), `claude-async-jobtoolgate-test-${crypt
 fs.mkdirSync(tmpJobRoot, { recursive: true });
 process.env.CLAUDE_ASYNC_JOB_DIR = tmpJobRoot;
 delete process.env.CLAUDE_ASYNC_JOB_TOOL_GATE; // pin the env-var default to off for these tests
+// Every test here calls startJob() in-process (real mintCard call) -- force the UNCARDED path
+// (nonexistent command -> ENOENT) so this file never files a real dispatch card. Belt-and-
+// suspenders alongside card-hook.mjs's own test-mode guard (see its header's "Test isolation" note).
+process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
 
 const { startJob } = await import("../job-core.mjs");
 
@@ -137,14 +141,23 @@ test("safePermissions: true switches to --permission-mode dontAsk with an allow/
   // simply adding the space would stop matching the extremely common bare `git status` invocation
   // -- see job-core.mjs's buildSafePermissionsSettings() comment for the full reasoning.
   for (const prefix of ["git status", "git status *", "git add *", "git commit *", "git checkout *",
-    "git worktree *", "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"]) {
+    "git worktree *", "git merge *", "pytest *", "uv *", "npm *", "node *", "python *", "mkdir *"]) {
     assert.ok(settings.permissions.allow.includes(`PowerShell(${prefix})`),
       `PowerShell(${prefix}) must be allowed to match its Bash equivalent`);
   }
-  for (const prefix of ["git push *", "git merge *", "git rebase *", "git reset --hard *", "git clean -f*"]) {
+  for (const prefix of ["git push *", "git rebase *", "git reset --hard *", "git clean -f*"]) {
     assert.ok(settings.permissions.deny.includes(`PowerShell(${prefix})`),
       `PowerShell(${prefix}) must be denied to match its Bash equivalent`);
   }
+  // git merge (2026-11-14 safe-mode-gaps follow-up): allowed for code now, see job-core.mjs's
+  // WRITE_GIT_PREFIXES comment -- denied during PR #7 forced a by-hand merge.
+  assert.ok(settings.permissions.allow.includes("Bash(git merge *)"));
+  assert.ok(settings.permissions.allow.includes("PowerShell(git merge *)"));
+  assert.ok(!settings.permissions.deny.includes("Bash(git merge *)"));
+  assert.ok(!settings.permissions.deny.includes("PowerShell(git merge *)"));
+  // git push stays denied -- the one write operation this profile must never grant.
+  assert.ok(settings.permissions.deny.includes("Bash(git push *)"));
+  assert.ok(settings.permissions.deny.includes("PowerShell(git push *)"));
   // Task 3 (2026-10-21 safe-perms-finish): destructive git forms denied even though their
   // non-destructive siblings (`git branch <name>`, `git checkout <branch>`, `git checkout -b`,
   // `git switch <branch>`) are allowed above.

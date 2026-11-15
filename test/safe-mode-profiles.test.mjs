@@ -11,6 +11,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 const tmpJobRoot = path.join(os.tmpdir(), `claude-async-profiles-test-${crypto.randomBytes(4).toString("hex")}`);
 fs.mkdirSync(tmpJobRoot, { recursive: true });
@@ -86,7 +87,7 @@ function allowSet(profile) { return new Set(buildSafePermissionsSettings(profile
 
 test("readonly: no file-editing tools, no interpreters/code-runners, no mkdir", () => {
   const allow = allowSet("readonly");
-  for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) assert.ok(!allow.has(tool), `${tool} must be absent from readonly`);
+  for (const tool of ["Edit", "Write", "NotebookEdit"]) assert.ok(!allow.has(tool), `${tool} must be absent from readonly`);
   // A BARE interpreter prefix (e.g. "node *") must be absent -- but the fixed-path wrapper calls
   // (http-get-loopback.mjs, git-ro.mjs, ollama-generate.mjs) are legitimately present in every
   // profile, so this only rejects the bare, unscoped form, not every rule that happens to start
@@ -135,10 +136,22 @@ test("code adds file editing, raw git, and the dev-tool runners on top of readon
   const ro = allowSet("readonly");
   const code = allowSet("code");
   for (const rule of ro) assert.ok(code.has(rule), `code profile dropped a readonly rule: ${rule}`);
-  for (const tool of ["Edit", "Write", "MultiEdit", "NotebookEdit"]) assert.ok(code.has(tool));
+  for (const tool of ["Edit", "Write", "NotebookEdit"]) assert.ok(code.has(tool));
   assert.ok(code.has("Bash(node *)") && code.has("PowerShell(node *)"));
   assert.ok(code.has("Bash(mkdir *)"));
   assert.ok(code.has("Bash(git commit *)") && code.has("Bash(git checkout *)"));
+});
+
+test("MultiEdit never appears in either profile's allow or deny list (2026-11-14): the installed " +
+  "CLI no longer exposes it as its own tool, so a bare rule naming it produced a startup warning " +
+  "for no real protection -- Edit's own rules already cover it", () => {
+  for (const profile of PROFILES) {
+    const settings = buildSafePermissionsSettings(profile);
+    assert.ok(!settings.permissions.allow.some((r) => r === "MultiEdit" || r.includes("MultiEdit")),
+      `${profile} allow list must not reference MultiEdit`);
+    assert.ok(!settings.permissions.deny.some((r) => r === "MultiEdit" || r.includes("MultiEdit")),
+      `${profile} deny list must not reference MultiEdit`);
+  }
 });
 
 test("ops is rejected by the internal settings builder", () => { assert.throws(() => buildSafePermissionsSettings("ops"), /invalid profile/); });
@@ -199,7 +212,7 @@ test("code accident guards (fix 7): .git/** edits and forced worktree-remove/che
 test("readonly adds write denies to the shared floor", () => {
  const ro = new Set(buildSafePermissionsSettings("readonly").permissions.deny);
  for (const deny of buildSafePermissionsSettings("code").permissions.deny) assert.ok(ro.has(deny));
- for (const tool of ["Write","Edit","MultiEdit","NotebookEdit","ScheduleWakeup"]) assert.ok(ro.has(tool));
+ for (const tool of ["Write","Edit","NotebookEdit","ScheduleWakeup"]) assert.ok(ro.has(tool));
 });
 
 test("internal profile helpers reject unknown profiles", () => {
@@ -216,6 +229,30 @@ test("buildDenialGuidanceText names the resolved profile and tells the job not t
   assert.match(text, /profile: "readonly"/);
   assert.match(text, /do not look for a workaround/i);
   assert.match(text, /stop and say so in your final report/i);
+});
+
+test("buildDenialGuidanceText (readonly): names all three helpers by absolute forward-slash path, from the running checkout, and says what each is for", () => {
+  const text = buildDenialGuidanceText("readonly");
+  for (const file of ["git-ro.mjs", "ollama-generate.mjs", "http-get-loopback.mjs"]) {
+    // Forward-slash spelling, as a Bash call would type it -- never the Windows backslash spelling.
+    const fwd = new RegExp(`([A-Za-z]:)?/[^\\s]*tools/${file.replace(".", "\\.")}`);
+    assert.match(text, fwd, `${file} must appear as an absolute forward-slash path`);
+    assert.ok(!text.includes(`tools\\${file}`), `${file} must never appear with a backslash path`);
+  }
+  assert.match(text, /read-only git/i);
+  assert.match(text, /ollama/i);
+  assert.match(text, /loopback health/i);
+  // Dynamic (the actual checkout this process is running from), never a hardcoded D:\code path.
+  const repoDir = path.dirname(fileURLToPath(new URL("../job-core.mjs", import.meta.url)));
+  assert.ok(text.includes(repoDir.replace(/\\/g, "/")),
+    "helper paths must be rooted at this checkout's own directory, not a hardcoded path");
+});
+
+test("buildDenialGuidanceText (code): no helper-naming guidance -- code loads CLAUDE.md normally", () => {
+  const text = buildDenialGuidanceText("code");
+  for (const file of ["git-ro.mjs", "ollama-generate.mjs", "http-get-loopback.mjs"]) {
+    assert.ok(!text.includes(file), `${file} must not appear in code's denial guidance`);
+  }
 });
 
 // ---------------------------------------------------------------------------- startJob() wiring
