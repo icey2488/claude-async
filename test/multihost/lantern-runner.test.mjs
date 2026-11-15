@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { cleanupTmp, TMP } from "./_setup.mjs";
 import { projectDirNameForCwd, claudeProjectsDir } from "../../lantern-session.mjs";
@@ -19,16 +19,20 @@ after(cleanupTmp);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(here, "..", "..", "job-runner.mjs");
 const FAKE = path.join(here, "lantern-fake-cli.mjs");
+const REPO_ROOT = path.join(here, "..", "..");
 let seq = 0;
 
 // Prepares a job dir + spec.json + meta.json (no `intent` unless the test adds one later) with a
-// FRESH cwd dir standing in for the job's workFolder, without running the runner yet.
-function prepareJob({ sleepMs = 0, exitCode = 0, extraArgv = [] } = {}) {
+// FRESH cwd dir standing in for the job's workFolder, without running the runner yet. `cwdOverride`
+// lets one test point the job at a real git checkout (this repo) instead of the usual
+// not-a-git-checkout TMP dir, to prove the worktree-resolution fix end to end, through the real
+// job-runner.mjs and a real `git`, not a fake.
+function prepareJob({ sleepMs = 0, exitCode = 0, extraArgv = [], cwdOverride } = {}) {
   const id = ++seq;
   const dir = path.join(TMP, `lantern-job-${id}`);
-  const cwd = path.join(TMP, `lantern-cwd-${id}`);
+  const cwd = cwdOverride || path.join(TMP, `lantern-cwd-${id}`);
   fs.mkdirSync(dir, { recursive: true });
-  fs.mkdirSync(cwd, { recursive: true });
+  if (!cwdOverride) fs.mkdirSync(cwd, { recursive: true });
   const spec = {
     command: process.execPath, argv: [FAKE, "--sleep-ms", String(sleepMs), "--exit", String(exitCode), ...extraArgv],
     cwd, out: path.join(dir, "out.log"), err: path.join(dir, "err.log"), exit: path.join(dir, "exit_code"),
@@ -302,4 +306,119 @@ test("readonly-shaped argv (--setting-sources \"\", --append-system-prompt, --ap
   const donePosts = requests.filter((b) => b.done === true);
   assert.equal(donePosts.length, 1, "a readonly-shaped launch still gets a done post clearing the same session");
   assert.deepEqual(donePosts[0], { name: jobId, done: true, session: sessionId });
+});
+
+// Lantern working-state fix: job-runner.mjs's 60s heartbeat loop now reposts the same status line
+// (see job-runner.mjs's hbInterval), so AgentGlass's agentboard.ts:306 FRESH_MS staleness window
+// never trips for a job that is still actually running. CLAUDE_ASYNC_HEARTBEAT_MS overrides the
+// production 60s interval so these tests observe several ticks in well under a second.
+test("heartbeat repost: the same status line is posted again on every heartbeat tick while the job runs", async () => {
+  const { dir, cwd, jobId } = prepareJob({ sleepMs: 1500, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  const sessionId = "99999999-0000-1111-2222-333333333333";
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  // The session watcher snapshots the transcript directory at start, so the file must appear
+  // AFTER spawn, not before -- 400ms gives the runner's own startup plenty of margin (same
+  // delay the other tests in this file use), leaving the rest of the 1500ms sleep for the fast
+  // heartbeat below to repost into.
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, sessionId);
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.ok(statusPosts.length > 1, `expected more than one status post, got ${statusPosts.length}`);
+  for (const body of statusPosts) assert.deepEqual(body, { name: jobId, doing: "", worktree: cwd, session: sessionId });
+  const donePosts = requests.filter((b) => b.done === true);
+  assert.equal(donePosts.length, 1, "still exactly one done post regardless of how many reposts preceded it");
+});
+
+test("heartbeat repost: no post is sent on any tick before a session id is known", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 900, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  // Several 100ms heartbeat ticks fire in this window with no session known yet.
+  await new Promise((r) => setTimeout(r, 650));
+  assert.equal(requests.length, 0, "heartbeat ticks before a session id is known must never post");
+  plantTranscript(cwd, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.ok(requests.length >= 1, "a post still happens once the session id is found");
+});
+
+test("heartbeat repost: no repost ever lands after the done post clears the row", async () => {
+  const { dir, cwd } = prepareJob({ sleepMs: 1500, exitCode: 0 });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, "bbbbbbbb-cccc-dddd-eeee-ffffffffffff");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.ok(requests.length > 2, "expected at least one repost between the first post and done");
+  assert.equal(requests[requests.length - 1].done, true, "the done post must be the last request received, with nothing racing in after it");
+});
+
+test("heartbeat repost: test mode without an explicit server still sends nothing, even across many fast ticks", async () => {
+  const { server: decoy, requests: decoyHits } = startServer();
+  const decoyPort = await listen(decoy);
+  const { dir, cwd } = prepareJob({ sleepMs: 900, exitCode: 0 });
+  // No setLanternServer: the only way this job could reach the decoy is by falling through to the
+  // default destination, which CLAUDE_ASYNC_LANTERN_PORT here points right at (see the
+  // decoy-listener test above for why this is the only way to prove the test-mode block holds).
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_LANTERN_PORT: String(decoyPort), CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(cwd, "cccccccc-dddd-eeee-ffff-000000000000");
+  const { code } = await runnerDone;
+  await close(decoy);
+  assert.equal(code, 0);
+  assert.equal(decoyHits.length, 0, "the test-mode block covers heartbeat reposts exactly as it covers the first post");
+});
+
+// Lantern working-state fix, runner-side half: a job whose cwd is a REAL git checkout (this repo,
+// not a TMP dir) must have its posted worktree match exactly what `git worktree list --porcelain`
+// prints for it -- the form AgentGlass's agentboard.ts compares by exact string equality
+// (stillThere) and by a forward-slash-only prefix test (under()). Goes through the real
+// job-runner.mjs and a real `git rev-parse --show-toplevel`, not a fake, to prove the fix holds
+// end to end on whatever OS this suite actually runs on (forward slashes already on POSIX, so this
+// is a no-op assertion there; the Windows-backslash case is what regressed before this fix).
+test("a job whose cwd is a real git checkout posts the worktree in the exact form `git worktree list --porcelain` prints", async () => {
+  const want = spawnSync("git", ["-C", REPO_ROOT, "rev-parse", "--show-toplevel"], { encoding: "utf8" }).stdout.trim();
+  assert.ok(want, "this suite must itself be running inside a git checkout for this test to mean anything");
+  const { dir, jobId } = prepareJob({ sleepMs: 1200, exitCode: 0, cwdOverride: REPO_ROOT });
+  const { server, requests } = startServer();
+  const port = await listen(server);
+  const sessionId = "ffffffff-0000-1111-2222-333333333333";
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, {});
+  await new Promise((r) => setTimeout(r, 450));
+  plantTranscript(REPO_ROOT, sessionId);
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  const statusPosts = requests.filter((b) => b.done === undefined);
+  assert.equal(statusPosts.length, 1);
+  assert.equal(statusPosts[0].worktree, want, "the posted worktree must byte-for-byte match git's own worktree-list form, not the raw cwd string");
+  assert.deepEqual(statusPosts[0], { name: jobId, doing: "", worktree: want, session: sessionId });
+});
+
+test("heartbeat repost: a failed post disables lantern for the rest of the job, so no repost and no done follow it", async () => {
+  const { server, requests } = startServer((req, res) => { res.writeHead(500); res.end("nope"); });
+  const port = await listen(server);
+  const { dir, cwd } = prepareJob({ sleepMs: 1200, exitCode: 0 });
+  setLanternServer(dir, `http://127.0.0.1:${port}`);
+  const runnerDone = spawnRunner(dir, { CLAUDE_ASYNC_HEARTBEAT_MS: "100" });
+  await new Promise((r) => setTimeout(r, 400));
+  plantTranscript(cwd, "dddddddd-eeee-ffff-0000-111111111111");
+  const { code } = await runnerDone;
+  await close(server);
+  assert.equal(code, 0);
+  assert.equal(requests.length, 1, "the first failed post must disable lanternAlive, so neither a heartbeat repost nor the done post is attempted again");
 });

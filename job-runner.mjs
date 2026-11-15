@@ -110,7 +110,7 @@ import { cleanupJobContainers, extractPrUrl, ENTRY_EXIT_CLONE, ENTRY_EXIT_CONFIG
 import { createMinter } from "./github-app.mjs";
 import { acquireRunnerLock } from "./runner-lock.mjs";
 import { createTokenRefresher } from "./token-refresh.mjs";
-import { lanternEnabled, postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta } from "./lantern-notify.mjs";
+import { lanternEnabled, postLanternStatus, postLanternDone, pollUntil, readIntentFromMeta, resolveLanternWorktree } from "./lantern-notify.mjs";
 import { watchForSessionId } from "./lantern-session.mjs";
 
 const specPath = process.argv[2];
@@ -299,6 +299,15 @@ const lanternCanTrack = !containerSpec && Boolean(cwd);
 // (opting in on purpose) still gets the real diagnostics.
 const lanternTestModeInert = !lanternServer && isTestMode();
 let lanternAlive = lanternEnabled();
+// Resolved once, before any post, to the exact string `git worktree list --porcelain` would
+// print for this checkout (see lantern-notify.mjs's resolveLanternWorktree) -- AgentGlass's
+// agentboard.ts compares a posted worktree against that list by exact string equality and by a
+// forward-slash-only prefix test, so a raw Windows-style cwd (backslashes) could never match.
+// Falls back to the raw cwd when it cannot be resolved (not a git checkout, git missing, timed
+// out), same as every job before this existed -- skipped entirely (no git spawn) when Lantern
+// can never post for this job anyway (disabled, or a container/no-cwd job that lanternPost()
+// would no-op on regardless).
+const lanternWorktree = (lanternAlive && lanternCanTrack) ? (resolveLanternWorktree(cwd) ?? cwd) : (cwd || "");
 let lanternSession = "";
 let lanternDoing = "";
 let lanternPosted = false; // true once the first (session-bearing) status row has actually been posted
@@ -312,7 +321,7 @@ function lanternPost() {
   if (!lanternAlive || !lanternSession) return;
   lanternPosted = true;
   postLanternStatus({
-    name: lanternName, doing: lanternDoing, worktree: cwd || "",
+    name: lanternName, doing: lanternDoing, worktree: lanternWorktree,
     session: lanternSession, server: lanternServer, logLine: lanternLog,
   }).then((r) => { if (!r.ok) lanternAlive = false; });
 }
@@ -780,6 +789,14 @@ const HEARTBEAT_MS = Number(process.env.CLAUDE_ASYNC_HEARTBEAT_MS) || 60_000;
 hbInterval = setInterval(() => {
   writeHeartbeat();
   writeJobMembership().catch(() => {});
+  // Lantern: repost the same status line on every heartbeat tick, not just once at start. A
+  // headless job's own `saidAt` would otherwise never advance after the first post, which is
+  // the scenario AgentGlass's agentboard.ts:306 FRESH_MS staleness window is built to catch --
+  // this keeps it from ever triggering for a job that is still actually running. Already a
+  // no-op before a session id is known and after lanternPost() has disabled itself on a failed
+  // send (both via lanternPost()'s own guard); `finish()` clears this interval before posting
+  // done, so a repost can never race a cleared row back to "working".
+  if (lanternAlive && lanternSession) lanternPost();
 }, HEARTBEAT_MS);
 hbInterval.unref();
 

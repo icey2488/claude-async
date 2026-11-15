@@ -65,6 +65,7 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { URL } from "node:url";
 import { isTestMode } from "./discord-notify.mjs";
 
@@ -112,6 +113,32 @@ export function lanternServerUrl(fsImpl = fs) {
 // a per-job spec.json field a job's own files could have written) -- see postJson() below.
 export function isLoopbackHost(hostname) {
   return hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
+}
+
+export const RESOLVE_WORKTREE_TIMEOUT_MS = 2000;
+
+// Resolves `cwd` to the exact string `git worktree list --porcelain` would print for the
+// checkout it is in -- always forward-slash, whatever drive-letter case git itself normalizes
+// to (observed uppercase on Windows). That is the form AgentGlass's agentboard.ts compares a
+// posted `worktree` against byte-for-byte (its `stillThere` check and `under()`'s prefix test
+// both split/compare on "/" only), so a job launched with a Windows-style cwd (backslashes) was
+// posting a string that could never match, which read as the job having no worktree at all.
+// `git rev-parse --show-toplevel`, not a string replace of backslash-for-slash, because it also
+// resolves a cwd inside a SUBFOLDER of a checkout (or a linked worktree) up to that checkout's
+// own root -- the only form `git worktree list --porcelain` ever lists, and `stillThere`'s
+// comparison is exact equality against that list, not a prefix test.
+// null (never throws) when `cwd` is not inside a git working tree, git is not on PATH, or the
+// call does not finish within timeoutMs -- the caller should fall back to the raw cwd in that
+// case (see job-runner.mjs), same as before this existed.
+export function resolveLanternWorktree(cwd, { spawnSyncImpl = spawnSync, timeoutMs = RESOLVE_WORKTREE_TIMEOUT_MS } = {}) {
+  if (!cwd) return null;
+  let r;
+  try {
+    r = spawnSyncImpl("git", ["-C", cwd, "rev-parse", "--show-toplevel"], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
+  } catch { return null; }
+  if (!r || r.error || r.status !== 0) return null;
+  const out = (r.stdout || "").trim();
+  return out || null;
 }
 
 // Single bounded POST over node:http (see the header for why not fetch()). Never throws, never
