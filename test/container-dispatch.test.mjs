@@ -39,6 +39,15 @@ test("dispatchStart: sandbox, repo and baseRef are forwarded when given", async 
   assert.equal(body.baseRef, "main");
 });
 
+test("dispatchStart: extraDirs is forwarded only when given (job-reach A1)", async () => {
+  const seen = [];
+  await dispatch.dispatchStart({ host: "claunker", prompt: "p" }, laptopCtx(peer(seen)));
+  assert.ok(!("extraDirs" in JSON.parse(seen[0].init.body)));
+  const seen2 = [];
+  await dispatch.dispatchStart({ host: "claunker", prompt: "p", extraDirs: ["C:\\foo"] }, laptopCtx(peer(seen2)));
+  assert.deepEqual(JSON.parse(seen2[0].init.body).extraDirs, ["C:\\foo"]);
+});
+
 async function apiServer() {
   const server = api.createApiServer({ cfg: cfgFor("claunker", { caps: BIG_CAPS }), apiCfg: apiCfgFor(),
                                        startOptions: { launch: fakeLaunch } });
@@ -63,6 +72,16 @@ test("POST /v1/start: repo/baseRef must be strings; on a host job they are refus
   assert.match(hostRepo.body.error, /only for container jobs/);
   assert.equal(tickets().length, 0);
   assert.equal(jobDirs().length, 0);
+});
+
+test("POST /v1/start: extraDirs must be an array of strings; a host job with a valid extraDirs is accepted", async () => {
+  const url = await apiServer();
+  const bad = await post(url, "/v1/start", { host: "claunker", prompt: "p", extraDirs: "not-an-array" });
+  assert.equal(bad.status, 400);
+  assert.match(bad.body.error, /extraDirs must be an array of strings/);
+  const badItems = await post(url, "/v1/start", { host: "claunker", prompt: "p", extraDirs: [5] });
+  assert.equal(badItems.status, 400);
+  assert.match(badItems.body.error, /extraDirs must be an array of strings/);
 });
 
 test("POST /v1/start: sandbox:\"container\" is refused under the default policy (host only); nothing is written", async () => {

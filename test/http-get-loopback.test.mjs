@@ -10,7 +10,8 @@ import http from "node:http";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { getLoopback, validateLoopbackUrl, EXIT } from "../tools/http-get-loopback.mjs";
+import { getLoopback, validateLoopbackUrl, EXIT, defaultAllowedTargets, AGENTGLASS_BOARD_PATH } from "../tools/http-get-loopback.mjs";
+import { DEFAULT_LANTERN_PORT } from "../lantern-notify.mjs";
 
 const SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tools", "http-get-loopback.mjs");
 
@@ -46,11 +47,22 @@ test("validateLoopbackUrl: refuses userinfo, https, and a query string/fragment"
   assert.ok(validateLoopbackUrl("http://127.0.0.1:9999/ok#frag", targets).error);
 });
 
-test("the real production allowlist contains only the host API's health route", async () => {
-  const mod = await import("../tools/http-get-loopback.mjs");
-  assert.deepEqual(mod.ALLOWED_TARGETS, [
-    { port: 7850, path: "/healthz" },
-  ]);
+// 2026-11-15 job-reach: the host API never listens on loopback (Tailscale-only), so the old
+// "7850/healthz" entry could never connect -- replaced with AgentGlass's Lantern board route,
+// resolved on the same published-port-file logic lantern-notify.mjs uses to POST a job's status.
+test("defaultAllowedTargets: resolves to the Lantern board on the resolved port, default 4000", () => {
+  const fakeFs = { readFileSync: () => { throw new Error("ENOENT"); } };
+  assert.deepEqual(defaultAllowedTargets(fakeFs), [{ port: DEFAULT_LANTERN_PORT, path: AGENTGLASS_BOARD_PATH }]);
+});
+
+test("defaultAllowedTargets: follows AgentGlass's published port file (e.g. the 4001 fallback)", () => {
+  const publishedFs = { readFileSync: () => "4001" };
+  assert.deepEqual(defaultAllowedTargets(publishedFs), [{ port: 4001, path: AGENTGLASS_BOARD_PATH }]);
+});
+
+test("Spine (8848) is deliberately not in the allowlist: no confirmed unauthenticated GET route", () => {
+  const fakeFs = { readFileSync: () => { throw new Error("ENOENT"); } };
+  assert.ok(!defaultAllowedTargets(fakeFs).some((t) => t.port === 8848));
 });
 
 // --- getLoopback(): real HTTP exchange against an ephemeral-port test server ---------------------

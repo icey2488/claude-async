@@ -55,6 +55,17 @@ test("claude_start schema: host is a required enum built from the registry (here
   assert.equal(start.inputSchema.properties.host.default, undefined);
 });
 
+test("claude_start schema: extraDirs is an optional array of strings, capped at 8, not required (job-reach A1)", async () => {
+  const { tools } = await client.listTools();
+  const start = tools.find((t) => t.name === "claude_start");
+  const extraDirs = start.inputSchema.properties.extraDirs;
+  assert.ok(extraDirs, "extraDirs must be in claude_start's inputSchema");
+  assert.equal(extraDirs.type, "array");
+  assert.equal(extraDirs.items.type, "string");
+  assert.equal(extraDirs.maxItems, 8);
+  assert.ok(!start.inputSchema.required.includes("extraDirs"));
+});
+
 test("host enum: built from a hosts.json with three names; the description lists them and how to add one", async () => {
   writeHostsJson({ localHost: "claunker", hosts: { ha: ENTRY(2), desk: ENTRY(3) } });
   const b = await bridge(() => liveCtx());
