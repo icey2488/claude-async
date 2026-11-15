@@ -20,6 +20,10 @@ const tmpJobRoot = path.join(os.tmpdir(), `claude-async-hermeshome-test-${crypto
 fs.mkdirSync(tmpJobRoot, { recursive: true });
 process.env.CLAUDE_ASYNC_JOB_DIR = tmpJobRoot;
 delete process.env.CLAUDE_ASYNC_JOB_HERMES_HOME_ISOLATION; // pin the env-var default to ON for these tests
+// Every test here calls startJob() in-process (real mintCard call) -- force the UNCARDED path
+// (nonexistent command -> ENOENT) so this file never files a real dispatch card. Belt-and-
+// suspenders alongside card-hook.mjs's own test-mode guard (see its header's "Test isolation" note).
+process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
 
 const { startJob } = await import("../job-core.mjs");
 

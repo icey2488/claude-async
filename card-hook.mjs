@@ -13,10 +13,25 @@
  * debug line on stderr and no error, so the start response carries no UNCARDED note.
  * Every other failure (an explicit CLAUNKER_JOBCARD_CMD that fails, ENOENT included;
  * non-zero exit; timeout) is a real misconfiguration and still surfaces as an error.
+ *
+ * Test isolation (2026-11-13 fixture-card incident: three test files called startJob() in-process
+ * with no jobcard override at all -- test/host-api-nested-profile.test.mjs, test/job-tool-gate-
+ * wiring.test.mjs, test/job-hermes-home-isolation.test.mjs -- and each filed a real "hi"/"parent"/
+ * "child"/"top-level" card on Erick's live Spine board, because this checkout's default
+ * CLAUNKER_HERMES_HOME resolves to the real prod jobcard.py): mirrors discord-notify.mjs/
+ * lantern-notify.mjs's own belt exactly -- runJobcard() refuses to fall through to the REAL default
+ * jobcard command whenever CLAUDE_ASYNC_TEST/NODE_TEST_CONTEXT is set (isTestMode(), imported from
+ * discord-notify.mjs) UNLESS the caller explicitly supplied CLAUNKER_JOBCARD_CMD. An explicit
+ * CLAUNKER_JOBCARD_CMD (even one that points at a nonexistent binary, the established test idiom)
+ * is a deliberate opt-in and is never blocked. No test has to remember to set anything: the default
+ * is "skip" for every in-process call and every spawned child that inherits process.env (NODE_TEST_
+ * CONTEXT propagates to a child the same way CLAUDE_ASYNC_TEST does), whether or not that test has
+ * ever heard of jobcard.
  */
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { classifyFinalStatus } from "./job-status.mjs";
+import { isTestMode } from "./discord-notify.mjs";
 
 const DEFAULT_HERMES_HOME = "D:\\claunker\\spine";
 
@@ -52,6 +67,13 @@ export function resolveJobcard() {
 // mode, see header). Never throws.
 function runJobcard(args) {
   const [exe, baseArgs, explicit] = resolveJobcard();
+  // See the header's "Test isolation" note: a test-runner process with no explicit
+  // CLAUNKER_JOBCARD_CMD never reaches the real default command, no matter what
+  // CLAUNKER_HERMES_HOME currently resolves to on this host.
+  if (!explicit && isTestMode()) {
+    try { process.stderr.write(`card-hook: test mode (CLAUDE_ASYNC_TEST/NODE_TEST_CONTEXT) with no explicit CLAUNKER_JOBCARD_CMD; skipping card\n`); } catch {}
+    return { ok: false, skipped: true };
+  }
   let result;
   try {
     result = spawnSync(exe, [...baseArgs, ...args], { encoding: "utf8", timeout: 10_000 });
