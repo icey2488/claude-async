@@ -12,8 +12,9 @@ const [, , jobDir, dummyCliPath, coreModulePath, markerPath] = process.argv;
 
 process.env.CLAUDE_ASYNC_JOB_DIR = jobDir;
 process.env.CLAUDE_CLI_PATH = dummyCliPath;
-// Force mintCard's UNCARDED path (nonexistent command -> ENOENT) so this test never creates a
-// real dispatch card.
+// card-hook.mjs's strict test-mode guard already refuses any jobcard command without a matching
+// CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD opt-in (never set here), so mintCard quietly no-ops; this
+// nonexistent command is belt-and-suspenders in case that guard is ever loosened.
 process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify(["__no_such_jobcard_binary__"]);
 
 const core = await import(pathToFileURL(coreModulePath).href);

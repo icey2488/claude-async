@@ -30,7 +30,11 @@ if (cmd === "done" || cmd === "fail") {
 } else { process.exit(1); }
 `);
 
-process.env.CLAUNKER_JOBCARD_CMD = JSON.stringify([process.execPath, MOCK_SCRIPT]);
+const MOCK_CMD = JSON.stringify([process.execPath, MOCK_SCRIPT]);
+process.env.CLAUNKER_JOBCARD_CMD = MOCK_CMD;
+// card-hook.mjs's strict test-mode guard requires this dedicated opt-in, set to the EXACT SAME
+// string as CLAUNKER_JOBCARD_CMD, before the mock jobcard above will actually be invoked.
+process.env.CLAUDE_ASYNC_TEST_ALLOW_JOBCARD_CMD = MOCK_CMD;
 const { closeCard } = await import("../card-hook.mjs");
 
 function clearLog() { try { fs.writeFileSync(LOG, ""); } catch {} }
