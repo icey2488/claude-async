@@ -67,6 +67,9 @@ claude_cancel { jobId }        POST /v1/cancel { jobId }   (routed by the job id
   **`repo`/`baseRef` are refused** for a host job. So no call can mean two things, and every
   existing host-mode call is unaffected. `repo`, `baseRef` and `sandbox` are only forwarded to a
   remote host when given, so a forwarded host-mode body is byte-for-byte what it was.
+- **`extraDirs` is refused for a container job** too (2026-11-15, feat/job-reach): a container
+  clones `repo` itself and has no host folder at all to add read access to. See RUNBOOK.md's
+  "Per-job extra directories" section for the host-job-only feature itself.
 
 Why a `repo` parameter rather than a mapping from `workFolder`: a mapping would keep a host path in
 the interface that no longer means anything (nothing is mounted), and would need a second table

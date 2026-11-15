@@ -9,6 +9,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateExtraDir } from "../extra-dirs.mjs";
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, REFUSED: 10, EXEC_FAILED: 20, TIMEOUT: 21 });
 export const TIMEOUT_MS = 15_000;
@@ -201,13 +202,38 @@ export async function runCli(argv, repoRoot = process.cwd()) {
   return runGit(built.argv, repoRoot);
 }
 
+// `--repo <absolute path>` must be the first two tokens (never anywhere else in argv): lets a job
+// inspect another checkout without `git -C` (never allow-listed -- see ALWAYS_DENY_FLAGS above).
+// Subject to the SAME validation and protected-location refusal as job-core.mjs's extraDirs (A2/
+// A3, shared via extra-dirs.mjs's validateExtraDir): absolute, must exist and be a directory,
+// symlinks/junctions/".." resolved before checking, protected locations always refused. No
+// profile is passed through, so the "code"-only live-checkout refusal (A4) does NOT apply here --
+// this option has no notion of the calling job's profile, and A4 was never part of this file's
+// scope. Returns { argv, repoRoot } (repoRoot is null when --repo was not given) or { error }.
+export function resolveRepoOption(argv) {
+  if (argv[0] !== "--repo") return { argv, repoRoot: null };
+  if (argv.length < 2 || typeof argv[1] !== "string" || !argv[1]) {
+    return { error: "--repo requires an absolute path argument" };
+  }
+  const v = validateExtraDir(argv[1], { label: "--repo" });
+  if (v.error) return { error: v.error };
+  return { argv: argv.slice(2), repoRoot: v.resolved };
+}
+
 async function cliMain(argv) {
-  if (argv.length === 0) {
-    process.stderr.write("usage: git-ro.mjs <diff REV1 REV2|log|show|rev-parse|ls-files --cached|status|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
+  const repoOpt = resolveRepoOption(argv);
+  if (repoOpt.error) {
+    process.stderr.write(`git-ro.mjs: refused: ${repoOpt.error}\n`);
+    process.exitCode = EXIT.REFUSED;
+    return;
+  }
+  const rest = repoOpt.argv;
+  if (rest.length === 0) {
+    process.stderr.write("usage: git-ro.mjs [--repo <absolute path>] <diff REV1 REV2|log|show|rev-parse|ls-files --cached|status|\"branch list\"|\"remote -v\"|\"worktree list\"> [flags/pathspecs...]\n");
     process.exitCode = EXIT.USAGE;
     return;
   }
-  const { exitCode, stdout, stderr } = await runCli(argv);
+  const { exitCode, stdout, stderr } = await runCli(rest, repoOpt.repoRoot || process.cwd());
   if (stdout) process.stdout.write(stdout);
   if (stderr) process.stderr.write(stderr);
   process.exitCode = exitCode;

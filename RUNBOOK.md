@@ -619,6 +619,17 @@ References: [CLI setting sources](https://code.claude.com/docs/en/cli-reference)
 
 ### Git inspection
 
+tools/git-ro.mjs accepts an optional leading `--repo <absolute path>` (2026-11-15, feat/job-reach
+A6): re-runs the SAME "cwd must be inside a Git work tree" check against the named directory
+instead of the process's own cwd, so a job can inspect another checkout without `git -C` (never
+allow-listed -- ALWAYS_DENY_FLAGS keeps `-C`/`-c`/`--git-dir`/`--work-tree`/`--exec-path` off the
+table regardless of subcommand, unchanged). `--repo` must be the first two tokens; subject to the
+exact same validation and protected-location refusal as extraDirs below (shared code,
+extra-dirs.mjs) -- absolute, must exist and be a directory, symlinks/junctions/".." resolved
+before checking, and a protected location (credential/config stores, the live Spine data dir) is
+always refused. Every other git-ro safety rule (the subcommand allowlist, ALWAYS_DENY_FLAGS, the
+secret-name/path courtesy checks) applies identically inside the named repo.
+
 tools/git-ro.mjs accepts log, show, diff **between two named commit revisions**, rev-parse,
 branch list, remote -v, worktree list, ls-files --cached, and status (2026-11-15: fixed to the
 single form `status --porcelain=v1 -b` — no caller flags or pathspecs admitted; GIT_OPTIONAL_LOCKS=0
@@ -644,8 +655,17 @@ not every possible Git configuration feature.
 
 ### Helpers, cmdlets and file reads
 
-tools/http-get-loopback.mjs only GETs http://127.0.0.1:7850/healthz (the host API's port) and
-follows **no redirects**.
+tools/http-get-loopback.mjs (2026-11-15, feat/job-reach B1-B3 finding): the host API
+(host-api.mjs) binds ONLY to a Tailscale address (100.64.0.0/10), **never** 127.0.0.1 -- the old
+"7850/healthz" allowlist entry could therefore never actually connect, a dead entry since
+whenever host-api.mjs shipped. Replaced with the one loopback target this repo could confirm:
+AgentGlass's Lantern board, GET /agents/board, on the port lantern-notify.mjs's own
+resolveLanternPort() resolves (env override, then AgentGlass's published port file, then the 4000
+default -- see that function's header for why the port can move to 4001). The allowed target is
+rebuilt fresh on every call (`defaultAllowedTargets()`), never cached at module load, so a live
+port-file change takes effect without restarting the job process. Spine (127.0.0.1:8848) was
+considered and left OUT: no plain unauthenticated GET health/status route for it could be
+confirmed from this repo's own code or docs -- never guessed. Follows **no redirects**.
 Ollama tags/ps targets were removed so its allowlist agrees with the Ollama guard; standalone
 ollama list / ollama ps remain available. Both HTTP helpers use absolute timers that destroy
 active requests/responses and clear on completion. Byte-cap exits also close streams. Trickle
@@ -718,6 +738,60 @@ safe shapes. Invoking that file by its literal name is refused outright inside a
 the guard. Work around it with a glob that avoids spelling "ollama", e.g.
 `node --test "test/oll*-guard-hook.test.mjs"`, or run the suite from outside the guard's scope
 (safe permissions off, or a human terminal).
+
+## Per-job extra directories (`feat/job-reach`, 2026-11-15)
+
+Design: docs/extra-dirs-proposal.md (the approved starting point). Same accident-protection
+framing as the safe-mode profiles above: `extraDirs` widens what a job can SEE (Claude Code's own
+`--add-dir`), not an OS sandbox.
+
+- `claude_start` / `POST /v1/start` accept an optional `extraDirs`: an array of absolute paths,
+  capped at 8 (`EXTRA_DIRS_MAX`, extra-dirs.mjs), host jobs only -- a container job (sandbox:
+  "container") refuses any non-empty `extraDirs` outright, before any side effect.
+- Validation (extra-dirs.mjs's `validateExtraDirs`/`validateExtraDir`, shared with git-ro.mjs's
+  `--repo`): absolute paths only; must exist and be a directory; symlinks/junctions/".." are
+  resolved via `fs.realpathSync` before any check runs; duplicates within the list, or of the
+  job's own `workFolder`, are refused.
+- **Protected locations, in every profile** (`protectedPaths()`, one constant, easy to extend):
+  credential/config stores under the user profile (`.ssh`, `.aws`, `.azure`, `.gnupg`,
+  `.config/gh`, `.docker`, the Claude config dir `.claude`) and `D:\claunker\spine-data` (the live
+  Spine token + DB). `~/.claude-async-jobs` (job reports; job-core.mjs's `JOB_ROOT`) is a
+  DIFFERENT top-level dir from `~/.claude` and is deliberately not on this list. A protected
+  entry that doesn't itself exist on disk still refuses a candidate under it (literal-path
+  fallback) -- this never depends on the protected directory actually being present.
+- **"code"-only accident guard** (`checkLiveCheckout`): profile "code" additionally refuses any
+  extraDir under `D:\claunker\` (live prod checkouts) -- a repo whose NAME merely contains
+  "claunker" (e.g. `D:\code\claunker-ops`) does not match. "readonly" may read live checkouts
+  (the protected-location refusals above, e.g. spine-data, still apply to both).
+- **Mechanism:** one `--add-dir <dir>` per granted directory, appended to the host job's own argv
+  (job-core.mjs's `startJob`). Never applied to a container job's argv (refused earlier anyway).
+- **Read-only by intent, not by mechanism, in "code"** (`--add-dir` is a visibility grant, not a
+  permission level -- there is no CLI-side "read-only in this one directory" setting to build on):
+  when safe permissions are on and the profile is "code", one `Edit(<forward-slash absolute
+  path>/**)` deny rule is added per granted directory to the generated `--settings`. Live-verified
+  against the installed CLI (2.1.325, via a disposable mock-Anthropic-API harness forcing Edit and
+  Write tool calls) to: (a) deny both Edit AND Write under the directory (a single `Edit(path)`
+  rule covers every file-editing tool -- same finding as the existing
+  `Edit(//**/claunker/**)` rule's own comment in `buildSafePermissionsSettings`); (b) leave the
+  job's own `workFolder` editable; (c) print no "is not matched by file permission checks" startup
+  warning. **A shell command (Bash/PowerShell) can still write there regardless** -- this is
+  accident protection, not a boundary, exactly like every other rule in this file. "readonly"
+  needs no extra rule: it already denies Edit/Write/NotebookEdit everywhere.
+  A root-anchored form (`Edit(//<path>/**)`, mirroring the existing name-based
+  `Edit(//**/claunker/**)` rule's "//" prefix) was tried and found to NOT block anything --
+  that "//" prefix means "root, then a wildcard before a literal segment", not "an absolute path
+  literal"; the working form omits it entirely.
+- **Guidance**: when `extraDirs` is non-empty, one combined `--append-system-prompt` text lists
+  the granted directories (forward slashes) and says they are read-only by intent, including the
+  "a shell command can still write there" caveat -- appended regardless of profile or whether safe
+  permissions are even on (a `--dangerously-skip-permissions` job still needs to know these paths
+  exist). Shares the single inline `--append-system-prompt` flag with the existing denial-guidance
+  text (two inline flags clobber each other, last one wins -- confirmed empirically, see the
+  file-based `--append-system-prompt-file` comment nearby for the one flag that doesn't have this
+  problem); the two texts are joined, never pushed as separate flags.
+- **Recorded in meta.json** (`extraDirs`, resolved/real paths) whenever any were granted, so
+  `claude_check` shows exactly which extra directories a job asked for -- same transparency
+  precedent as `hermesHome`/`profile`.
 
 ## Dispatch defaults (model + effort)
 

@@ -32,6 +32,7 @@ import { resolveSandbox, loadContainerConfig, planContainerJob, checkDockerImage
 import { preflightGitHubApp, repoNameOf } from "./github-app.mjs";
 import { withLanternPreamble } from "./lantern-preamble.mjs";
 import { isTestMode } from "./discord-notify.mjs";
+import { validateExtraDirs } from "./extra-dirs.mjs";
 
 // Claude Desktop spawns this bridge (the MCP child process) with NO PATHEXT in its environment
 // at all. That was harmless before 5a09feb: the old direct node->node spawn path let a bare
@@ -572,11 +573,13 @@ function readonlyHelperGuidance() {
     `Three fixed-purpose helpers are allow-listed as escape hatches instead -- call them with ` +
     `\`node <path> ...\`, from either Bash or PowerShell:\n` +
     `- ${forwardSlashPath(GIT_RO_SCRIPT)} -- read-only git: log/show/diff between two named ` +
-    `revisions, rev-parse, branch/remote listing, worktree list, ls-files --cached, status.\n` +
+    `revisions, rev-parse, branch/remote listing, worktree list, ls-files --cached, status; an ` +
+    `optional leading \`--repo <absolute path>\` inspects another checkout instead of cwd (subject ` +
+    `to the same protected-location refusals as extraDirs).\n` +
     `- ${forwardSlashPath(OLLAMA_GENERATE_SCRIPT)} -- generate text from a local Ollama model ` +
     `(--model/--prompt, optional --system/--format); cloud model names are refused.\n` +
-    `- ${forwardSlashPath(LOOPBACK_HELPER_SCRIPT)} -- a single GET against the host API's own ` +
-    `loopback health endpoint; no other URL, host, or port is accepted.`;
+    `- ${forwardSlashPath(LOOPBACK_HELPER_SCRIPT)} -- a single GET against AgentGlass's Lantern ` +
+    `board (/agents/board) on loopback; no other URL, host, path, or port is accepted.`;
 }
 
 export function buildDenialGuidanceText(profile = DEFAULT_PROFILE) {
@@ -590,6 +593,22 @@ export function buildDenialGuidanceText(profile = DEFAULT_PROFILE) {
     `capability this profile does not grant, stop and say so in your final report with the exact ` +
     `denial text, rather than working around it.`;
   return resolvedProfile === "readonly" ? `${base}\n\n${readonlyHelperGuidance()}` : base;
+}
+
+// extraDirs guidance (A7): told whenever any extraDirs were granted, regardless of profile or
+// whether safe permissions are even on for this job -- it needs to know these paths exist and are
+// meant for reading, not as a second work folder. Returns null when extraDirs is empty (nothing
+// to add to the system prompt). Paths are listed with forward slashes -- the spelling a Bash call
+// must type verbatim for a path to resolve the same way (see quotedPosixPath's comment above).
+export function buildExtraDirsGuidanceText(extraDirs) {
+  if (!extraDirs || !extraDirs.length) return null;
+  const list = extraDirs.map((d) => `- ${forwardSlashPath(d)}`).join("\n");
+  return `This job was also granted read access to ${extraDirs.length} extra director${extraDirs.length === 1 ? "y" : "ies"} ` +
+    `beyond its own work folder (Claude Code's --add-dir):\n${list}\n` +
+    `They are intended for READING ONLY. In profile "code" an Edit/Write/NotebookEdit call into any ` +
+    `of them is denied (accident protection, not a hostile-job boundary); a shell command (Bash/` +
+    `PowerShell) can still write there regardless, since --add-dir is a visibility grant, not a ` +
+    `permission level. In profile "readonly" nothing can write anywhere, including these dirs.`;
 }
 
 // Builds the --settings object every claude-async job launch gets (merged with any other
@@ -1257,7 +1276,7 @@ function writeNewMeta(p, meta, fsImpl = fs) {
 // repo / baseRef: container jobs only ("owner/repo" cloned inside the container, and the ref to
 // start from); a host job that passes either is refused, so host-mode calls are unaffected.
 // Order is deliberate: every rejection happens before the job dir or ticket exists.
-export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile }, opts = {}) {
+export async function startJob({ prompt, workFolder, jobId, model, effort, intent, sandbox, repo, baseRef, profile, extraDirs }, opts = {}) {
   const hostname = os.hostname();
   const hostLabel = opts.host ? `host ${opts.host} (${hostname})` : `host ${hostname}`;
   const fail = (errorCode, error) => ({ error, errorCode, ...(opts.host ? { host: opts.host } : {}), hostname });
@@ -1271,6 +1290,12 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (sb.error) return fail("invalid", sb.error);
   if (sb.mode === "host" && ((repo !== undefined && repo !== null && repo !== "") || (baseRef !== undefined && baseRef !== null && baseRef !== ""))) {
     return fail("invalid", "repo and baseRef are only for container jobs (sandbox: \"container\"); a host job runs in workFolder");
+  }
+  // extraDirs (A1): host jobs only. A container job clones `repo` inside the container and has no
+  // host folder at all to add read access to -- refused outright, never silently ignored.
+  if (sb.mode === "container" && Array.isArray(extraDirs) && extraDirs.length > 0) {
+    return fail("invalid", "extraDirs is only for host jobs (sandbox: \"host\"); a container job clones " +
+      "`repo` inside the container and has no host folder to grant read access to");
   }
 
   // Resolved early (before any side effect, including the container preflight below) so fix 4's
@@ -1360,6 +1385,17 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   if (profileError) return fail("profile", profileError);
   const resolvedProfile = requestedProfile;
 
+  // extraDirs (A2/A3/A4): validated for host jobs only (containerPlan is null here -- the
+  // container path above already refused a non-empty extraDirs before any side effect). Absolute
+  // paths only, must exist and be a directory, symlinks/junctions/".." resolved before checking,
+  // a cap on count, no duplicate of the job's own workFolder, and the shared protected-location /
+  // live-checkout refusals in extra-dirs.mjs. Checked before the job dir is reserved below, so a
+  // bad entry never leaves a half-started job behind.
+  const extraDirsResult = containerPlan ? { dirs: [] }
+    : (opts.validateExtraDirs || validateExtraDirs)(extraDirs, { profile: resolvedProfile, workFolder: cwd });
+  if (extraDirsResult.error) return fail("invalid", extraDirsResult.error);
+  const resolvedExtraDirs = extraDirsResult.dirs;
+
   let operatorHooks;
   let readonlyMemoryAppend = null;
   try {
@@ -1410,6 +1446,9 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   const promptForCli = withLanternPreamble(prompt);
   const argv = ["-p", promptForCli, "--strict-mcp-config", "--mcp-config", EMPTY_MCP];
   argv.push(...(safePermissionsEnabled ? ["--permission-mode", "dontAsk"] : ["--dangerously-skip-permissions"]));
+  // extraDirs (A1): one --add-dir per granted directory. containerPlan jobs never reach here with
+  // a non-empty resolvedExtraDirs (refused earlier, before any side effect).
+  for (const dir of resolvedExtraDirs) argv.push("--add-dir", dir);
   const resolvedModel = model || DEFAULT_MODEL;
   argv.push("--model", resolvedModel);
   // Effort routing (argv-only — never mutate process.env; it leaks across detached jobs).
@@ -1442,11 +1481,27 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
   }
   if (safePermissionsEnabled) {
     Object.assign(settingsObj, buildSafePermissionsSettings(resolvedProfile));
-    // Denial guidance (ITEM 4): additive system-prompt text, only when safe permissions are
-    // actually enforced -- a --dangerously-skip-permissions job never sees a denial in the first
-    // place, so its prompt is left exactly as before this change.
-    argv.push("--append-system-prompt", buildDenialGuidanceText(resolvedProfile));
+    // extraDirs (A5): "code" only -- Edit/Write/NotebookEdit denied under each granted directory
+    // (readonly already denies those tools everywhere, so there is nothing to add there). One
+    // Edit(<forward-slash absolute path>/**) deny rule per dir -- live-verified against the
+    // installed CLI (2.1.325) to block Edit AND Write under the directory while leaving the job's
+    // own workFolder editable, and to print no "not matched by file permission checks" startup
+    // warning; see the comment on the existing "Edit(//**/claunker/**)" rule above for why a single
+    // Edit(path) rule is what the CLI actually applies to every file-editing tool. A shell command
+    // (Bash/PowerShell) can still write there regardless -- see buildExtraDirsGuidanceText below.
+    if (resolvedProfile === "code" && resolvedExtraDirs.length) {
+      settingsObj.permissions.deny.push(...resolvedExtraDirs.map((d) => `Edit(${forwardSlashPath(d)}/**)`));
+    }
   }
+  // Denial guidance (ITEM 4) and extraDirs guidance (A7) share ONE inline --append-system-prompt
+  // flag: two inline flags clobber each other (last one wins, confirmed empirically -- see the
+  // --append-system-prompt-file comment above for the file-based flag that doesn't have this
+  // problem), so every text that needs to reach the model this way is joined into one string.
+  const appendSystemPromptTexts = [];
+  if (safePermissionsEnabled) appendSystemPromptTexts.push(buildDenialGuidanceText(resolvedProfile));
+  const extraDirsGuidance = buildExtraDirsGuidanceText(resolvedExtraDirs);
+  if (extraDirsGuidance) appendSystemPromptTexts.push(extraDirsGuidance);
+  if (appendSystemPromptTexts.length) argv.push("--append-system-prompt", appendSystemPromptTexts.join("\n\n"));
   if (eff === "ultracode") {
     // ultracode = xhigh effort (explicit, not ambient) + standing dynamic-workflow orchestration.
     // xhigh is pushed explicitly so ultracode delivers its defined effort regardless of the
@@ -1580,6 +1635,10 @@ export async function startJob({ prompt, workFolder, jobId, model, effort, inten
                  cardId: cardId || null, startHead: startHead || null,
                  ...(persistedIntent ? { intent: persistedIntent } : {}),
                  ...(jobHermesHome ? { hermesHome: jobHermesHome } : {}),
+                 // extraDirs (A7): recorded whenever any were granted, so claude_check shows exactly
+                 // which extra directories a reviewer's job asked for -- same transparency precedent
+                 // as hermesHome/profile above.
+                 ...(resolvedExtraDirs.length ? { extraDirs: resolvedExtraDirs } : {}),
                  ...(containerPlan ? { sandbox: "container", container: { name: containerPlan.name,
                        image: containerPlan.image, imageId: containerPlan.imageId, dockerBin: containerPlan.dockerBin,
                        jobId: id, repo: containerPlan.repo, baseRef: containerPlan.baseRef || null,

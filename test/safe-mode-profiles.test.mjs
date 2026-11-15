@@ -241,7 +241,7 @@ test("buildDenialGuidanceText (readonly): names all three helpers by absolute fo
   }
   assert.match(text, /read-only git/i);
   assert.match(text, /ollama/i);
-  assert.match(text, /loopback health/i);
+  assert.match(text, /lantern/i);
   // Dynamic (the actual checkout this process is running from), never a hardcoded D:\code path.
   const repoDir = path.dirname(fileURLToPath(new URL("../job-core.mjs", import.meta.url)));
   assert.ok(text.includes(repoDir.replace(/\\/g, "/")),

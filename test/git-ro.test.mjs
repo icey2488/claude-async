@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "tools", "git-ro.mjs");
 const CANARY_SECRET = "CANARY-SECRET-AWOOGA-98765";
 
-let repoDir, outsideDir, outsideSecretFile;
+let repoDir, repoDir2, outsideDir, outsideSecretFile;
 
 before(() => {
   repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "git-ro-test-repo-"));
@@ -46,10 +46,22 @@ before(() => {
   fs.writeFileSync(path.join(repoDir, ".env"), `SECRET=${CANARY_SECRET}\n`);
   outsideSecretFile = path.join(outsideDir, "outside-secret.txt");
   fs.writeFileSync(outsideSecretFile, `${CANARY_SECRET}\n`);
+
+  // A second, independent repo for --repo <path> tests (A6) -- proves the option actually
+  // redirects git to the NAMED repo, not the process's own cwd.
+  repoDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "git-ro-test-repo2-"));
+  git("init", "-q", repoDir2);
+  const git2 = (...args) => spawnSync("git", args, { cwd: repoDir2, encoding: "utf8" });
+  git2("config", "user.email", "test@example.com");
+  git2("config", "user.name", "Test");
+  fs.writeFileSync(path.join(repoDir2, "f.txt"), "second repo\n");
+  git2("add", ".");
+  git2("commit", "-q", "-m", "second repo commit");
 });
 
 after(() => {
   fs.rmSync(repoDir, { recursive: true, force: true });
+  fs.rmSync(repoDir2, { recursive: true, force: true });
   fs.rmSync(outsideDir, { recursive: true, force: true });
 });
 
@@ -199,4 +211,56 @@ test("the main-module guard runs the CLI whether invoked with backslashes or for
   const forwardSlash = SCRIPT.replace(/\\/g, "/");
   const r = spawnSync(process.execPath, [forwardSlash, "log", "--oneline"], { cwd: repoDir, encoding: "utf8" });
   assert.equal(r.status, 0, `forward-slash invocation must still run the CLI: stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`);
+});
+
+// --- --repo <path> (A6: inspect another checkout without `git -C`) ------------------------------
+
+test("--repo <otherRepo> runs git IN THAT REPO, not the process cwd (a different repo, different log)", () => {
+  // run()'s cwd is repoDir; target a second, independent repo so the two outputs can never match
+  // by coincidence.
+  const r = run(["--repo", repoDir2, "log", "--oneline"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /second repo commit/);
+});
+
+test("--repo must be the first two tokens; appearing later is refused as an ordinary unknown argument", () => {
+  const r = run(["log", "--repo", repoDir2]);
+  assert.notEqual(r.status, 0);
+});
+
+test("--repo requires a path argument", () => {
+  const r = run(["--repo"]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /refused/);
+});
+
+test("--repo refuses a relative path", () => {
+  const r = run(["--repo", "relative/path", "log"]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /absolute path/);
+});
+
+test("--repo refuses a nonexistent directory", () => {
+  const r = run(["--repo", path.join(outsideDir, "does-not-exist"), "log"]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /does not exist/);
+});
+
+test("--repo refuses a protected location (shared A2/A3 check with extraDirs)", () => {
+  // Assumes this machine's own ~/.ssh exists (true on Erick's workstation); extra-dirs.test.mjs
+  // covers the same refusal with a fabricated homedir, independent of the real one.
+  const r = run(["--repo", path.join(os.homedir(), ".ssh"), "log"]);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /protected location/);
+});
+
+test("--repo still applies every other git-ro safety rule (e.g. --output is refused) in the named repo", () => {
+  const r = run(["--repo", repoDir2, "log", "-1", "--output=pwned-repo2.txt"]);
+  assert.notEqual(r.status, 0);
+  assert.ok(!fs.existsSync(path.join(repoDir2, "pwned-repo2.txt")));
+});
+
+test("raw `git -C` is still never allow-listed by this change (ALWAYS_DENY_FLAGS unchanged)", () => {
+  const r = run(["-C", repoDir2, "log"]);
+  assert.notEqual(r.status, 0);
 });

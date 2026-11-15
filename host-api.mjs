@@ -3,7 +3,7 @@
  * host-api.mjs — a receiver's remote dispatch API. Runs only on a machine whose hosts.json says
  * "receiver": true (Claunker today; a Linux receiver such as "ha" is the same code, config only).
  *
- *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef?, profile? }
+ *   POST /v1/start   body { host, prompt, workFolder?, jobId?, model?, effort?, intent?, sandbox?, repo?, baseRef?, profile?, extraDirs? }
  *   GET  /v1/check?jobId=<id>&tailBytes=<n>
  *   POST /v1/cancel  body { jobId }   (container jobs only; see job-core.mjs cancelJob)
  *   GET  /v1/jobs
@@ -185,6 +185,10 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
         if (body.profile !== undefined && body.profile !== null && !PROFILE_SET.has(body.profile)) {
           return send(res, 400, { error: `invalid profile ${JSON.stringify(body.profile)} (must be one of ${PROFILES.join(", ")})`, hostname });
         }
+        if (body.extraDirs !== undefined && body.extraDirs !== null &&
+            (!Array.isArray(body.extraDirs) || !body.extraDirs.every((d) => typeof d === "string"))) {
+          return send(res, 400, { error: "extraDirs must be an array of strings", hostname });
+        }
         // Unknown nested parents are rejected, including cross-host parents.
         // Headers remain self-reported: this is accident protection, not authorization.
         const parsedDepth = parseDepth(req.headers[DEPTH_HEADER]);
@@ -201,7 +205,7 @@ export function createApiServer({ cfg, apiCfg, startOptions = {} }) {
           { prompt: body.prompt, workFolder: body.workFolder || undefined, jobId: body.jobId || undefined,
             model: body.model || undefined, effort: body.effort || undefined, intent: body.intent || undefined,
             sandbox: body.sandbox || undefined, repo: body.repo || undefined, baseRef: body.baseRef || undefined,
-            profile: body.profile || undefined },
+            profile: body.profile || undefined, extraDirs: body.extraDirs || undefined },
           cfg, { ...startOptions, depth: req.headers[DEPTH_HEADER] ?? "", profileEnv: { [PROFILE_ENV]: parentProfile } });
         return send(res, out.error ? (STATUS_BY_CODE[out.errorCode] || 400) : 200, { ...out, hostname: out.hostname || hostname });
       }

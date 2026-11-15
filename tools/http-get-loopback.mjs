@@ -1,9 +1,23 @@
 #!/usr/bin/env node
-/** Fixed loopback health GET; no redirects, absolute socket deadline and byte cap.
- * Accident protection only. Responses are not a confidentiality boundary. */
+/** Fixed loopback GET(s); no redirects, absolute socket deadline and byte cap.
+ * Accident protection only. Responses are not a confidentiality boundary.
+ *
+ * 2026-11-15 job-reach finding: the host API (host-api.mjs) binds ONLY to a Tailscale address
+ * (100.64.0.0/10), never 127.0.0.1 -- a prior "7850/healthz" entry here could never actually
+ * connect (dead allowlist entry). Replaced with targets that genuinely listen on loopback and are
+ * useful to a readonly job:
+ *   - AgentGlass's Lantern board (GET /agents/board), port resolved the same way
+ *     lantern-notify.mjs resolves it for POSTing a job's own status (env override, then the
+ *     published port file, then the 4000 default -- see resolveLanternPort()'s header there for
+ *     why the port can move to 4001).
+ *   - Spine (127.0.0.1:8848) was considered but left OUT: this repo has no checkout of that
+ *     service and no plain unauthenticated GET health/status route for it could be confirmed from
+ *     this repo's own code or docs -- never guessed.
+ */
 import { boundedRequest } from "./http-bounded.mjs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveLanternPort } from "../lantern-notify.mjs";
 
 export const BODY_MAX_BYTES = 64 * 1024;
 export const REQUEST_TIMEOUT_MS = 5_000;
@@ -12,12 +26,17 @@ const ALLOWED_RESPONSE_HEADERS = ["content-type", "content-length", "location", 
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 2, REFUSED: 10, TRANSPORT_FAILED: 20 });
 
-export const ALLOWED_TARGETS = Object.freeze([
-  { port: 7850, path: "/healthz" },
-]);
+export const AGENTGLASS_BOARD_PATH = "/agents/board";
 
-// allowedTargets is a seam (tests only) -- production always uses ALLOWED_TARGETS above.
-export function validateLoopbackUrl(raw, allowedTargets = ALLOWED_TARGETS) {
+// Built fresh on every call (never cached at module load), so a live port-file change (AgentGlass
+// walking from :4000 to :4001, see lantern-notify.mjs's header) takes effect without restarting
+// the job process. fsImpl: test seam, forwarded to resolveLanternPort().
+export function defaultAllowedTargets(fsImpl) {
+  return [{ port: resolveLanternPort(fsImpl), path: AGENTGLASS_BOARD_PATH }];
+}
+
+// allowedTargets is a seam (tests only) -- production always uses defaultAllowedTargets().
+export function validateLoopbackUrl(raw, allowedTargets = defaultAllowedTargets()) {
   let u;
   try { u = new URL(raw); } catch { return { error: `not a valid URL: ${JSON.stringify(raw)}` }; }
   if (u.protocol !== "http:") return { error: `scheme must be http, got ${u.protocol}` };
@@ -33,7 +52,7 @@ export function validateLoopbackUrl(raw, allowedTargets = ALLOWED_TARGETS) {
   return { url: u, port };
 }
 
-export async function getLoopback(rawUrl, { timeoutMs = REQUEST_TIMEOUT_MS, allowedTargets = ALLOWED_TARGETS } = {}) {
+export async function getLoopback(rawUrl, { timeoutMs = REQUEST_TIMEOUT_MS, allowedTargets = defaultAllowedTargets() } = {}) {
   const v = validateLoopbackUrl(rawUrl, allowedTargets);
   if (v.error) return { ok: false, exitCode: EXIT.REFUSED, error: v.error, redirects: [] };
   try {
@@ -47,7 +66,7 @@ export async function getLoopback(rawUrl, { timeoutMs = REQUEST_TIMEOUT_MS, allo
 
 async function cliMain(argv) {
   if (argv.length !== 1) {
-    process.stdout.write(JSON.stringify({ ok: false, error: "usage: http-get-loopback.mjs <http://127.0.0.1:<port>/<path>>" }) + "\n");
+    process.stdout.write(JSON.stringify({ ok: false, error: "usage: http-get-loopback.mjs <http://127.0.0.1:<port>/agents/board>" }) + "\n");
     process.exitCode = EXIT.USAGE;
     return;
   }
